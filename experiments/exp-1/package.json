@@ -1,0 +1,14 @@
+{
+  "name": "exp-1-wasm-snapshot",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "description": "EXP-1: prove QuickJS REPL namespace (closure + pending promise) survives WASM linear-memory + globals snapshot/restore into a fresh instance, no source replay.",
+  "scripts": {
+    "harness": "node harness.mjs",
+    "negative": "node negative-control.mjs"
+  },
+  "devDependencies": {
+    "quickjs-wasi": "3.0.0"
+  }
+}

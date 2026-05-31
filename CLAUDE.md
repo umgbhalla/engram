@@ -46,7 +46,9 @@ literally persist the heap.
 - [x] Feasibility study + architecture → `docs/feasibility.md` (verdict: JS feasible HIGH, Python-Pyodide blocked).
 - [x] Phased experiment plan → `docs/experiments.md` (10 experiments).
 - [ ] Drop CF creds in `.env` (USER).
-- [ ] EXP-1 (local QuickJS snapshot round-trip) — START, no creds needed.
+- [x] EXP-1 (local QuickJS snapshot round-trip) — **PASS** (`docs/results/exp-1.md`).
+      var + closure + pending promise survive memory+globals dump/restore into a
+      fresh process; `x===43`. Snap 1.28 MB raw / 96 KB gzip, restore ~2 ms.
 
 ## Repo conventions (multi-agent)
 
