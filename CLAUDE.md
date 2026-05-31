@@ -58,6 +58,8 @@ literally persist the heap.
   `.env.example`. Account id + API token expected there.
 - **Worktrees**: parallel agents use isolated git worktrees to avoid clobbering.
 - **Docs land in `docs/`**: `feasibility.md`, `experiments.md`, `decisions.md` (ADRs).
+- **`context/`**: external repos as shallow submodules for reference (read-only, not built).
+  Index in `context/include.md`. Init: `git submodule update --init --depth 1`.
 
 ## Key facts (do not re-derive)
 
