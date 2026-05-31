@@ -2,6 +2,53 @@
 
 > Single source of truth for this repo. `AGENTS.md` is a symlink to this file.
 
+## Context trail — read this first in a new session
+
+**One line:** a durable, hibernating, dynamically-configured **stateful JavaScript REPL** on
+Cloudflare — the live QuickJS interpreter heap is snapshotted to a Durable Object's SQLite,
+so a session sleeps when idle and wakes with full live state, no replay.
+
+**How we got here (the journey + plans/expectations):**
+1. Started exploring **Cloudflare Dynamic Worker Loader** (run code in fresh isolates at runtime).
+2. Goal crystallized: not one-shot code, but a **Jupyter-kernel-like resumable REPL** — live
+   namespace that survives idle eviction. Expectation: "lock interpreter state, resume, move forward."
+3. Key realization: **V8 isolates can't snapshot a live heap; WASM linear memory CAN** (it's a
+   plain ArrayBuffer). → compile the interpreter (QuickJS) to WASM, snapshot its memory.
+4. Dropped Dynamic Worker Loader for a **Durable Object + bundled CompiledWasm** substrate
+   (ADR-0001). Snapshot the heap, not logical state (ADR-0002).
+5. Proved it across 7 experiments (EXP-1..9, 4b), built **V0** (Rust DO shell + JS glue, SQLite-first
+   snapshot), stress-tested it, now hardening into **V0.1** (usable dynamically-configured env).
+6. **Expectation for V1:** if V0.1 is genuinely useful, go multi-tenant via **DO Facets** —
+   where Dynamic Worker Loader deliberately re-enters (per-tenant kernel code, isolated SQLite,
+   supervisor control). See ADR-0003. End vision: a dynamically-configured JS env that stays a
+   stateful REPL, portable later to Rivet ActorCore.
+
+**Doc map** (`docs/`):
+| File | What |
+|---|---|
+| `feasibility.md` | feasibility study + architecture (verdict, snapshot mechanism, tech, risks) |
+| `experiments.md` | the 10-experiment phased plan |
+| `decisions.md` | ADRs: 0001 drop DW Loader · 0002 heap-snapshot · 0003 facets-for-V1 |
+| `v0.1-design.md` | V0.1 spec: dynamically-configured stateful JS env |
+| `results/SUMMARY.md` | operating envelope (size/latency ceilings, all hard numbers) |
+| `results/exp-{1,4b,5a,6,7,8,9}.md` | per-experiment results |
+| `results/v0.md` | V0 build report |
+| `results/v0-tests.md` | V0 stress/soak suite — 5/6 PASS + BUG-1 (eval-mutex deadlock) |
+| `results/v0.1.md` | V0.1 build report (when done) |
+| `TODO.md` | task board |
+
+**Code map:** `v0/` = shipped V0 kernel (`src/lib.rs` Rust DO, `src/glue.js` JS glue,
+`entry.mjs` CompiledWasm wrapper, `wrangler.jsonc`). `v0.1/` = V0.1 evolution (in progress).
+`experiments/exp-*/` = the 7 proven experiments (each self-contained, deployable).
+`context/` = external repos (shallow submodules; `context/include.md` indexes them).
+
+**Workflow history** (background multi-agent runs, for provenance):
+`wkfcx55zi` feasibility research · `wnf82p8o5` EXP-6/7/8/9/4b · `ws0na8tg4` V0 build ·
+`wb2xbvb46` V0 stress · `wzv44v81d` V0.1 build.
+
+**Deployed CF resources:** Workers `montydyn-v0` (+ `montydyn-v01` for V0.1) and experiment
+workers `montydyn-exp{5a,6,7,9,4b}`; R2 bucket `montydyn-snapshots`. Account: Workers Paid.
+
 ## Goal
 
 Build a **durable, hibernating, stateful REPL kernel** with Jupyter/IPython-kernel
