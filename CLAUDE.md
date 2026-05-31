@@ -24,8 +24,8 @@ literally persist the heap.
 ## Architecture (target)
 
 - **Kernel** = script interpreter compiled Rust → WASM.
-  - JS first: [Boa](https://github.com/boa-dev/boa) (pure-Rust JS engine) or QuickJS-wasm.
-  - Python later: RustPython / Pyodide.
+  - JS first: **QuickJS-ng → WASM** (built-in snapshot API; quickjs-wasi precedent). Boa = higher-risk alt (no snapshot API).
+  - Python later: **RustPython** (single-memory, snapshottable). Pyodide BLOCKED on CF (side-table capture unreachable).
 - **Host** = Cloudflare **Durable Object** (identity + SQLite + alarms + WebSocket
   hibernation). Holds the snapshot; orchestrates lifecycle.
 - **Snapshot store** = DO SQLite for small, R2 for large memory images.
@@ -42,10 +42,11 @@ literally persist the heap.
 
 ## Status
 
-- [x] Feasibility research launched (workflow `wkfcx55zi`).
-- [ ] Feasibility study + architecture spec → `docs/feasibility.md`.
-- [ ] Phased experiment plan → `docs/experiments.md`.
-- [ ] Experiment 1 (cheapest, highest-signal) executed.
+- [x] Feasibility research done (workflow `wkfcx55zi`).
+- [x] Feasibility study + architecture → `docs/feasibility.md` (verdict: JS feasible HIGH, Python-Pyodide blocked).
+- [x] Phased experiment plan → `docs/experiments.md` (10 experiments).
+- [ ] Drop CF creds in `.env` (USER).
+- [ ] EXP-1 (local QuickJS snapshot round-trip) — START, no creds needed.
 
 ## Repo conventions (multi-agent)
 
