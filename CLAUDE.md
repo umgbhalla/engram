@@ -120,11 +120,24 @@ literally persist the heap.
       - **Atomicity fix** (`77ada26`): checkpoint replace crash-atomic via workerd write-coalescing (raw BEGIN/COMMIT forbidden on DO SQLite); R2 path swap-then-delete; runtime chunk-count guard. Crash-edge + R2-overflow crash-restore PASS on cold DO.
       - Skipped per scope: TTL/archival/eviction-cost, Python, multi-tenant.
 
-## Next (post-v0)
-- Validate R2 overflow path at scale (>2 MB gz namespace) under real crash timing — implemented, lightly exercised.
-- Streaming gunzip into WASM memory to raise the >30 MB raw restore ceiling (deferred; not needed at v0 sizes).
-- Investigate uncatchable OOM ceiling at 16–20 MB raw if envelope must grow.
-- Product surface: client SDK / REPL UI; Python kernel (RustPython) port; Rivet ActorCore portability spike.
+- [x] **V0.1 BUILT + MERGED** (workflow `wzv44v81d`) — `v0.1/`, deployed `montydyn-v01`. → `docs/results/v0.1.md`.
+      Dynamically-configured stateful JS env. Strict improvement over V0, zero regression.
+      - **BUG-1 (blocker) FIXED + verified** (errors 17/17, smoke 24/24): `evalCode` returns JSON,
+        drains QuickJS exception → `{ok:false,error:{name,message,stack}}`, mutex always released; reset recovers.
+      - **Features (live):** `{t:create,config}` (clock/rngSeed/capture/cellBudget/fetch/tools) **persisted across cold wake**;
+        host tools via `host.<name>` → `__hostCall`; per-cell `console.*` capture; structured value preview; reconnect-safe SDK (`v0.1/sdk`).
+      - **BUG-5/6 FIXED** (seeded `performance.now`; correct `r2-restore` vs `sqlite-restore` label).
+      - ⚠️ **BUG-2/4 STILL OPEN (P0):** `runGC()` frees JS objects but **WASM linear memory is monotonic** → snapshot size
+        stays at high-water-mark; a size-trip session still can't checkpoint. Real fix = guard on *used* heap + compact-on-restore.
+      - ⚠️ **BUG-3 PARTIAL (P1):** tick-budget preempts value-touching loops (typed TimeoutError) but a truly empty `while(true){}` can still WS-1006 the DO.
+      - **P2:** host-tool state (kv data) not persisted across restore. **P3:** fetch allowlist inert; error-preview drops message.
+
+## Next (post-v0.1)
+- **P0 — BUG-2/4 memory reclaim:** size guard on post-GC *used* heap (QuickJS memory-usage API), compact-on-restore into a fresh smaller instance (WASM memory never shrinks in place).
+- **P1 — BUG-3:** reliable preemption for CPU-bound/empty loops (lower interrupt-tick interval or wall budget that survives workerd's frozen-clock).
+- **P2 — host-tool state persistence** (kv data) across restore; **P3** real fetch egress + allowlist enforcement, error-value preview.
+- Then **V1 — DO Facets** (ADR-0003): supervisor + per-session kernel facets, Worker Loader re-enters. **Gate facets needing memory bounds / untrusted / long-running / persistent host-tool state on P0–P2.**
+- Deferred: streaming gunzip (>30 MB images), Python kernel (RustPython), Rivet ActorCore.
 
 ## Repo conventions (multi-agent)
 
