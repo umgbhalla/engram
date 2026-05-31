@@ -1,0 +1,25 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# rust / wasm
+target/
+**/*.rs.bk
+pkg/
+*.wasm
+
+# node
+node_modules/
+.wrangler/
+dist/
+.dev.vars
+
+# tooling
+.pi/
+.DS_Store
+
+# snapshots / scratch
+snapshots/
+*.snap.bin
+scratch/
