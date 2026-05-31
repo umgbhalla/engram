@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "montydyn-exp6",
+  "main": "src/worker.mjs",
+  "compatibility_date": "2025-05-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  "rules": [
+    { "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true }
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "KERNEL_DO", "class_name": "KernelDO" }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["KernelDO"]
+    }
+  ],
+
+  "r2_buckets": [
+    { "binding": "SNAPSHOTS", "bucket_name": "montydyn-snapshots" }
+  ]
+}
