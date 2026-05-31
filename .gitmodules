@@ -1,0 +1,27 @@
+[submodule "context/quickjs-wasi"]
+	path = context/quickjs-wasi
+	url = https://github.com/vercel-labs/quickjs-wasi
+[submodule "context/quickjs-ng"]
+	path = context/quickjs-ng
+	url = https://github.com/quickjs-ng/quickjs
+[submodule "context/boa"]
+	path = context/boa
+	url = https://github.com/boa-dev/boa
+[submodule "context/rustpython"]
+	path = context/rustpython
+	url = https://github.com/RustPython/RustPython
+[submodule "context/workers-rs"]
+	path = context/workers-rs
+	url = https://github.com/cloudflare/workers-rs
+[submodule "context/rivetkit"]
+	path = context/rivetkit
+	url = https://github.com/rivet-gg/rivetkit
+[submodule "context/perry"]
+	path = context/perry
+	url = https://github.com/PerryTS/perry
+[submodule "context/wizer"]
+	path = context/wizer
+	url = https://github.com/bytecodealliance/wizer
+[submodule "context/dynos"]
+	path = context/dynos
+	url = https://github.com/threepointone/dynos
