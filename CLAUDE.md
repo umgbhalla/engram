@@ -49,6 +49,13 @@ literally persist the heap.
 - [x] EXP-1 (local QuickJS snapshot round-trip) — **PASS** (`docs/results/exp-1.md`).
       var + closure + pending promise survive memory+globals dump/restore into a
       fresh process; `x===43`. Snap 1.28 MB raw / 96 KB gzip, restore ~2 ms.
+- [x] EXP-5a (THE THESIS TEST, real Cloudflare, JS DO) — **PASS** (`docs/results/exp-5a.md`).
+      QuickJS namespace survived a **real DO eviction** (constructor generation
+      1→2, in-memory kernel gone) restored from a gzip'd memory+globals snapshot in
+      R2; `x===42`, closure `inc()===43`, no source replay. Restore ~0.57 s at
+      ~1.2 MB raw / 97 KB gzip. quickjs-wasi runs in workerd via CompiledWasm
+      import; no Error 1101/1102/10021/10195. Worker `montydyn-exp5a`, R2
+      `montydyn-snapshots` left deployed. GO for the bet.
 
 ## Repo conventions (multi-agent)
 
