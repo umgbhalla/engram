@@ -56,6 +56,20 @@ literally persist the heap.
       ~1.2 MB raw / 97 KB gzip. quickjs-wasi runs in workerd via CompiledWasm
       import; no Error 1101/1102/10021/10195. Worker `montydyn-exp5a`, R2
       `montydyn-snapshots` left deployed. GO for the bet.
+- [x] EXP-6/7/8/9/4b (workflow `wnf82p8o5`, parallel worktrees) — **ALL PASS**.
+      Operating envelope → `docs/results/SUMMARY.md`. Key numbers:
+      - Namespace not capped (>193 MB live), but **snapshot dump caps at ~57 MB live** (3× transient); safe raw image **≤20 MB**.
+      - Cold restore **sub-second p50 to ~14 MB gz / ~21 MB raw**; latency is 100% R2 network. Crash (1102) at ~27–32 MB raw.
+      - Determinism byte-identical with seeded clock/RNG/crypto externalized (EXP-8).
+      - Per-cell checkpoint crash-recovery + engine-hash upgrade guard verified on CF (EXP-9).
+      - **EXP-4b: Rust DO CAN snapshot nested wasm; eval needs JS → use Rust-shell + JS-glue (path b).** Risk #3 retired.
+      - OOM/1102 UNCATCHABLE (WS 1006) → size-admission guard mandatory.
+
+## Next (v0, path b: Rust DO shell + JS glue)
+1. Streaming snapshot dump (`snap.memory` → gzip → R2, kill double-copy) — gates both ceilings.
+2. Hard size-admission guard (refuse >~45–50 MB live / >~20 MB raw restore).
+3. Bake-in seeded clock/RNG/crypto + build-time engine-hash guard; persist host entropy counter per snapshot.
+Target v0: ≤20 MB raw / ~1.7 MB gz, sub-second p50 cold wake, byte-deterministic, crash+upgrade-safe.
 
 ## Repo conventions (multi-agent)
 

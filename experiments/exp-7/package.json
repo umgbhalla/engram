@@ -1,0 +1,19 @@
+{
+  "name": "exp-7",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "EXP-7: restore latency distribution vs snapshot size on Cloudflare DO + R2",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "test": "node test-client.mjs"
+  },
+  "dependencies": {
+    "quickjs-wasi": "3.0.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.86.0",
+    "ws": "^8.18.0"
+  }
+}

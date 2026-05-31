@@ -1,0 +1,13 @@
+{
+  "name": "exp-8",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "EXP-8: determinism — seeded RNG + controlled clock as host imports => byte-identical restore-and-advance",
+  "scripts": {
+    "test": "node src/determinism.mjs"
+  },
+  "dependencies": {
+    "quickjs-wasi": "3.0.0"
+  }
+}

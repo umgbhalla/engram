@@ -23,3 +23,6 @@ dist/
 snapshots/
 *.snap.bin
 scratch/
+
+# claude harness
+.claude/

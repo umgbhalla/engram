@@ -1,0 +1,19 @@
+{
+  "name": "exp-9",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "EXP-9: crash-robustness (per-cell checkpoints) + upgrade guard (engine content-hash) on CF Durable Object + R2",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "test": "node test-client.mjs"
+  },
+  "dependencies": {
+    "quickjs-wasi": "3.0.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.86.0",
+    "ws": "^8.18.0"
+  }
+}
