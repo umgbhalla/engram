@@ -64,12 +64,20 @@ literally persist the heap.
       - Per-cell checkpoint crash-recovery + engine-hash upgrade guard verified on CF (EXP-9).
       - **EXP-4b: Rust DO CAN snapshot nested wasm; eval needs JS → use Rust-shell + JS-glue (path b).** Risk #3 retired.
       - OOM/1102 UNCATCHABLE (WS 1006) → size-admission guard mandatory.
+- [x] **V0 BUILT + MERGED** (workflow `ws0na8tg4`) — `v0/`, deployed `montydyn-v0`. → `docs/results/v0.md`.
+      Path (b): Rust DO shell (`v0/src/lib.rs`) + JS glue (`v0/src/glue.js`) + `entry.mjs` CompiledWasm wrapper.
+      - **SQLite-first** snapshot (chunked ~64KB rows + manifest); **R2 overflow only >2 MB gz**. Demoted R2 off the hot path.
+      - REPL + resumable + **no-replay** all MET; real eviction gen 1→2, `sqlite-restore`, effects fire once.
+      - **Fast: p50 ~200 ms, p95 <530 ms, no >1 s tail** (vs EXP-7 R2 p95 >1 s). v0 images <1 MB gz.
+      - Seeded clock/RNG determinism + build-time engine-hash guard + size-admission guard (clean reject, no crash).
+      - **Atomicity fix** (`77ada26`): checkpoint replace crash-atomic via workerd write-coalescing (raw BEGIN/COMMIT forbidden on DO SQLite); R2 path swap-then-delete; runtime chunk-count guard. Crash-edge + R2-overflow crash-restore PASS on cold DO.
+      - Skipped per scope: TTL/archival/eviction-cost, Python, multi-tenant.
 
-## Next (v0, path b: Rust DO shell + JS glue)
-1. Streaming snapshot dump (`snap.memory` → gzip → R2, kill double-copy) — gates both ceilings.
-2. Hard size-admission guard (refuse >~45–50 MB live / >~20 MB raw restore).
-3. Bake-in seeded clock/RNG/crypto + build-time engine-hash guard; persist host entropy counter per snapshot.
-Target v0: ≤20 MB raw / ~1.7 MB gz, sub-second p50 cold wake, byte-deterministic, crash+upgrade-safe.
+## Next (post-v0)
+- Validate R2 overflow path at scale (>2 MB gz namespace) under real crash timing — implemented, lightly exercised.
+- Streaming gunzip into WASM memory to raise the >30 MB raw restore ceiling (deferred; not needed at v0 sizes).
+- Investigate uncatchable OOM ceiling at 16–20 MB raw if envelope must grow.
+- Product surface: client SDK / REPL UI; Python kernel (RustPython) port; Rivet ActorCore portability spike.
 
 ## Repo conventions (multi-agent)
 
