@@ -132,10 +132,22 @@ literally persist the heap.
       - ⚠️ **BUG-3 PARTIAL (P1):** tick-budget preempts value-touching loops (typed TimeoutError) but a truly empty `while(true){}` can still WS-1006 the DO.
       - **P2:** host-tool state (kv data) not persisted across restore. **P3:** fetch allowlist inert; error-preview drops message.
 
-## Next (post-v0.1)
-- **P0 — BUG-2/4 memory reclaim:** size guard on post-GC *used* heap (QuickJS memory-usage API), compact-on-restore into a fresh smaller instance (WASM memory never shrinks in place).
-- **P1 — BUG-3:** reliable preemption for CPU-bound/empty loops (lower interrupt-tick interval or wall budget that survives workerd's frozen-clock).
-- **P2 — host-tool state persistence** (kv data) across restore; **P3** real fetch egress + allowlist enforcement, error-value preview.
+- [x] **V0.2 BUILT (NOT merged)** (workflow this run) — `v0.2/`, deployed `montydyn-v02`. → `docs/results/v0.2.md`. Branch `feat/v0.2`.
+      Hardening on top of v0.1; smoke **41/41** live. v0/ + v0.1/ + their workers untouched. R2 keys namespaced `v02/`.
+      - **P0 BUG-2/4 FIXED (un-wedge) + image shrink, with documented hard limit:** size-admission guard now on QuickJS
+        **used heap** (`getMemoryUsage().memoryUsedSize`), not the monotonic `memory.buffer` → an in-envelope spike-then-free
+        **checkpoints again** (no permanent SizeAdmissionError; store r2→sqlite). **Arena SCRUB** (alloc zero-buffers across freed
+        slack, free+GC) zeroes freed pages so gz/stored image shrinks (local 30MB free: gz 0.84→0.18MB). **Raw `memory.buffer`
+        does NOT shrink in place** (WASM monotonic; dlmalloc no downward compaction — verified; true compaction infeasible w/o
+        value-serialization that loses promise/closure fidelity). >~45MB buffer dump **fails safe** (typed error, socket alive, reset recovers) — no OOM/1006.
+      - **P1 BUG-3 FIXED:** interrupt-tick budget is the hard primary (decrements every invocation); empty `while(true){}` →
+        typed TimeoutError in <1s, socket alive, next eval works; 10M-iter loop completes. Default ticks 30000→**8000**.
+      - **P2 DONE:** host-tool kv state serialized in snapshot manifest (`kv_json`), re-hydrated on restore → `kv.get`/`keys` survive cold wake.
+      - **No regression:** BUG-1, config+tools across evict, seeded clock/RNG, state survival all green.
+
+## Next (post-v0.2)
+- Review + merge `feat/v0.2`. **P3:** real fetch egress + allowlist enforcement, error-value preview.
+- Beyond-envelope memory reclaim (value-level re-serialization or per-session memory cap) if needed for spiky workloads.
 - Then **V1 — DO Facets** (ADR-0003): supervisor + per-session kernel facets, Worker Loader re-enters. **Gate facets needing memory bounds / untrusted / long-running / persistent host-tool state on P0–P2.**
 - Deferred: streaming gunzip (>30 MB images), Python kernel (RustPython), Rivet ActorCore.
 
