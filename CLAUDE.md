@@ -132,8 +132,10 @@ literally persist the heap.
       - ⚠️ **BUG-3 PARTIAL (P1):** tick-budget preempts value-touching loops (typed TimeoutError) but a truly empty `while(true){}` can still WS-1006 the DO.
       - **P2:** host-tool state (kv data) not persisted across restore. **P3:** fetch allowlist inert; error-preview drops message.
 
-- [x] **V0.2 BUILT (NOT merged)** (workflow this run) — `v0.2/`, deployed `montydyn-v02`. → `docs/results/v0.2.md`. Branch `feat/v0.2`.
-      Hardening on top of v0.1; smoke **52/52** live (after the gate-fix pass). v0/ + v0.1/ + their workers untouched. R2 keys namespaced `v02/`.
+- [x] **V0.2 BUILT + MERGED** (workflows `wmu0xafd9` + `whtbjgamd`) — `v0.2/`, deployed `montydyn-v02` (v `03ccf6bb`). → `docs/results/v0.2.md`.
+      Hardening on top of v0.1. **Both V1-safety gates DECISIVELY GREEN, lead-verified live** before merge. v0/ + v0.1/ + their workers untouched. R2 keys namespaced `v02/`.
+      - **Final P1 budget = default 1200 / cap 2000** (18-rep bisection; safety-first). Lead-verified: `while(true){x=1}` **8/8 trips, socket alive**; all loop shapes trip; no DO kill. Earlier 2500 leaked ~1/4 property-store loops to WS-1006 — rejected. Tradeoff: a tight loop above ~5–6M iters safely false-trips (typed TimeoutError, recoverable) → chunk heavy bursts across cells or raise `cellBudgetTicks`.
+      - **P0 cold-restore wedge fixed + lead-verified:** 26.3MB spike → free → genuine evict → cold restore `keep=777` via `sqlite-restore`.
       - **GATE-FIX PASS:** closed two live gate failures — (P0) **cold-restore wedge**: the RESTORE guard now admits on the
         snapshot's recorded `usedHeap` (new `used_heap` manifest column), NOT raw image bytes, so a spike>20MB-then-free session
         cold-restores (safe-to-instantiate raw ceiling 45MB still fails too-big images safe). sizeGz "under-capture" was a gate
@@ -147,16 +149,18 @@ literally persist the heap.
         slack, free+GC) zeroes freed pages so gz/stored image shrinks (local 30MB free: gz 0.84→0.18MB). **Raw `memory.buffer`
         does NOT shrink in place** (WASM monotonic; dlmalloc no downward compaction — verified; true compaction infeasible w/o
         value-serialization that loses promise/closure fidelity). >~45MB buffer dump **fails safe** (typed error, socket alive, reset recovers) — no OOM/1006.
-      - **P1 BUG-3 FIXED:** interrupt-tick budget is the hard primary (decrements every invocation); empty `while(true){}` →
-        typed TimeoutError in <1s, socket alive, next eval works; 10M-iter loop completes. Default ticks 30000→**8000**.
+      - **P1 BUG-3 FIXED:** interrupt-tick budget is the hard primary (decrements every invocation); EVERY infinite-loop shape
+        (empty / `x=1` / `globalThis.x=1` / `o.a=1`) trips a typed TimeoutError ~0.2–0.5s, socket alive, next eval works.
+        Root cause of the earlier escape = workerd throttles the host interrupt callback after a bounded, load-sensitive
+        invocations/turn; the property-store shapes hit it sooner, so the budget MUST sit below that floor (≤1200). Default 30000→**1200**.
       - **P2 DONE:** host-tool kv state serialized in snapshot manifest (`kv_json`), re-hydrated on restore → `kv.get`/`keys` survive cold wake.
       - **No regression:** BUG-1, config+tools across evict, seeded clock/RNG, state survival all green.
 
-## Next (post-v0.2)
-- Review + merge `feat/v0.2`. **P3:** real fetch egress + allowlist enforcement, error-value preview.
-- Beyond-envelope memory reclaim (value-level re-serialization or per-session memory cap) if needed for spiky workloads.
-- Then **V1 — DO Facets** (ADR-0003): supervisor + per-session kernel facets, Worker Loader re-enters. **Gate facets needing memory bounds / untrusted / long-running / persistent host-tool state on P0–P2.**
-- Deferred: streaming gunzip (>30 MB images), Python kernel (RustPython), Rivet ActorCore.
+## Next (post-v0.2 — V1-facet gate is CLEAR)
+- **P0/P1/P2 all cleared.** V1-facet safety gate (memory bounds, untrusted runaway loops, host-tool state) is met; accepted limits documented (raw buffer doesn't shrink in place; >~45MB spike needs reset; >~5–6M single-cell loops false-trip safely).
+- **P3 (small, do before/with V1):** real fetch egress + allowlist enforcement; error-as-VALUE preview drops message/stack.
+- **V1 — DO Facets** (ADR-0003): supervisor DO + per-session kernel facets (each isolated SQLite), Worker Loader re-enters for per-tenant kernel code; heap-snapshot stays inside each facet. This is the multi-tenant packaging.
+- Deferred: beyond-envelope memory reclaim (value-serialization / per-session cap); streaming gunzip (>30 MB images); Python kernel (RustPython); Rivet ActorCore.
 
 ## Repo conventions (multi-agent)
 
