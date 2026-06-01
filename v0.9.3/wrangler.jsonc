@@ -1,0 +1,47 @@
+{
+  "name": "montydyn-v093",
+  // Wrapper entry: imports quickjs.wasm + the 5 Tier-0 extension .so as CompiledWasm
+  // (wrangler-bundled), the stdlib bundle as a Text module, and re-exports the worker-build
+  // output (Rust DO shim + quickjs-wasi JS glue).
+  "main": "entry.mjs",
+  "compatibility_date": "2025-05-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  // Build pipeline:
+  //   1. scripts/prepare-wasm.mjs       — copy quickjs.wasm from node_modules + wasm-opt -Oz.
+  //   2. scripts/prepare-extensions.mjs — copy the 5 .so extensions into src/ext/ (v0.8).
+  //   3. scripts/build-stdlib.mjs       — esbuild the curated lib set into src/stdlib.bundle.txt.
+  //   4. scripts/engine-hash.mjs        — SHA-256 the wasm into src/engine-hash.js.
+  //   5. worker-build --release         — compile the Rust DO + glue bundle.
+  "build": {
+    "command": "node scripts/prepare-wasm.mjs && node scripts/prepare-extensions.mjs && node scripts/build-stdlib.mjs && node scripts/engine-hash.mjs && worker-build --release"
+  },
+
+  // quickjs.wasm + src/ext/*.so bundled as CompiledWasm => importable as precompiled
+  // WebAssembly.Module (workerd forbids runtime WebAssembly.compile of arbitrary bytes, so the
+  // extension .so MUST arrive precompiled). *.bundle.txt bundled as a Text module => string.
+  "rules": [
+    { "type": "CompiledWasm", "globs": ["src/quickjs.wasm", "src/ext/*.wasm"], "fallthrough": true },
+    { "type": "Text", "globs": ["src/stdlib.bundle.txt"], "fallthrough": true }
+  ],
+
+  "durable_objects": {
+    "bindings": [{ "name": "KERNEL_DO", "class_name": "KernelDO" }]
+  },
+
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["KernelDO"] }],
+
+  // R2 is OPTIONAL overflow only (images whose gzip image exceeds the SQLite hot
+  // path). The default snapshot store is DO SQLite (single row <=~2MB, else chunked).
+  // v0.9 reuses the existing montydyn-snapshots bucket with v09/ keys.
+  "r2_buckets": [
+    { "binding": "SNAPSHOTS", "bucket_name": "montydyn-snapshots" }
+  ],
+
+  // V0.5 OBSERVABILITY: Analytics Engine dataset. Every kernel op emits a datapoint
+  // (env.AE.writeDataPoint) with rich blobs/doubles. Queryable via the AE SQL API.
+  "analytics_engine_datasets": [
+    { "binding": "AE", "dataset": "montydyn_kernel" }
+  ]
+}
