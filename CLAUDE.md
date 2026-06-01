@@ -51,6 +51,10 @@ so a session sleeps when idle and wakes with full live state, no replay.
 
 **Milestones shipped:** V0→V0.8 (single-tenant kernel: durable hibernating REPL, SQLite-first heap snapshot, determinism, guards, stdlib, web extensions, mid-cell tripwire, AE observability). **v0.9** = codemode infra (host.ctx host-side context store + host.subLM + host.final; `@montydyn/sdk` + Code Mode `execute()` drop-in; `montydyn` CLI repl + depth-1 RLM loop — 4.36MB-context needle via host-side slicing; durable session hibernate/resume). **V1.0** = multi-tenant via DO Facets (SupervisorDO 64-shard + WS-hibernation PROXY model [facet-held sockets broken → supervisor holds+RPCs per frame] + per-session KernelFacet own SQLite, cold-restore, failure-isolation proven).
 
+**Shipped after V1.0:** **v0.9.1** big-context fix (chunked store, multi-MB survives cold-restore) · **V1.1** multi-tenant facet at v0.8 parity + adaptive keep-warm · **v1.2** per-tenant API-key auth + AE metering + `/usage` (billable SaaS seam) · **v0.9.2** bounded **lambda-RLM** combinators (SPLIT/MAP/REDUCE, terminates) + durable **agent code-mode** adapter · **notebook UI** (`montydyn-ui`: durable browser REPL + RLM demo) · **v0.9.3** native-C giant-alloc backstop (no WS-1006) + engine-migration journal + scale-validated (0% err @150 concurrent, bad-facet isolation).
+
+**PRODUCT COMPLETE (arc end):** montydyn is a durable, hibernating, **multi-tenant codemode/RLM REPL platform** — kernel + auth/metering + lambda-RLM + agent mode + SDK + CLI + UI, scale-validated, all known holes closed. Deployed: `montydyn-v093` (codemode kernel) · `montydyn-v12` (multi-tenant SaaS) · `montydyn-ui` (notebook). **Remaining to GA (NOT auto-done):** npm-publish `@montydyn/sdk` (needs owner OK) · scale-at-1000s · docs site · R2 stale-key prune (needs R2 S3 token). **Python kernel: DROPPED per owner.**
+
 ## Goal
 
 Build a **durable, hibernating, stateful REPL kernel** with Jupyter/IPython-kernel
