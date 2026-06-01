@@ -133,7 +133,14 @@ literally persist the heap.
       - **P2:** host-tool state (kv data) not persisted across restore. **P3:** fetch allowlist inert; error-preview drops message.
 
 - [x] **V0.2 BUILT (NOT merged)** (workflow this run) — `v0.2/`, deployed `montydyn-v02`. → `docs/results/v0.2.md`. Branch `feat/v0.2`.
-      Hardening on top of v0.1; smoke **41/41** live. v0/ + v0.1/ + their workers untouched. R2 keys namespaced `v02/`.
+      Hardening on top of v0.1; smoke **52/52** live (after the gate-fix pass). v0/ + v0.1/ + their workers untouched. R2 keys namespaced `v02/`.
+      - **GATE-FIX PASS:** closed two live gate failures — (P0) **cold-restore wedge**: the RESTORE guard now admits on the
+        snapshot's recorded `usedHeap` (new `used_heap` manifest column), NOT raw image bytes, so a spike>20MB-then-free session
+        cold-restores (safe-to-instantiate raw ceiling 45MB still fails too-big images safe). sizeGz "under-capture" was a gate
+        LCG-precision artifact, not a code bug (dump captures full linear memory; gzip correct — verified). (P1) **global-write loop**
+        `while(true){x=1}` now trips a typed TimeoutError, socket alive: root cause = **workerd throttles the host interrupt callback
+        after ~1.6k invocations/turn**, so the tick budget is hard-capped below it (default 1200 / max 1500). 10M tight loop on workerd
+        documented as exceeding the per-turn interrupt budget; certified heavy benchmark ~6M iters (or chunk across cells).
       - **P0 BUG-2/4 FIXED (un-wedge) + image shrink, with documented hard limit:** size-admission guard now on QuickJS
         **used heap** (`getMemoryUsage().memoryUsedSize`), not the monotonic `memory.buffer` → an in-envelope spike-then-free
         **checkpoints again** (no permanent SizeAdmissionError; store r2→sqlite). **Arena SCRUB** (alloc zero-buffers across freed
