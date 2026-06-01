@@ -173,6 +173,12 @@ literally persist the heap.
       - **Long-tail harness now in infra:** `v0.4/bench/` (open-loop cold-wake distribution by size) + per-restore `restoreTimings` telemetry. Re-runnable.
       - **Measurement caveat:** workerd freezes clock in-turn → sub-turn phases inferred by differencing, not faked.
 
+- [x] **v0.5 OBSERVABILITY + DEEP TEST** (workflow `woowhi0bs`) — `v0.5/`, deployed `montydyn-v05`. → `docs/results/v0.5-observability.md`. Merged.
+      - **Cloudflare Analytics Engine live:** `env.AE.writeDataPoint` per op (index=doId; 7 blobs op/restoreSource/store/errorName/configClock/valueType/label; 12 doubles totalServerMs/readMs/sizeRaw/sizeGz/usedHeap/cell/generation/gunzipMs/instantiateMs/growCount/nChunks/ok) → dataset `montydyn_kernel`, queryable via AE SQL API. Structured Workers Logs. (worker crate has no AE binding → called via js_sys Reflect on Env; ingestion lag ~30–90s; use `quantileWeighted`.)
+      - **Deep tests:** durability **11/11** (no holes under fault injection); scale **0 errors / 0 DO-kills @ 200 racers + 80 sessions**, mutex exact 0..199; adversarial fuzz **no sandbox escape**; idle-soak 4/4 + 120-cell integrity. Cold-start **confirmed platform-bound server-side** (restore phases read 0ms even at real 72s wakes).
+      - ⚠️ **Top finding (P1, outside envelope):** reproducible **~256MB monotonic-buffer DO-kill** — a session grown past the safe envelope can't recover (WASM memory monotonic). Guards catch the documented ≤57MB envelope; this is the extreme-scale edge. Also: interrupt-throttle escape edge at high prior-load.
+      - Minor: `host.fetch` returns `{}` instead of a typed reject on block (P3).
+
 ## Next (V1 — facets feasible, ordered)
 - **Cold-start: largely solved/accepted** — p50 network-bound, tail platform-bound. Remaining owned lever = R2-read path for >2MB images (stream reads / keep on SQLite). **Adaptive keep-warm** = a *future* supervisor-side policy: predict per-session access cadence, warm only the hot tail (heartbeat WS to dodge eviction), let the idle 90% sleep — algorithmically decided *when NOT to keep warm*. Don't build until V1 supervisor exists.
 1. **De-risk facet WebSocket hibernation** (API present, unproven) — the top gating unknown for V1.
