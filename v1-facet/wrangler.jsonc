@@ -1,0 +1,27 @@
+{
+  // V1 FACET SPIKE — supervisor DO + Worker Loader, proving the ADR-0003 packaging.
+  "name": "montydyn-facet",
+  "main": "src/supervisor.js",
+  "compatibility_date": "2026-04-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  // Supervisor DO must be a SQLite-backed class (facets require new_sqlite_classes).
+  "durable_objects": {
+    "bindings": [{ "name": "SUPERVISOR", "class_name": "SupervisorDO" }]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["SupervisorDO"] }
+  ],
+
+  // Worker Loader binding: lets the supervisor load dynamic DO classes at runtime.
+  "worker_loaders": [
+    { "binding": "LOADER" }
+  ],
+
+  // R2 overflow reused (namespaced under v1facet/) — only needed if the kernel facet
+  // overflows SQLite. Pre-existing bucket; do not delete.
+  "r2_buckets": [
+    { "binding": "SNAPSHOTS", "bucket_name": "montydyn-snapshots" }
+  ]
+}

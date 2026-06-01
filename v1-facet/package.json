@@ -1,0 +1,12 @@
+{
+  "name": "montydyn-facet",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bake": "node scripts/bake-modules.mjs",
+    "deploy": "node scripts/bake-modules.mjs && wrangler deploy"
+  },
+  "devDependencies": {
+    "ws": "^8.18.0"
+  }
+}
