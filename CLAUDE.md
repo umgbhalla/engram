@@ -179,8 +179,13 @@ literally persist the heap.
       - ⚠️ **Top finding (P1, outside envelope):** reproducible **~256MB monotonic-buffer DO-kill** — a session grown past the safe envelope can't recover (WASM memory monotonic). Guards catch the documented ≤57MB envelope; this is the extreme-scale edge. Also: interrupt-throttle escape edge at high prior-load.
       - Minor: `host.fetch` returns `{}` instead of a typed reject on block (P3).
 
+- [x] **DEEP-HIBERNATION TEST** (workflow `wohz9b923`) — `docs/results/deep-hibernation.md`. **7/7 cycles survived, ZERO loss** across real full eviction (base 3×12min, 5MB 2×12min, base 2×20min; socket CLOSED + idle held).
+      - Genuine reconstruction every time (`inMemory:false`, generation bumped), `sqlite-restore`, state/closures/arrays intact. AE corroborated server-side (restore+eval gen/cell match).
+      - **Deep cold-wake bounded, NO catastrophic placement penalty:** base 1.3MB ~130ms (even faster than shallow!); 5MB ~1.5–1.8s; base 20min ~1.3–1.5s. Dominant cost = **cold WS connect / DO spin-up ~950ms–1s** (platform), NOT our restore. ~1.5s worst real user wake.
+      - **Durability verdict: rock-solid at 20-min full eviction.** Confirms deep tail is platform-bound (WS connect + spin-up), and sizes the adaptive-keep-warm policy below.
+
 ## Next (V1 — facets feasible, ordered)
-- **Cold-start: largely solved/accepted** — p50 network-bound, tail platform-bound. Remaining owned lever = R2-read path for >2MB images (stream reads / keep on SQLite). **Adaptive keep-warm** = a *future* supervisor-side policy: predict per-session access cadence, warm only the hot tail (heartbeat WS to dodge eviction), let the idle 90% sleep — algorithmically decided *when NOT to keep warm*. Don't build until V1 supervisor exists.
+- **Cold-start: solved/accepted, now empirically sized.** p50 network-bound; deep-eviction worst real wake ~1.5s (platform WS-connect/spin-up), state always survives. Owned lever = R2-read path for >2MB images. **Adaptive keep-warm** (future, supervisor-side): most sessions eat the ~1.5s wake fine → keep-warm only for latency-sensitive hot sessions (heartbeat WS to dodge eviction); predict cadence, decide *when NOT to warm*. Build after V1 supervisor.
 1. **De-risk facet WebSocket hibernation** (API present, unproven) — the top gating unknown for V1.
 2. **Port the Rust DO shell → a JS facet DO class** (mutex, checkpoint commit-ordering, manifest SQL) wrapping `glue.js`; keep P3 async eval.
 3. **Switch WASM delivery to `{wasm}`** Worker-Loader module type (from CompiledWasm import).
