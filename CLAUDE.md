@@ -37,17 +37,20 @@ so a session sleeps when idle and wakes with full live state, no replay.
 | `results/v0.1.md` | V0.1 build report (when done) |
 | `TODO.md` | task board |
 
-**Code map:** `v0/` = shipped V0 kernel (`src/lib.rs` Rust DO, `src/glue.js` JS glue,
-`entry.mjs` CompiledWasm wrapper, `wrangler.jsonc`). `v0.1/` = V0.1 evolution (in progress).
-`experiments/exp-*/` = the 7 proven experiments (each self-contained, deployable).
+**Code map:** `v0.8/` = **current kernel** (`src/lib.rs` Rust DO, `src/glue.js` JS glue,
+`entry.mjs` CompiledWasm wrapper, `wrangler.jsonc`, `stdlib-src/`, `scripts/`). Older kernels
+`v0`→`v0.7` were **pruned from the tree** (lean working dir) — recover any from git history or the
+`v0.N-milestone` tags. `v1-facet/` = V1 facet proof. `experiments/exp-*/` = 7 proven experiments.
 `context/` = external repos (shallow submodules; `context/include.md` indexes them).
 
 **Workflow history** (background multi-agent runs, for provenance):
 `wkfcx55zi` feasibility research · `wnf82p8o5` EXP-6/7/8/9/4b · `ws0na8tg4` V0 build ·
 `wb2xbvb46` V0 stress · `wzv44v81d` V0.1 build.
 
-**Deployed CF resources:** Workers `montydyn-v0` (+ `montydyn-v01` for V0.1) and experiment
-workers `montydyn-exp{5a,6,7,9,4b}`; R2 bucket `montydyn-snapshots`. Account: Workers Paid.
+**Deployed CF resources (current):** Workers `montydyn-v08` (live kernel) + `montydyn-facet`
+(V1 proof) — all older version/experiment workers swept. R2 `montydyn-snapshots` (stale keys
+from deleted workers remain; needs an R2 S3 token to prune, cheap). AE dataset `montydyn_kernel`.
+Account: Workers Paid. Repo pushed to private `github.com/umgbhalla/montydyn`.
 
 ## Goal
 
