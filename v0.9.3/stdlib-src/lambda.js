@@ -101,7 +101,11 @@
   function partText(part, budget) {
     const cap = budget.leafChars;
     if (part && typeof part === "object" && typeof part.ctx === "string") {
-      const t = host.ctx.slice(part.start | 0, part.end | 0, part.ctx);
+      // P1 fix: a single-leaf (un-SPLIT) handle has no start/end -> default end to
+      // the FULL context length (host.ctx.len) so it doesn't slice(0,0) to empty.
+      const start = part.start | 0;
+      const end = part.end != null ? (part.end | 0) : host.ctx.len(part.ctx);
+      const t = host.ctx.slice(start, end, part.ctx);
       return t.length > cap ? t.slice(0, cap) : t;
     }
     const s = String(part == null ? "" : part);
