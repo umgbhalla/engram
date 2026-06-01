@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>montydyn — durable notebook</title>
+<style>
+  :root {
+    --bg: #0c0e14; --panel: #141823; --panel2: #1b2030; --border: #262d40;
+    --fg: #e6e9f0; --muted: #8b93a7; --accent: #6ea8fe; --green: #4ade80;
+    --amber: #fbbf24; --red: #f87171; --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  a { color: var(--accent); }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+    background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .3px; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  .grow { flex: 1; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px;
+    border-radius: 999px; font-size: 12px; font-family: var(--mono); border: 1px solid var(--border); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.warm { background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .dot.cold { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+  .dot.off { background: var(--red); }
+  .layout { display: grid; grid-template-columns: 1fr 340px; height: calc(100% - 53px); }
+  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } aside { display: none; } }
+  main { overflow-y: auto; padding: 16px; }
+  aside { background: var(--panel); border-left: 1px solid var(--border); overflow-y: auto; padding: 14px; }
+  .cell { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    margin-bottom: 14px; overflow: hidden; }
+  .cell.running { border-color: var(--accent); }
+  .cell-head { display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+    background: var(--panel2); border-bottom: 1px solid var(--border); font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .cell-head .num { color: var(--accent); }
+  .cell-head .grow { flex: 1; }
+  .cell textarea { width: 100%; border: 0; background: transparent; color: var(--fg);
+    font-family: var(--mono); font-size: 13px; padding: 10px; resize: vertical; min-height: 46px; outline: none; }
+  .out { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-word;
+    padding: 0 10px 10px; }
+  .out .log { color: var(--muted); }
+  .out .val { color: var(--green); }
+  .out .err { color: var(--red); }
+  .out .final { color: var(--amber); }
+  .meta { font-family: var(--mono); font-size: 10px; color: var(--muted); padding: 4px 10px;
+    border-top: 1px dashed var(--border); }
+  button { background: var(--panel2); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 7px; padding: 5px 11px; cursor: pointer; font-size: 12px; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #06121f; border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  label { display: block; font-size: 11px; color: var(--muted); margin: 10px 0 3px; text-transform: uppercase; letter-spacing: .5px; }
+  input, textarea.cfg, select { width: 100%; background: var(--panel2); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 7px; padding: 6px 8px; font-family: var(--mono); font-size: 12px; }
+  textarea.cfg { resize: vertical; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row > * { flex: 1; }
+  h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); margin: 18px 0 6px; border-top: 1px solid var(--border); padding-top: 14px; }
+  h3:first-child { border-top: 0; padding-top: 0; }
+  .hint { color: var(--muted); font-size: 11px; }
+  .toolbar { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+  code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; font-family: var(--mono); }
+</style>
+</head>
+<body>
+<header>
+  <h1>montydyn</h1>
+  <span class="sub">durable hibernating notebook · codemode kernel</span>
+  <div class="grow"></div>
+  <span class="pill" id="statePill"><span class="dot off" id="stateDot"></span><span id="stateTxt">disconnected</span></span>
+  <span class="pill" id="genPill" title="kernel generation / committed cell">gen –</span>
+</header>
+
+<div class="layout">
+  <main>
+    <div class="toolbar">
+      <button class="primary" id="addCell">+ Cell</button>
+      <button id="runAll">Run all</button>
+      <button id="hibernate" title="force-evict in-memory kernel; durable snapshot kept">Hibernate</button>
+      <button id="reconnect" title="reconnect to the same durable session id">Reconnect</button>
+      <button id="resetSession" title="drop kernel + clear snapshot">Reset</button>
+    </div>
+    <div id="cells"></div>
+  </main>
+
+  <aside>
+    <h3>Session</h3>
+    <label>Kernel endpoint (wss)</label>
+    <input id="cfgEndpoint" value="wss://montydyn-v092.umg-bhalla88.workers.dev" />
+    <label>API key (only for montydyn-v12; blank for v092)</label>
+    <input id="cfgApiKey" placeholder="md_… (leave blank for v092)" />
+    <label>Session id (reconnect to restore state)</label>
+    <div class="row">
+      <input id="cfgSession" />
+      <button id="newSession" style="flex:0 0 auto">new</button>
+    </div>
+    <p class="hint">State survives reload — same session id resumes the hibernated heap.</p>
+
+    <h3>Config</h3>
+    <label>Clock</label>
+    <select id="cfgClock"><option value="seeded">seeded (deterministic)</option><option value="system">system</option></select>
+    <label>RNG seed</label>
+    <input id="cfgSeed" value="42" />
+    <label>Stdlib modules (comma, or "true" = default set)</label>
+    <input id="cfgModules" value="true" />
+    <label>Fetch allowlist (comma hosts, "true"=all, "false"=none)</label>
+    <input id="cfgFetch" value="false" />
+    <button id="applyConfig" style="margin-top:10px;width:100%">Apply config (fresh session)</button>
+    <p class="hint">Config is set on session create; apply makes a new session id so it takes effect on a fresh heap.</p>
+
+    <h3>RLM · needle-in-context</h3>
+    <label>Context (the haystack)</label>
+    <textarea class="cfg" id="rlmCtx" rows="5">The quarterly report is dull. Buried on line 9999 the secret access code is ZEBRA-7741. Everything else is filler text about synergy and roadmaps.</textarea>
+    <label>Query</label>
+    <input id="rlmQuery" value="What is the secret access code?" />
+    <div class="row" style="margin-top:8px">
+      <button id="runRlm">run rlm()</button>
+      <button id="runLambda">lambdaRLM()</button>
+    </div>
+    <p class="hint">A regex-grounded client subLM finds the needle across chunks → host.final → FINAL.</p>
+    <div class="out" id="rlmOut"></div>
+  </aside>
+</div>
+
+<script type="module">
+// ---------------------------------------------------------------------------
+// montydyn browser client — speaks the kernel WS protocol directly.
+//   /ws?id=<session>  ;  {t:"create",config} {t:"eval",src} {t:"gen"} {t:"evict"}
+//   {t:"reset"} {t:"setContext",name,blob} {t:"final"}
+// For montydyn-v12 the WS path is /connect?session=<id>&apiKey=<key>; we autodetect.
+// The cooperative subLM RLM loop is implemented here (mirrors @montydyn/sdk) so it runs
+// fully against the REMOTE kernel — the kernel never reaches back to the browser.
+// ---------------------------------------------------------------------------
+
+const $ = (id) => document.getElementById(id);
+const LS = {
+  get k(){ return localStorage.getItem("md_session"); },
+  set k(v){ localStorage.setItem("md_session", v); },
+};
+
+function randId() { return "nb-" + Math.random().toString(36).slice(2, 10); }
+
+class Kernel {
+  constructor() { this.ws = null; this.queue = Promise.resolve(); this.onState = () => {}; }
+  url() {
+    const ep = $("cfgEndpoint").value.replace(/\/+$/, "");
+    const id = $("cfgSession").value;
+    const key = $("cfgApiKey").value.trim();
+    // v12 uses /connect?session=&apiKey= ; v092 uses /ws?id=
+    if (key || /-v1\d?\b/.test(ep) || /connect/.test(ep)) {
+      const u = `${ep}/connect?session=${encodeURIComponent(id)}`;
+      return key ? `${u}&apiKey=${encodeURIComponent(key)}` : u;
+    }
+    return `${ep}/ws?id=${encodeURIComponent(id)}`;
+  }
+  async open() {
+    if (this.ws && this.ws.readyState === 1) return;
+    this.onState("connecting");
+    await new Promise((res, rej) => {
+      const ws = new WebSocket(this.url());
+      this.ws = ws;
+      ws.addEventListener("open", () => res(), { once: true });
+      ws.addEventListener("error", (e) => rej(new Error("ws error")), { once: true });
+      ws.addEventListener("close", () => this.onState("disconnected"), { once: true });
+    });
+    // send create config once
+    if (this._config) await this.raw({ t: "create", config: this._config });
+  }
+  setConfig(c) { this._config = c; }
+  raw(msg, timeoutMs = 120000) {
+    return new Promise((resolve, reject) => {
+      const ws = this.ws;
+      const onMsg = (ev) => { cleanup(); try { resolve(JSON.parse(ev.data)); } catch (e) { reject(e); } };
+      const onClose = () => { cleanup(); reject(new Error("ws closed before reply")); };
+      const t = setTimeout(() => { cleanup(); reject(new Error("rpc timeout")); }, timeoutMs);
+      function cleanup() { clearTimeout(t); ws.removeEventListener("message", onMsg); ws.removeEventListener("close", onClose); }
+      ws.addEventListener("message", onMsg, { once: true });
+      ws.addEventListener("close", onClose, { once: true });
+      ws.send(JSON.stringify(msg));
+    });
+  }
+  send(msg, timeoutMs) {
+    const run = async () => { await this.open(); return this.raw(msg, timeoutMs); };
+    const p = this.queue.then(run, run);
+    this.queue = p.then(() => {}, () => {});
+    return p;
+  }
+  eval(src, t) { return this.send({ t: "eval", src }, t); }
+  gen() { return this.send({ t: "gen" }); }
+  evict() { return this.send({ t: "evict" }); }
+  reset() { return this.send({ t: "reset" }); }
+  setContext(name, blob) { return this.send({ t: "setContext", name, blob: String(blob) }); }
+  final() { return this.send({ t: "final" }); }
+  close() { if (this.ws) try { this.ws.close(); } catch (_) {} this.ws = null; }
+}
+
+const kernel = new Kernel();
+
+// ---- state indicator -------------------------------------------------------
+async function refreshState() {
+  try {
+    const g = await kernel.gen();
+    const warm = !!g.inMemory;
+    $("stateDot").className = "dot " + (warm ? "warm" : "cold");
+    $("stateTxt").textContent = warm ? "warm (in-memory)" : "cold (snapshot)";
+    $("genPill").textContent = `gen ${g.generation} · cell ${g.committedCell}`;
+  } catch (e) {
+    $("stateDot").className = "dot off";
+    $("stateTxt").textContent = "disconnected";
+    $("genPill").textContent = "gen –";
+  }
+}
+kernel.onState = (s) => {
+  if (s === "disconnected") { $("stateDot").className = "dot off"; $("stateTxt").textContent = "disconnected"; }
+  if (s === "connecting") { $("stateDot").className = "dot"; $("stateTxt").textContent = "connecting…"; }
+};
+
+// ---- config ----------------------------------------------------------------
+function buildConfig() {
+  const modulesRaw = $("cfgModules").value.trim();
+  let modules = true;
+  if (modulesRaw && modulesRaw !== "true") modules = modulesRaw === "false" ? false : modulesRaw.split(",").map(s => s.trim()).filter(Boolean);
+  const fetchRaw = $("cfgFetch").value.trim();
+  let fetch = false;
+  if (fetchRaw === "true") fetch = true; else if (fetchRaw && fetchRaw !== "false") fetch = fetchRaw.split(",").map(s => s.trim()).filter(Boolean);
+  return {
+    clock: $("cfgClock").value,
+    rngSeed: Number($("cfgSeed").value) || 0,
+    modules,
+    fetch,
+  };
+}
+
+// ---- cells -----------------------------------------------------------------
+let cellSeq = 0;
+function addCell(src = "") {
+  const id = ++cellSeq;
+  const el = document.createElement("div");
+  el.className = "cell";
+  el.innerHTML = `
+    <div class="cell-head"><span class="num">[${id}]</span><span class="grow"></span>
+      <button data-run>▶ run (⇧⏎)</button><button data-del>✕</button></div>
+    <textarea spellcheck="false" placeholder="// JS — runs against the durable namespace">${src}</textarea>
+    <div class="out" hidden></div><div class="meta" hidden></div>`;
+  const ta = el.querySelector("textarea");
+  const out = el.querySelector(".out");
+  const meta = el.querySelector(".meta");
+  ta.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && e.shiftKey) { e.preventDefault(); run(); }
+  });
+  el.querySelector("[data-run]").onclick = run;
+  el.querySelector("[data-del]").onclick = () => el.remove();
+  async function run() {
+    el.classList.add("running"); out.hidden = false; out.innerHTML = "<span class='log'>running…</span>";
+    const t0 = performance.now();
+    try {
+      const r = await kernel.eval(ta.value);
+      renderResult(out, r);
+      const ms = Math.round(performance.now() - t0);
+      meta.hidden = false;
+      const restored = r.inMemoryBefore === false;
+      meta.innerHTML = `cell ${r.cell} · gen ${r.generation} · ${ms}ms` +
+        (restored ? ` · <span style="color:var(--amber)">cold-restored (${r.restoreSource||"snapshot"})</span>` : ` · warm`) +
+        (r.checkpoint && r.checkpoint.sizeGz ? ` · snap ${(r.checkpoint.sizeGz/1024).toFixed(1)}KB gz` : "");
+    } catch (e) {
+      out.innerHTML = `<span class='err'>${esc(String(e.message||e))}</span>`;
+    } finally { el.classList.remove("running"); refreshState(); }
+  }
+  el._run = run; el._ta = ta;
+  $("cells").appendChild(el);
+  return el;
+}
+
+function renderResult(out, r) {
+  let html = "";
+  for (const l of (r.logs || [])) {
+    const txt = typeof l === "string" ? l : `${l.level}: ${l.text}`;
+    html += `<div class="log">› ${esc(txt)}</div>`;
+  }
+  if (!r.ok && r.error) {
+    html += `<div class="err">✖ ${esc(r.error.name||"Error")}: ${esc(r.error.message||"")}</div>`;
+  } else {
+    const v = r.valuePreview != null ? r.valuePreview : r.value;
+    if (v !== null && v !== undefined && v !== "")
+      html += `<div class="val">⇒ ${esc(typeof v === "string" ? v : JSON.stringify(v))}</div>`;
+    else html += `<div class="log">⇒ <i>undefined</i></div>`;
+  }
+  if (r.final && r.final.kind)
+    html += `<div class="final">★ FINAL [${r.final.kind}]: ${esc(String(r.final.value))}</div>`;
+  out.innerHTML = html || "<span class='log'>(no output)</span>";
+}
+function esc(s) { return String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+
+// ---- RLM: cooperative subLM loop over a pasted context ---------------------
+const SUBLM_SHIM = `
+  (() => {
+    globalThis.__subLM_answers = globalThis.__subLM_answers || {};
+    globalThis.__subLM_queue = [];
+    const PENDING = "__SUBLM_PENDING__";
+    const keyOf = (p,o) => { try { return JSON.stringify([p,o||null]); } catch(_) { return String(p); } };
+    globalThis.host = new Proxy(globalThis.host, { get(t,name){
+      if (name === 'subLM') return (prompt,opts) => {
+        const k = keyOf(String(prompt),opts);
+        if (Object.prototype.hasOwnProperty.call(globalThis.__subLM_answers,k)) return Promise.resolve(globalThis.__subLM_answers[k]);
+        globalThis.__subLM_queue.push({ id:k, prompt:String(prompt), opts:opts||null }); throw PENDING; };
+      return t[name];
+    }});
+    globalThis.__subLM_run = (codeStr) => { globalThis.__subLM_queue = [];
+      try { return eval(codeStr); } catch(e){ if (e===PENDING || (e&&e.message===PENDING)) return {__pending:true}; throw e; } };
+    globalThis.__subLM_pending = () => globalThis.__subLM_queue.slice();
+    globalThis.__subLM_fulfill = (a) => { Object.assign(globalThis.__subLM_answers,a); return Object.keys(a).length; };
+    return 'subLM-shim-ready';
+  })()`;
+
+function rootModel(query, contextName) {
+  return `
+    (async () => {
+      const name = ${JSON.stringify(contextName)}, q = ${JSON.stringify(query)};
+      const total = host.ctx.len(name);
+      const chunks = host.ctx.chunk(4000, name);
+      const parts = [];
+      for (const c of chunks) {
+        const text = host.ctx.get(c.i, 4000, name);
+        parts.push(await host.subLM("Query: " + q + "\\n\\nChunk " + c.i + ":\\n" + text, { chunk: c.i }));
+      }
+      const answer = await host.subLM("Query: " + q + "\\n\\nReduce these partials into ONE answer:\\n" + parts.join("\\n---\\n"), { reduce: true });
+      host.final(answer);
+      return { totalChars: total, nChunks: chunks.length };
+    })()`;
+}
+
+// Client-side leaf oracle: a regex-grounded "model" that extracts the answer from a chunk.
+// (No external LLM needed for the needle demo; it grounds on what's literally in the slice.)
+function clientSubLM(query, { prompt }) {
+  // reduce step: pick the first non-"not found" partial
+  if (/Reduce these partials/.test(prompt)) {
+    const lines = prompt.split("\n").filter(l => l && !/^Query:|^Reduce|^---/.test(l));
+    const hit = lines.find(l => !/not found|no code|nothing/i.test(l) && /[A-Z]{2,}-?\d|code|answer/i.test(l));
+    return hit ? hit.trim() : (lines[0] || "not found").trim();
+  }
+  // chunk step: look for a code-like token (the needle), else report not found
+  const m = prompt.match(/\b([A-Z]{3,}-\d{3,}|[A-Z0-9]{4,}-[A-Z0-9]{2,})\b/);
+  if (m) return "Found: the code is " + m[1];
+  return "not found in this chunk";
+}
+
+async function runRlm(useLambda) {
+  const out = $("rlmOut"); out.innerHTML = "<span class='log'>setting context…</span>";
+  const query = $("rlmQuery").value;
+  const ctx = $("rlmCtx").value;
+  try {
+    await kernel.setContext("context", ctx);
+    await kernel.eval(SUBLM_SHIM);
+    await kernel.eval(`globalThis.__subLM_answers={}; globalThis.__subLM_queue=[]; 0`);
+    let subLMCalls = 0, log = [];
+    const code = useLambda
+      ? `(async () => { const r = await globalThis.lambda.lambdaRLM(${JSON.stringify(query)}, { ctx:"context", maxDepth:2, costBudget:16 }); host.final(r.answer); return r; })()`
+      : rootModel(query, "context");
+    if (useLambda) {
+      const has = await kernel.eval("typeof globalThis.lambda === 'object' && typeof globalThis.lambda.lambdaRLM === 'function'");
+      if (!(has.value === true || has.value === "true")) {
+        out.innerHTML = "<span class='err'>lambdaRLM needs the in-VM `lambda` module — Apply config with modules=true (default), fresh session.</span>";
+        return;
+      }
+    }
+    out.innerHTML = "<span class='log'>running RLM loop…</span>";
+    for (let pump = 0; pump < 400; pump++) {
+      await kernel.eval(`globalThis.__subLM_run(${JSON.stringify(code)})`, 120000);
+      const pending = await kernel.eval(`JSON.stringify(globalThis.__subLM_pending())`);
+      let reqs = [];
+      try { reqs = typeof pending.value === "string" ? JSON.parse(pending.value) : (Array.isArray(pending.value) ? pending.value : []); } catch (_) {}
+      if (!reqs.length) break;
+      const answers = {};
+      for (const req of reqs) { subLMCalls++; answers[req.id] = clientSubLM(query, req); }
+      await kernel.eval(`globalThis.__subLM_fulfill(${JSON.stringify(answers)})`);
+    }
+    const fin = await kernel.final();
+    const f = fin.final && fin.final.kind ? fin.final : null;
+    out.innerHTML =
+      `<div class="log">subLM calls: ${subLMCalls}</div>` +
+      (f ? `<div class="final">★ FINAL [${f.kind}]: ${esc(String(f.value))}</div>`
+         : `<div class="err">no FINAL recorded</div>`);
+    refreshState();
+  } catch (e) { out.innerHTML = `<span class='err'>${esc(String(e.message||e))}</span>`; }
+}
+
+// ---- wiring ----------------------------------------------------------------
+function ensureSession() {
+  if (!$("cfgSession").value) $("cfgSession").value = LS.k || randId();
+  LS.k = $("cfgSession").value;
+}
+
+$("addCell").onclick = () => addCell();
+$("runAll").onclick = async () => { for (const el of $("cells").children) await el._run(); };
+$("newSession").onclick = () => { $("cfgSession").value = randId(); LS.k = $("cfgSession").value; kernel.close(); refreshState(); };
+$("reconnect").onclick = async () => { kernel.close(); kernel.setConfig(buildConfig()); await kernel.open(); refreshState(); };
+$("hibernate").onclick = async () => { await kernel.evict(); refreshState(); };
+$("resetSession").onclick = async () => { await kernel.reset(); refreshState(); };
+$("applyConfig").onclick = async () => {
+  $("cfgSession").value = randId(); LS.k = $("cfgSession").value;
+  kernel.close(); kernel.setConfig(buildConfig()); await kernel.open();
+  await kernel.eval("1"); refreshState();
+};
+$("runRlm").onclick = () => runRlm(false);
+$("runLambda").onclick = () => runRlm(true);
+
+// boot
+ensureSession();
+kernel.setConfig(buildConfig());
+addCell('// durable across reload: increment a counter that lives in the heap\nglobalThis.n = (globalThis.n||0) + 1;\nconsole.log("ran", n, "times");\nn');
+addCell('// closures survive hibernation too\nglobalThis.inc = globalThis.inc || (()=>++globalThis.n);\ninc()');
+kernel.open().then(refreshState).catch(refreshState);
+setInterval(refreshState, 15000);
+</script>
+</body>
+</html>

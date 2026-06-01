@@ -1,0 +1,12 @@
+{
+  // montydyn-ui — the product face: a browser notebook/REPL over the codemode kernel.
+  // A single Worker that serves the SPA (HTML embedded as a Text module). The page talks
+  // WebSocket directly to the live montydyn-v092 kernel (wss://montydyn-v092...workers.dev/ws).
+  "name": "montydyn-ui",
+  "main": "src/worker.js",
+  "compatibility_date": "2025-05-01",
+  "observability": { "enabled": true },
+  "rules": [
+    { "type": "Text", "globs": ["src/index.html"], "fallthrough": true }
+  ]
+}
