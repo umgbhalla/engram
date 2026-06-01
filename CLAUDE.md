@@ -166,7 +166,15 @@ literally persist the heap.
       - **WASM-in-facet resolved:** raw-bytes runtime `WebAssembly.compile` is BLOCKED ("Wasm code generation disallowed by embedder"), BUT an **undocumented `{wasm:ArrayBuffer}` Worker-Loader module type** delivers a pre-compiled Module that instantiates → kernel needs only a delivery tweak, NOT a rewrite.
       - **Hard constraint:** **facets CANNOT set alarms** ("Facets currently cannot set alarms") → idle/TTL scheduling MUST live on the supervisor DO. Kernel durability is per-cell sync snapshot, doesn't need alarms.
 
+- [x] **v0.4 COLD-START BUILT + MERGED** (workflows `w5irh0y0q` build + `w4fs2wmv7` research) — `v0.4/`, deployed `montydyn-v04`. → `docs/results/v0.4-coldstart.md`, `docs/research/coldstart-and-v1.md`. 62/62 smoke, zero regression.
+      - **Real numbers (measured, honest):** base cold p50 **180ms** vs warm 163ms (~17ms cold delta) → p50 is **~all network/DO-wake**. Tail p99 **640ms** vs warm 180ms = **platform cold-isolate spin-up + first WASM instantiate, AROUND our code** (our restore phases read 0ms — sub-await). 5MB image: **R2 GET readMs ~597ms** = the one in-kernel-owned multi-hundred-ms cost.
+      - **Conclusion:** cold start is **network/platform-bound** at v0 sizes — NOT fixable in-kernel; QuickJS init <300µs, read/gunzip/blit sub-ms. Only owned lever = **keep big images off R2 / stream R2 reads** (matters only >2MB gz).
+      - **Wins:** pre-size = verified single-grow invariant (no latency change; module exports own memory so can't inject); lazy-instantiate = gen/ping pay no instantiate (~49ms saved on non-eval); **wasm-opt -Oz** quickjs.wasm −8.8% (1.59→1.45MB), byte-identical correctness.
+      - **Long-tail harness now in infra:** `v0.4/bench/` (open-loop cold-wake distribution by size) + per-restore `restoreTimings` telemetry. Re-runnable.
+      - **Measurement caveat:** workerd freezes clock in-turn → sub-turn phases inferred by differencing, not faked.
+
 ## Next (V1 — facets feasible, ordered)
+- **Cold-start: largely solved/accepted** — p50 network-bound, tail platform-bound. Remaining owned lever = R2-read path for >2MB images (stream reads / keep on SQLite). **Adaptive keep-warm** = a *future* supervisor-side policy: predict per-session access cadence, warm only the hot tail (heartbeat WS to dodge eviction), let the idle 90% sleep — algorithmically decided *when NOT to keep warm*. Don't build until V1 supervisor exists.
 1. **De-risk facet WebSocket hibernation** (API present, unproven) — the top gating unknown for V1.
 2. **Port the Rust DO shell → a JS facet DO class** (mutex, checkpoint commit-ordering, manifest SQL) wrapping `glue.js`; keep P3 async eval.
 3. **Switch WASM delivery to `{wasm}`** Worker-Loader module type (from CompiledWasm import).
