@@ -1,0 +1,12 @@
+{
+  "name": "@montydyn/cli",
+  "version": "0.9.0",
+  "description": "CLI for the durable montydyn codemode/RLM kernel: configurable REPL + depth-1 RLM loop.",
+  "type": "module",
+  "bin": { "montydyn": "montydyn.mjs" },
+  "files": ["montydyn.mjs", "README.md"],
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "license": "MIT"
+}

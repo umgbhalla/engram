@@ -1,0 +1,53 @@
+{
+  // montydyn V1.1 — multi-tenant kernel via DO Facets, at v0.8 feature parity.
+  // SupervisorDO (normal SQLite DO): routing + adaptive keep-warm + WS-proxy + worker_loaders
+  //   + mediated per-tenant egress (HttpGateway WorkerEntrypoint as the facet globalOutbound).
+  // Per-session KernelFacet (dynamically loaded via LOADER): own SQLite, {wasm} engine,
+  //   configurable in-VM stdlib (lodash/dayjs/nanoid/uuid/zod, mathjs opt-in) + the 5 Tier-0
+  //   native extensions (crypto.subtle/getRandomValues/randomUUID, TextEncoder/Decoder, URL,
+  //   structuredClone, Headers) delivered via {text}/{js}/{wasm} loader modules.
+  "name": "montydyn-v12",
+  "main": "src/supervisor.js",
+  "compatibility_date": "2026-04-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  "build": {
+    // Build the esbuilt stdlib bundle + bake the module set (glue+facet+wasm+dist+stdlib+ext)
+    // into src/modules.gen.js before wrangler bundles the supervisor.
+    "command": "node scripts/build-stdlib.mjs && node scripts/bake-modules.mjs"
+  },
+
+  "durable_objects": {
+    "bindings": [{ "name": "SUPERVISOR", "class_name": "SupervisorDO" }]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["SupervisorDO"] }
+  ],
+
+  "worker_loaders": [
+    { "binding": "LOADER" }
+  ],
+
+  // V1.1 mediated egress: optional coarse, tenant-wide host allow/deny for the HttpGateway
+  // (the facet globalOutbound). Unset => the gateway forwards and the in-VM per-session
+  // config.fetch allowlist is the control. Set MEDIATED_FETCH_ALLOW/DENY (comma hostnames)
+  // to hard-restrict ALL egress at the supervisor seam.
+  "vars": {
+    "MEDIATED_FETCH_ALLOW": "",
+    "MEDIATED_FETCH_DENY": "",
+    // V1.2 metering: GET /usage queries the AE SQL API. The account id is non-secret (var);
+    // CF_API_TOKEN + ADMIN_TOKEN are deployed as Worker SECRETS (wrangler secret put), never
+    // committed. CF_ACCOUNT_ID also accepted as a secret/env; this var is the default.
+    "CF_ACCOUNT_ID": "54a86ffba6a98141d2b1b4a1035334ed"
+  },
+
+  // Reuse pre-existing infra (namespaced v1/ keys). SQLite-first snapshot is in the
+  // facet; R2 is the overflow target and AE is telemetry.
+  "r2_buckets": [
+    { "binding": "SNAPSHOTS", "bucket_name": "montydyn-snapshots" }
+  ],
+  "analytics_engine_datasets": [
+    { "binding": "AE", "dataset": "montydyn_kernel" }
+  ]
+}
