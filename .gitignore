@@ -26,3 +26,5 @@ scratch/
 
 # claude harness
 .claude/
+v1-spike-ws/
+v1-spike-wasm/
