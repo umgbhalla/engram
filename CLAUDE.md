@@ -156,11 +156,24 @@ literally persist the heap.
       - **P2 DONE:** host-tool kv state serialized in snapshot manifest (`kv_json`), re-hydrated on restore → `kv.get`/`keys` survive cold wake.
       - **No regression:** BUG-1, config+tools across evict, seeded clock/RNG, state survival all green.
 
-## Next (post-v0.2 — V1-facet gate is CLEAR)
-- **P0/P1/P2 all cleared.** V1-facet safety gate (memory bounds, untrusted runaway loops, host-tool state) is met; accepted limits documented (raw buffer doesn't shrink in place; >~45MB spike needs reset; >~5–6M single-cell loops false-trip safely).
-- **P3 (small, do before/with V1):** real fetch egress + allowlist enforcement; error-as-VALUE preview drops message/stack.
-- **V1 — DO Facets** (ADR-0003): supervisor DO + per-session kernel facets (each isolated SQLite), Worker Loader re-enters for per-tenant kernel code; heap-snapshot stays inside each facet. This is the multi-tenant packaging.
-- Deferred: beyond-envelope memory reclaim (value-serialization / per-session cap); streaming gunzip (>30 MB images); Python kernel (RustPython); Rivet ActorCore.
+- [x] **P3 (v0.3) BUILT + MERGED** (workflow `w8z0wmn49`) — `v0.3/`, deployed `montydyn-v03`. Verified 16/16 + 52/52, zero regression.
+      - **Real fetch egress:** `host.fetch(url,init)` → DO-side `fetch()` → `{status,ok,headers,body}`. Eval is now **ASYNC** (fetch pump; eval binding `Promise<String>`) so cells can `await host.fetch`.
+      - **Allowlist enforced:** `config.fetch` false=block all / true=all / `[hosts]`=hostnames; else typed `FetchBlockedError` (rejected VM promise, socket alive). Fetch adds 0 entropy → determinism preserved.
+      - **Error-as-value preview** now includes name+message+short stack (`valueType:"error"`).
+- [x] **V1 FACET SPIKE — WORKS** (workflow `w8z0wmn49`) — `v1-facet/`, deployed `montydyn-facet`. → `docs/results/v1-facet-spike.md`, `docs/results/v1-direction.md`. **All 5 ADR-0003 steps proven LIVE:**
+      - Supervisor DO (+`worker_loaders`) loads a DO class via `LOADER.getDurableObjectClass`, runs it as a facet (`ctx.facets.get`) with its **own isolated SQLite** (facet can't read supervisor's secret); two facets independent.
+      - **Real quickjs kernel runs as a facet**, evals stateful cells, snapshots heap into the **facet's own SQLite**, **cold-restores across `ctx.facets.abort`** (z=99 survived, no replay).
+      - **WASM-in-facet resolved:** raw-bytes runtime `WebAssembly.compile` is BLOCKED ("Wasm code generation disallowed by embedder"), BUT an **undocumented `{wasm:ArrayBuffer}` Worker-Loader module type** delivers a pre-compiled Module that instantiates → kernel needs only a delivery tweak, NOT a rewrite.
+      - **Hard constraint:** **facets CANNOT set alarms** ("Facets currently cannot set alarms") → idle/TTL scheduling MUST live on the supervisor DO. Kernel durability is per-cell sync snapshot, doesn't need alarms.
+
+## Next (V1 — facets feasible, ordered)
+1. **De-risk facet WebSocket hibernation** (API present, unproven) — the top gating unknown for V1.
+2. **Port the Rust DO shell → a JS facet DO class** (mutex, checkpoint commit-ordering, manifest SQL) wrapping `glue.js`; keep P3 async eval.
+3. **Switch WASM delivery to `{wasm}`** Worker-Loader module type (from CompiledWasm import).
+4. **Build SupervisorDO** — owns routing + alarms + `worker_loaders`; per-session kernel facets, per-tenant isolation.
+5. **Scale/cold-start validation** — facet count, eviction, `facets.delete`, RPC budget.
+- Deferred: beyond-envelope memory reclaim; streaming gunzip (>30 MB); Python kernel (RustPython); Rivet ActorCore.
+- Open V1 risks: facet WS hibernation, `{wasm}` type undocumented, multi-named-facet scale, loader codeId cache foot-gun.
 
 ## Repo conventions (multi-agent)
 
