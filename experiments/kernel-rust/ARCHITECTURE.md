@@ -1,0 +1,94 @@
+# engram-rust — Rust kernel build (Phase 1a)
+
+Deployed: `engram-rust` (https://engram-rust.umg-bhalla88.workers.dev), R2 prefix `benchrust/`.
+Live functional suite: **24/24 PASS**. Engine ABI harness: **PASS**.
+
+## Architecture chosen: Rust-DO shell + rquickjs-engine wasm (CompiledWasm) + thin JS WASI shim
+
+Two wasm modules, mirroring exactly how the JS kernel ships quickjs.wasm:
+
+```
+entry.mjs  --import engine.wasm (CompiledWasm) + engine-hash.js--> globalThis.__ENGINE_MODULE
+   |
+src/lib.rs  = Rust DurableObject (workers-rs, wasm32-unknown-unknown)
+   |   protocol/SQL/snapshot-store/mutex/checkpoint  (ALL Rust)
+   |   binds via #[wasm_bindgen(module="/src/kernel-glue.mjs")]
+   v
+src/kernel-glue.mjs = THIN JS WASI shim — NO business logic. Only:
+   - WASI preview1 imports (seeded random_get, frozen clock, fd_write->console)
+   - instantiate the engine + memory.buffer BLIT (snapshot substrate) + gzip
+   - host.fetch IMPLEMENTATION (DO-side fetch + allowlist) — the only effect the
+     wasip1 engine can't do itself
+   v
+engine/src/lib.rs = rquickjs ENGINE (wasm32-wasip1) — ALL kernel logic in Rust:
+   eval (async, host-call park/resume) · value-preview · 3 guards · determinism ·
+   host.kv (in-engine, persisted) · entropy counters · kv export/import
+```
+
+**Why this and not pure workers-rs:** rquickjs compiles to `wasm32-wasip1`; workers-rs DOs
+compile to `wasm32-unknown-unknown`. They cannot be one module. W1 proved a wasip1 module runs
+on CF via CompiledWasm + a JS WASI shim — so the engine ships exactly like quickjs.wasm does in
+the JS kernel, and the snapshot substrate (the literal `memory.buffer` blit) is identical. The
+2000-line glue.js is replaced: its logic now lives in the Rust engine wasm; the JS that remains
+(`kernel-glue.mjs`) is pure plumbing.
+
+## What compiles / bundles
+
+- engine wasm: 740 KB (`cargo build --release --target wasm32-wasip1`).
+- worker bundle: 1.16 MB / 480 KB gzip — `wrangler deploy --dry-run` confirms it bundles, under
+  the 10 MB worker cap.
+
+## Parity coverage (v0.9.3 target)
+
+| Requirement | Status |
+|---|---|
+| WS+HTTP frames: create/eval/ping/gen/reset/evict/health | DONE |
+| eval-result {ok,value,valueType,valuePreview,logs,error} + checkpoint frame | DONE |
+| stateful multi-cell (heap persists across evals) | DONE |
+| snapshot raw memory.buffer + counters/kv → DO-SQLite chunks (64KB), R2 overflow >2MB gz | DONE |
+| genuine evict → cold-restore (blit into fresh instance) | DONE (24/24 incl. closure private + pending promise) |
+| seeded determinism (Rust clock+RNG), entropy counters in manifest | DONE |
+| guard: interrupt instruction budget (TimeoutError) | DONE |
+| guard: memory limit | DONE (rquickjs set_memory_limit 64MB) |
+| guard: BUFFER-GROWTH TRIPWIRE (the adversarial fast-array bomb fix) | DONE — interrupt-check + post-cell check; both `push(new Array(100000))` and single `new Uint8Array(40MB)` caught as recoverable MemoryLimitError, socket alive |
+| host.fetch (DO-side, allowlist) | DONE (block+allow live) |
+| host.kv (small, persisted across restore) | DONE |
+| value-preview util.inspect-style (Map/Set/Date/RegExp/Symbol/Promise/Error, NOT JSON {}) | DONE — the FAFO bug fixed from the start |
+| crash-atomic checkpoint (DO write-coalescing; R2 swap-then-delete) | DONE |
+
+## Key engineering notes / one real blocker handled
+
+- **Interrupt-counter patch (REQUIRED for the tripwire to work).** QuickJS only calls the host
+  interrupt handler every `JS_INTERRUPT_COUNTER_INIT` (default **10000**) poll sites. At that
+  cadence a fast native-alloc bomb (`push(new Array(100000).fill(7))`) grows the linear buffer by
+  hundreds of MB *between* handler calls → the buffer-growth tripwire never fires and the DO
+  hangs/OOMs. Lowered to **64** in `experiments/_src/rquickjs/sys/quickjs/quickjs.c`
+  (one-line, commented) so the tripwire + memory limit catch fast growth within ~17 MB. This is
+  the documented "set_memory_limit misses fast array growth" gap (docs/ADVERSARIAL.md), now
+  closed in Rust. ⚠ The patch is in the SHARED vendored rquickjs; only affects future rebuilds.
+- **Budget is interrupt-INVOCATIONS, not opcodes.** Default `cellBudgetTicks` = 1200 (parity with
+  the JS kernel's certified 1200/2000). Heavy legit cells (multi-M iteration) need a raised budget
+  via `{t:create,config:{cellBudgetTicks:N}}` — the same documented tradeoff as the JS kernel.
+- **worker-build 0.8.3 foot-gun:** a top-level `dependencies` key in package.json breaks the
+  wasm-bindgen snippet parse ("invalid type: map, expected a string"). Keep test deps in
+  `devDependencies` (documented in apps/kernel/package.json too).
+
+## Deferred to Phase 1b (stubbed for ABI parity, marked TODO in code)
+
+- Tier-0 C extensions static-link (crypto.subtle/TextEncoder/URL/structuredClone/Headers).
+- W5 compaction / W4 byte-delta / E6 oplog durability stack.
+- host.subLM / host.ctx / host.final (codemode/RLM) + engine-migration journal replay
+  (`replayJournal` currently creates-fresh so the DO never wedges on a hash mismatch).
+- AE observability emit (the JS kernel's per-op datapoints).
+- stdlib injection (`stdlibInfo` returns an empty catalog).
+
+## Repro
+
+```
+cd experiments/kernel-rust
+node engine-harness.mjs            # engine ABI + snapshot/restore + guards (local WASI)
+set -a && . ../../.env && set +a
+wrangler deploy --dry-run          # confirm bundle
+wrangler deploy                    # deploy engram-rust (scratch worker only)
+node live-test.mjs                 # 24/24 live functional suite
+```
