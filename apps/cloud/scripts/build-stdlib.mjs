@@ -16,7 +16,12 @@ import { createRequire } from "node:module";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
-const srcDir = join(root, "stdlib-src");
+// stdlib entry sources are DEDUPED to the kernel's canonical stdlib-src/ (the 6 libs cloud
+// bundles — lodash/dayjs/nanoid/uuid/zod/mathjs — are byte-identical there). We keep cloud's
+// own MODULES set below (NO `lambda`) so the BUNDLED set, and thus the baked engineHash, stays
+// byte-stable; only the on-disk source location is shared. Kernel stays canonical for the
+// wasm-bindgen module path; cloud reads cross-app.
+const srcDir = join(root, "..", "kernel", "stdlib-src");
 const require = createRequire(import.meta.url);
 
 const MODULES = ["lodash", "dayjs", "nanoid", "uuid", "zod"];

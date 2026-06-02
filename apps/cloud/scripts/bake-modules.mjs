@@ -30,13 +30,20 @@ const root = join(here, "..");
 const src = join(root, "src");
 const vendor = join(root, "vendor");
 
-// glue.js: rewrite the quickjs-wasi import to the in-facet dist path.
-let glue = readFileSync(join(src, "glue.js"), "utf8");
+// glue.js: SINGLE SOURCE OF TRUTH is apps/kernel/src/glue.js (the v0.9.3 kernel glue:
+// NativeAllocLimitError OOM backstop, host.subLM, host.ctx, RLM journal replay). The cloud
+// no longer keeps its own fork — the deny-default fetch divergence is expressed via the
+// `denyFetchByDefault` config flag (forced on per-tenant in facet-kernel.js), so one glue
+// serves both apps. We read the kernel's on-disk file (kept canonical for wasm-bindgen's
+// `#[wasm_bindgen(module = "/src/glue.js")]`, which needs a real path) and rewrite the bare
+// quickjs-wasi import to the in-facet vendored dist (cloud ships no quickjs-wasi dep).
+const kernelGluePath = join(root, "..", "kernel", "src", "glue.js");
+let glue = readFileSync(kernelGluePath, "utf8");
 glue = glue.replace(/from\s+["']quickjs-wasi["']/g, 'from "./qjs/index.js"');
 
 let facet = readFileSync(join(src, "facet-kernel.js"), "utf8");
 
-const wasmBytes = readFileSync(join(src, "quickjs.wasm"));
+const wasmBytes = readFileSync(join(vendor, "quickjs.wasm"));
 const wasmB64 = wasmBytes.toString("base64");
 
 // quickjs-wasi dist (self-contained ESM). Vendored copy (byte-identical to v0.2/v1).

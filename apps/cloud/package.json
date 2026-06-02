@@ -7,7 +7,12 @@
     "bake": "node scripts/build-stdlib.mjs && node scripts/bake-modules.mjs",
     "deploy": "npm run bake && wrangler deploy"
   },
+  "comments": {
+    "vendor-provenance": "quickjs-wasi@3.0.0 + binaryen are pinned to DOCUMENT/VERIFY the vendored bytes under vendor/ (see vendor/PROVENANCE.json + docs/provenance.md). They are NOT used to derive: cloud ships RAW quickjs.wasm and deriving via wasm-opt -Oz would byte-change the engine and invalidate every live snapshot (EngineHashMismatchError). binaryen pinned to match apps/kernel."
+  },
   "devDependencies": {
+    "quickjs-wasi": "3.0.0",
+    "binaryen": "129.0.0",
     "esbuild": "^0.24.0",
     "lodash-es": "^4.17.21",
     "dayjs": "^1.11.13",

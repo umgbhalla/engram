@@ -15,6 +15,24 @@
 // blocked inside a facet, so {wasm} is the only path. We hand the Module to the
 // ported glue via globalThis.__QJS_MODULE (the exact contract glue.js expects).
 import { DurableObject } from "cloudflare:workers";
+
+// Multi-tenant fetch policy: the unified glue (shared with engram-kernel) is ALLOW-default
+// for an unset cfg.fetch. The cloud (untrusted multi-tenant) MUST stay DENY-default. We
+// express that via the unified glue's `denyFetchByDefault` config flag, forced on here so
+// no caller can accidentally open egress — an explicit cfg.fetch (true / false / allowlist)
+// still wins. This is the one intentional kernel<->cloud behavioral divergence, kept as a
+// config overlay (not a code fork) so both apps share one glue.js.
+function _forceDenyFetchDefault(configJson) {
+  let cfg;
+  try {
+    cfg = JSON.parse(configJson || "{}");
+  } catch (_) {
+    cfg = {};
+  }
+  if (!cfg || typeof cfg !== "object") cfg = {};
+  cfg.denyFetchByDefault = true;
+  return JSON.stringify(cfg);
+}
 import quickjsModule from "./quickjs.wasm"; // {wasm} => WebAssembly.Module (CompiledWasm)
 // V1.1 SLICE A — configurable in-VM stdlib. The esbuilt bundle (JSON string) arrives as a
 // {text} loader module; the meta {js} module sets globalThis.__STDLIB_META itself when
@@ -135,7 +153,7 @@ export class KernelFacet extends DurableObject {
       );
       return label;
     }
-    await this.glue.createFresh(this._configJson || "{}");
+    await this.glue.createFresh(_forceDenyFetchDefault(this._configJson));
     return "fresh";
   }
 
@@ -145,7 +163,7 @@ export class KernelFacet extends DurableObject {
   // Persisted so a cold-restore re-applies the same config. Only takes effect on the
   // next fresh create (or is carried in the snapshot for an already-live kernel).
   async configure(configJson) {
-    this._configJson = configJson || "{}";
+    this._configJson = _forceDenyFetchDefault(configJson);
     this._setMeta("config_json", this._configJson);
     return { ok: true };
   }

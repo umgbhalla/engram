@@ -5,3 +5,9 @@ src/modules.gen.js
 src/stdlib.bundle.txt
 src/stdlib-meta.json
 node_modules/
+
+# No *.wasm gets silently force-added again (e.g. into src/).
+*.wasm
+
+# Deliberately vendored binaries — all cloud vendored bytes live here, tracked on purpose.
+!vendor/**

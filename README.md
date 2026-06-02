@@ -177,6 +177,28 @@ Full numbers: `docs/results/SUMMARY.md`.
 
 ---
 
+## Codebase introspection
+
+DATA from a four-report structural audit (full ranked action table: [`docs/INTROSPECTION.md`](docs/INTROSPECTION.md)).
+
+**Supply chain — external engine, original shell.** The live JS engine is **not original**: it is the npm package **`quickjs-wasi@3.0.0`** (vercel-labs). Everything Engram-authored is the host shell around it — `apps/kernel/src/lib.rs` (Rust DO, 1576 LOC), `apps/kernel/src/glue.js` (host↔VM glue, 2016 LOC), the supervisor/facet kernel, sdk, cli.
+
+**The kernel/cloud WASM asymmetry.** Same engine, two provenance paths:
+
+| | kernel | cloud |
+|---|---|---|
+| `quickjs-wasi` dep | yes (`@3.0.0`) | **none** |
+| engine source | **derived** from npm at build | **vendored, git-tracked bytes** |
+| `quickjs.wasm` | gitignored, `-Oz`, 1.45MB | tracked, raw 1,586,981 B |
+| delivery | CompiledWasm + Rust wasm-bindgen | base64-bake into a `{wasm}` Worker-Loader module |
+
+Cloud has no dep so it can't derive — it vendors 10 tracked binaries (~2.8MB); kernel tracks zero. Risk: no version pin links the two paths → silent engine divergence.
+
+- **`glue.js` is 2016 lines / ~100KB, but 54% is prose.** 645 comment-only lines = 53,852 B (54.0%) are an inline append-only changelog (version tags, BUG-1..6, GUARD/GAP notes). The rest is a host-program-**plus-embedded-guest-program** (`REBIND_SRC` + other eval'd VM strings) spanning ~12 orthogonal subsystems that were never modularized.
+- A module split is **cosmetic for the shipped artifact** — esbuild/wrangler bundle to one file; justify on maintainability only. Any byte-shifting reformat invalidates live snapshots via `EngineHashMismatchError`.
+
+---
+
 ## Docs
 
 | File | What |
