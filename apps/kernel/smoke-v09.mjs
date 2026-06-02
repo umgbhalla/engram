@@ -6,7 +6,7 @@
 //   (e) no regression vs v08 (stdlib, loop preempt, kv, crypto).
 // Usage: node smoke-v09.mjs [wss-base]
 import WebSocket from "ws";
-import { connect, EngramExecutor } from "./sdk/index.mjs";
+import { connect, EngramExecutor } from "@engram/sdk";
 
 const BASE = process.argv[2] || "wss://montydyn-v09.umg-bhalla88.workers.dev";
 const results = [];

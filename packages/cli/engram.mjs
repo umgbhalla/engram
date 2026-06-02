@@ -17,7 +17,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { execSync } from "node:child_process";
 import WebSocket from "ws";
-import { connect } from "../sdk/index.mjs";
+import { connect } from "@engram/sdk";
 
 const DEFAULT_ENDPOINT = process.env.ENGRAM_ENDPOINT || "wss://engram-kernel.umg-bhalla88.workers.dev";
 const STORE = path.join(os.homedir(), ".engram-sessions.json");

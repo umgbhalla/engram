@@ -6,6 +6,7 @@
   "bin": { "engram": "engram.mjs" },
   "files": ["engram.mjs", "README.md"],
   "dependencies": {
+    "@engram/sdk": "workspace:*",
     "ws": "^8.18.0"
   },
   "license": "MIT"

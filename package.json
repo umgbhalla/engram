@@ -1,0 +1,16 @@
+{
+  "name": "engram",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "deploy:kernel": "wrangler deploy -c apps/kernel/wrangler.jsonc",
+    "deploy:cloud": "wrangler deploy -c apps/cloud/wrangler.jsonc",
+    "deploy:ui": "wrangler deploy -c apps/ui/wrangler.jsonc",
+    "deploy:all": "bun scripts/deploy.ts",
+    "build:sdk": "echo 'no build step for @engram/sdk (ships index.mjs as-is)'",
+    "build:cli": "echo 'no build step for @engram/cli (ships engram.mjs as-is)'"
+  }
+}

@@ -1,5 +1,5 @@
 {
-  "name": "montydyn-v11",
+  "name": "@engram/cloud-app",
   "private": true,
   "type": "module",
   "scripts": {

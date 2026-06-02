@@ -1,0 +1,8 @@
+{
+  "name": "@engram/ui-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  }
+}

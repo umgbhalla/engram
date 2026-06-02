@@ -11,7 +11,7 @@
 // Usage: node smoke-v093.mjs [wss-base]
 
 import WebSocket from "ws";
-import { connect } from "./sdk/index.mjs";
+import { connect } from "@engram/sdk";
 
 const BASE = process.argv[2] || "wss://montydyn-v093.umg-bhalla88.workers.dev";
 const results = [];

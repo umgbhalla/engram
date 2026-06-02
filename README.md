@@ -44,10 +44,10 @@ No journaling, no source replay. We literally persist the heap. That single prop
 
 | Surface | URL / artifact | Source dir | What |
 |---|---|---|---|
-| Notebook UI | `engram-ui.umg-bhalla88.workers.dev` | `ui/` | zero-dep browser REPL + RLM demo; defaults to engram-kernel |
-| Kernel | `engram-kernel.umg-bhalla88.workers.dev` | `v0.9.3/` | codemode + RLM + hibernation + native backstop + journal |
-| Cloud (multi-tenant) | `engram-cloud` | `v1.2/` | sharded supervisor, per-tenant auth, `/eval`, `/usage` |
-| SDK / CLI | `@engram/sdk`, `engram` | `v0.9.3/{sdk,cli}` | **not yet npm-published** (owner-gated) |
+| Notebook UI | `engram-ui.umg-bhalla88.workers.dev` | `apps/ui/` | zero-dep browser REPL + RLM demo; defaults to engram-kernel |
+| Kernel | `engram-kernel.umg-bhalla88.workers.dev` | `apps/kernel/` | codemode + RLM + hibernation + native backstop + journal |
+| Cloud (multi-tenant) | `engram-cloud` | `apps/cloud/` | sharded supervisor, per-tenant auth, `/eval`, `/usage` |
+| SDK / CLI | `@engram/sdk`, `engram` | `packages/{sdk,cli}` | **not yet npm-published** (owner-gated) |
 
 Storage: R2 `engram-snapshots`, Analytics Engine dataset `montydyn_kernel`. Workers **Paid** plan required (Worker Loader / Dynamic Workers / facets).
 
@@ -65,7 +65,7 @@ Open `https://engram-ui.umg-bhalla88.workers.dev`. Endpoint + API key persist in
 # health
 curl https://engram-kernel.umg-bhalla88.workers.dev/health
 
-# create a session + eval over WS — see v0.9.3/sdk for the framed protocol
+# create a session + eval over WS — see packages/sdk for the framed protocol
 ```
 
 Frame protocol (kernel WS):
@@ -76,7 +76,7 @@ Frame protocol (kernel WS):
 ### SDK
 
 ```js
-import { Engram } from "@engram/sdk";          // v0.9.3/sdk
+import { Engram } from "@engram/sdk";          // packages/sdk
 const s = await Engram.connect({ url, apiKey });
 await s.eval("globalThis.x = 41");
 await s.eval("x + 1");                          // → 42, survives eviction
@@ -85,8 +85,8 @@ await s.eval("x + 1");                          // → 42, survives eviction
 ### CLI
 
 ```bash
-node v0.9.3/cli/engram.mjs repl --url <kernel-url>   # durable REPL
-node v0.9.3/cli/engram.mjs rlm  --context big.txt --q "find the needle"
+node packages/cli/engram.mjs repl --url <kernel-url>   # durable REPL
+node packages/cli/engram.mjs rlm  --context big.txt --q "find the needle"
 ```
 
 ---
@@ -95,18 +95,18 @@ node v0.9.3/cli/engram.mjs rlm  --context big.txt --q "find the needle"
 
 ```
 README.md / CLAUDE.md (≡ AGENTS.md)   ── source of truth + full context trail
-v0.9.3/                               ── CURRENT kernel (engram-kernel)
+apps/kernel/                          ── CURRENT kernel (engram-kernel)
   src/lib.rs        Rust DO shell: SQLite manifest/chunks, ctx store, cell journal
   src/glue.js       JS glue: eval, snapshot/restore, guards, host boundary, RLM
   entry.mjs         CompiledWasm wrapper
   stdlib-src/       lambda-RLM combinators + esbuilt stdlib bundles
-  sdk/ cli/         @engram/sdk, engram CLI
   bench/ scripts/   cold-start harness, deploy/build scripts
-v1.2/                                 ── multi-tenant SaaS (engram-cloud)
+apps/cloud/                           ── multi-tenant SaaS (engram-cloud)
   src/supervisor.js SupervisorDO + HttpGateway + auth + AE metering + sharding
   vendor/           vendored quickjs dist + Tier-0 extension .wasm
-ui/                                   ── notebook SPA (engram-ui)
-v1-facet/                             ── V1 facet spike (proof)
+apps/ui/                              ── notebook SPA (engram-ui)
+packages/sdk/  packages/cli/          ── @engram/sdk, engram CLI
+experiments/v1-facet/                 ── V1 facet spike (proof)
 experiments/exp-*/                    ── 7 proven experiments (EXP-1,4b,5a,6,7,8,9)
 context/                              ── external repos (shallow submodules; see include.md)
 docs/                                 ── feasibility, experiments, ADRs, per-version results
@@ -173,7 +173,7 @@ Full numbers: `docs/results/SUMMARY.md`.
 4. **R2 stale-key prune** — old `montydyn-snapshots` bucket already deleted; `engram-snapshots` is live.
 5. **Python kernel** — **dropped** per owner. RustPython was the candidate (single-memory, snapshottable); Pyodide is blocked on CF.
 
-**Carried risks:** engine-migration journal is best-effort (effectful cells can't replay faithfully and are flagged — heap-snapshot remains the real durability mechanism); effectful-cell detection is a conservative host-side substring scan; lambda-RLM single-leaf bound bug fixed in `v0.9.3/stdlib-src/lambda.js`.
+**Carried risks:** engine-migration journal is best-effort (effectful cells can't replay faithfully and are flagged — heap-snapshot remains the real durability mechanism); effectful-cell detection is a conservative host-side substring scan; lambda-RLM single-leaf bound bug fixed in `apps/kernel/stdlib-src/lambda.js`.
 
 ---
 

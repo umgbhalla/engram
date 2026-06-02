@@ -42,11 +42,16 @@ so a session sleeps when idle and wakes with full live state, no replay.
 | `results/v0.1.md` | V0.1 build report (when done) |
 | `TODO.md` | task board |
 
-**Code map:** `v0.8/` = **current kernel** (`src/lib.rs` Rust DO, `src/glue.js` JS glue,
-`entry.mjs` CompiledWasm wrapper, `wrangler.jsonc`, `stdlib-src/`, `scripts/`). Older kernels
-`v0`→`v0.7` were **pruned from the tree** (lean working dir) — recover any from git history or the
-`v0.N-milestone` tags. `v1-facet/` = V1 facet proof. `experiments/exp-*/` = 7 proven experiments.
-`context/` = external repos (shallow submodules; `context/include.md` indexes them).
+**Code map (monorepo — bun workspaces `apps/*` + `packages/*`):**
+`apps/kernel/` = **current kernel** → `engram-kernel` (`src/lib.rs` Rust DO, `src/glue.js` JS glue,
+`entry.mjs` CompiledWasm wrapper, `wrangler.jsonc`, `stdlib-src/`, `scripts/`).
+`apps/cloud/` = multi-tenant supervisor → `engram-cloud` (`src/supervisor.js`, `vendor/`).
+`apps/ui/` = notebook SPA → `engram-ui`. `packages/sdk/` = `@engram/sdk`, `packages/cli/` = `@engram/cli`.
+`experiments/v1-facet/` = V1 facet proof. `experiments/exp-*/` = 7 proven experiments.
+`scripts/deploy.ts` = deploy driver; root `package.json` has `deploy:{kernel,cloud,ui,all}`.
+Older kernels `v0`→`v0.8` + version-named dirs were **pruned/renamed** — recover from git history or
+`v0.N-milestone` tags. `context/` = external repos (shallow submodules; `context/include.md` indexes them).
+Provenance below references old `v0.9.3/`/`v1.2/`/`ui/` paths = now `apps/kernel`/`apps/cloud`/`apps/ui`.
 
 **Workflow history** (background multi-agent runs, for provenance):
 `wkfcx55zi` feasibility research · `wnf82p8o5` EXP-6/7/8/9/4b · `ws0na8tg4` V0 build ·

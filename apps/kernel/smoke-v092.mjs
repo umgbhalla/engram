@@ -13,7 +13,7 @@
 // Usage: node smoke-v092.mjs [wss-base]
 
 import WebSocket from "ws";
-import { connect, createAgent } from "./sdk/index.mjs";
+import { connect, createAgent } from "@engram/sdk";
 
 const BASE = process.argv[2] || "wss://montydyn-v092.umg-bhalla88.workers.dev";
 const results = [];
