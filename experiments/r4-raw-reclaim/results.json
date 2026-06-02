@@ -1,0 +1,89 @@
+{
+  "mechanisms": {
+    "b_run_gc_same_instance": {
+      "rawBufBeforeMB": 52.375,
+      "rawBufAfterMB": 52.375,
+      "rawShrank": false,
+      "rawReclaimPct": 0,
+      "usedHeapBeforeMB": 0.065,
+      "usedHeapAfterMB": 0.065,
+      "usedHeapReclaimPct": 99.85,
+      "imageGzMB": 3.55,
+      "fidelity": {
+        "inc": 103,
+        "x": 42,
+        "incIsClosure": 1,
+        "promisePresent": 1,
+        "promiseResolves": 7
+      },
+      "verdict_note": "WASM linear memory is monotonic by spec; run_gc frees QuickJS heap (used-heap drops) but cannot return pages to the WASM memory object."
+    },
+    "a_writeobject_fresh_instance": {
+      "bloatedSourceBufMB": 52.375,
+      "freshInstanceBufMB": 1.125,
+      "rawShrank": true,
+      "rawReclaimPct": 97.85,
+      "serializedRootsJson": "{\"x\":42,\"incType\":\"function\",\"pType\":\"Promise\"}",
+      "fidelity_after_rehydrate": {
+        "x": 42,
+        "incIsClosure": 0,
+        "incCall": -998,
+        "promisePresent": 0
+      },
+      "verdict_note": "Raw buffer DOES shrink (fresh instance = fresh small memory). BUT JSON/JS_WriteObject cannot serialize the closure private state or the pending promise (W6: 7/16 value kinds lost). Closure and promise are GONE. Reclaim w/ FIDELITY = FALSE on this path."
+    },
+    "c_small_init_selective_blit": {
+      "smallInitModuleRuns": true,
+      "startBufMB": 1.25,
+      "setupX": 42,
+      "selectiveBlit": {
+        "snapPages": 838,
+        "copiedPages": 812,
+        "skippedPages_zeroFreed": 26,
+        "rawBufAfterMB": 52.375,
+        "rawSmallerThanSnapshot": false,
+        "fidelity": {
+          "reattach": 1,
+          "inc": 103,
+          "x": 42,
+          "incIsClosure": 1,
+          "promisePresent": 1,
+          "promiseResolves": 7
+        },
+        "note": "Selective blit can SKIP storing zero pages (gz already does this for free), but the live instance must still grow its buffer to span the snapshot pointer range. Raw buffer cannot be smaller than the highest live pointer offset. Freed pages between live allocations cannot be removed without relocating pointers."
+      }
+    }
+  },
+  "session": {
+    "baseInc1": 101,
+    "baseInc2": 102,
+    "baseX": 42,
+    "preBufMB": 1.25,
+    "preUsedMB": 0.065,
+    "spikedBufMB": 52.375,
+    "spikedUsedMB": 42.875,
+    "freedBufMB": 52.375,
+    "freedUsedMB": 0.065
+  },
+  "VERDICT": {
+    "question": "Is RAW linear-memory reclaim achievable AT ALL with FULL fidelity on this substrate?",
+    "mechanism_a_writeobject": {
+      "rawReclaim": "97.85%",
+      "fidelity": "LOST closure + pending promise (JSON/JS_WriteObject drops them)",
+      "fullFidelityRawReclaim": false
+    },
+    "mechanism_b_run_gc": {
+      "rawReclaim": "0% (WASM memory monotonic)",
+      "fidelity": "FULL (same instance) — but raw buffer does NOT shrink",
+      "fullFidelityRawReclaim": false
+    },
+    "mechanism_c_selective_blit": {
+      "smallInitRuns": true,
+      "rawReclaim": "0% (must span live pointer range)",
+      "fidelity": "inc=103, promise=7",
+      "fullFidelityRawReclaim": false
+    },
+    "FULL_FIDELITY_RAW_RECLAIM_ACHIEVED": false,
+    "conclusion": "Full-fidelity RAW-buffer reclaim is FUNDAMENTALLY IMPOSSIBLE on this substrate. Fidelity (closures+promises) requires preserving absolute heap pointer offsets => the WASM linear memory must span the highest live offset; WASM memory is monotonic (cannot shrink in place) and there is no QuickJS heap-relocation/compaction API. Reclaim WITHOUT fidelity (fresh small instance + JS_WriteObject/JSON) works but drops closures+promises. Therefore GZ stored-image reclaim (zero-scrub freed pages) is the CEILING; W5 gz-reclaim is the best achievable."
+  }
+}
