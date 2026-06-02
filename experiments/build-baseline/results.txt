@@ -1,0 +1,78 @@
+
+=== strategy: baseline-full-dump ===
+workload  bytesWritten  writeAmp   restoreMs  peakImage  fidelity
+--------  ------------  ---------  ---------  ---------  --------
+W-light   4.74MB        1074.19x   2.6ms      1.25MB     PASS    
+W-spike   679.3KB       0.01x      20.8ms     49.25MB    PASS    
+W-churn   2.98MB        13520.74x  2.9ms      3.19MB     PASS    
+W-long    19.90MB       821.16x    2.2ms      1.25MB     PASS    
+W-bigctx  1.07MB        3304.60x   3.5ms      4.63MB     PASS    
+
+r2Dir: /tmp/claude-501/engram-bench-baseline-full-dump-1780403178849
+[
+  {
+    "workload": "W-light",
+    "bytesWritten": 4968144,
+    "sqliteBytes": 4968144,
+    "r2Bytes": 0,
+    "writeAmp": 1074.1932972972972,
+    "restoreMs": 2.5604590000000087,
+    "peakImage": 1310748,
+    "heapDelta": 4625,
+    "fidelityPass": true,
+    "restoredGeneration": 2,
+    "inMemoryFresh": true
+  },
+  {
+    "workload": "W-spike",
+    "bytesWritten": 695652,
+    "sqliteBytes": 695652,
+    "r2Bytes": 0,
+    "writeAmp": 0.01382077883803554,
+    "restoreMs": 20.835666999999944,
+    "peakImage": 51642396,
+    "heapDelta": 50333777,
+    "fidelityPass": true,
+    "restoredGeneration": 2,
+    "inMemoryFresh": true
+  },
+  {
+    "workload": "W-churn",
+    "bytesWritten": 3123290,
+    "sqliteBytes": 3123290,
+    "r2Bytes": 0,
+    "writeAmp": 13520.735930735931,
+    "restoreMs": 2.8505420000001322,
+    "peakImage": 3342364,
+    "heapDelta": 231,
+    "fidelityPass": true,
+    "restoredGeneration": 2,
+    "inMemoryFresh": true
+  },
+  {
+    "workload": "W-long",
+    "bytesWritten": 20867325,
+    "sqliteBytes": 20867325,
+    "r2Bytes": 0,
+    "writeAmp": 821.1602786085314,
+    "restoreMs": 2.231999999999971,
+    "peakImage": 1310748,
+    "heapDelta": 25412,
+    "fidelityPass": true,
+    "restoredGeneration": 2,
+    "inMemoryFresh": true
+  },
+  {
+    "workload": "W-bigctx",
+    "bytesWritten": 1116955,
+    "sqliteBytes": 1116955,
+    "r2Bytes": 0,
+    "writeAmp": 3304.6005917159764,
+    "restoreMs": 3.499084000000039,
+    "peakImage": 4849692,
+    "heapDelta": 338,
+    "fidelityPass": true,
+    "restoredGeneration": 2,
+    "inMemoryFresh": true
+  }
+]
