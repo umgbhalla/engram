@@ -31,6 +31,14 @@ so a session sleeps when idle and wakes with full live state, no replay.
 **Doc map** (`docs/`):
 | File | What |
 |---|---|
+| **Exploration arc (post-product, 2026-06):** | research→experiment→bake-off→integration-plan, all proven+pushed |
+| `REWRITE-OPTIONS.md` · `PRIOR-ART.md` | can the JS brain move to Rust/WASM? (no parity gain) + who else built this (nobody whole) |
+| `WASM-EXPEDITIONS.md` · `-2.md` | 6+7 built/measured expeditions; E1 rquickjs + W2 Boa snapshot on wasip1; W5 un-wedges monotonic-memory |
+| `DURABILITY-ROADMAP.md` + `W5-COMPACTION-PLAN.md` + `W4-BYTEDELTA-PLAN.md` | sequenced pain-killers: W5→W4→E6→W3→E4 |
+| `DURABILITY-BAKEOFF.md` | 8 strategies on 1 harness; **Combined (W5+W4+E6) = production pick** (2.95–7.7× fewer bytes, bounded restore) |
+| `SANDBOX-API.md` | host.fs→R2 + durable seeded timers + env + deny-list; the staged-commit coherence invariant |
+| `COMBINED-STACK-INTEGRATION.md` | PR-shaped plan to land the stack in apps/kernel (blocked on REALCF-VALIDATION + owner OK) |
+| `REALCF-VALIDATION.md` | real-CF numbers vs the in-process sim (scratch engram-bench worker) |
 | `feasibility.md` | feasibility study + architecture (verdict, snapshot mechanism, tech, risks) |
 | `experiments.md` | the 10-experiment phased plan |
 | `decisions.md` | ADRs: 0001 drop DW Loader · 0002 heap-snapshot · 0003 facets-for-V1 |
