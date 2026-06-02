@@ -6,3 +6,14 @@ _bin/
 *.wasm
 *.bin
 *.snap
+# reproducible build scratch
+**/Cargo.lock
+**/go.mod
+**/go.sum
+**/package-lock.json
+**/*.c
+e3-chiwawa/
+**/*.h
+**/*.wat
+experiments/**/package.json
+w7-wasmtime-dirtypage/
