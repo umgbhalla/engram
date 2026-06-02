@@ -114,6 +114,27 @@ real workerd; baked stdlib identical to runtime-injected; snapshots from baked s
 
 ---
 
+## R2-tail mitigation — cold-restore latency for big incompressible heaps (real-CF-exposed)
+
+**Real-CF finding:** >2MB-gz heaps route to R2; R2 GET = ~300ms warm / ~900ms cold / ~1.8s p95 — the
+single biggest owned restore cost. Round-4 r4 evaluated mitigations (local sim, calibrated to the real
+927ms/1768ms numbers; needs real-CF confirm before shipping):
+
+```
+   mitigation                         result
+   ──────────                         ──────
+   chunked-parallel GET, 1 big object 1.14× only (cold is connection-latency-bound, not bandwidth)
+   chunked-parallel, multi-object     3.9× (4-obj) / 7.65× (8-obj) — only if baseline was serial
+   streaming gunzip                   free ~20-130ms overlap on the chunked path
+   ★ HOT-TIER: keep image in DO-SQLite ~0ms synchronous (∞× vs R2); kernel ALREADY chunks SQLite
+   ★ prefer-SQLite via gz-9            compressible 5MB → 98KB gz, stays under 2MB line, avoids R2
+```
+
+**Recommendation:** the win is **avoid R2 for restore-critical images** — raise the overflow threshold +
+gz-9, and hot-tier (keep in SQLite 64KB rows) when the raw image is large but the session is latency-
+sensitive. Chunked-parallel only matters for the multi-object base+delta+oplog restore shape. Build as a
+routing-policy tweak after the core stack; re-measure on real CF.
+
 ## Parked (door open, no parity reason now)
 
 ```

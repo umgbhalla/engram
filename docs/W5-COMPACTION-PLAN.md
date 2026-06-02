@@ -20,9 +20,19 @@
 >
 > **Revised W5 goal:** W5 reclaims the **stored/gz image size** (un-wedges the dump ceiling — the actual
 > P0), NOT the running raw buffer. The §2 "restore at minimal size" step is unreliable on workerd and must
-> be treated as best-effort, not a guarantee. True raw-buffer reclaim needs the parked native-rquickjs
-> build (which re-creates the instance from serialized roots). The dump-ceiling un-wedge still holds:
-> a scrubbed+gzipped freed-spike image fits under the ceiling even though the raw buffer stays large.
+> be treated as best-effort, not a guarantee. The dump-ceiling un-wedge still holds: a scrubbed+gzipped
+> freed-spike image fits under the ceiling even though the raw buffer stays large.
+>
+> **✗ DEFINITIVE (round-4 r3, `docs/HARDENING-LOG.md`): full-fidelity raw-buffer reclaim is FUNDAMENTALLY
+> IMPOSSIBLE on this substrate — not just unbuilt, physically precluded.** The constraints are mutually
+> exclusive: fidelity (closures + pending promises) requires every QuickJS object stay at its ABSOLUTE
+> linear-memory offset (pointers are raw offsets); shrinking the raw buffer requires either WASM
+> `memory.shrink` (does not exist — memory is monotonic by spec) or heap relocation (no QuickJS compaction
+> API; dlmalloc never compacts downward; relocation would invalidate every pointer = lose the fidelity).
+> Measured: GC reclaims used-heap **99.85%** but raw buffer **0%**; `JS_WriteObject`→fresh instance shrinks
+> raw **97.85%** but LOSES closures+promises (only plain data survives). **So gz/used-heap reclaim is the
+> HARD CEILING. The parked native-rquickjs path does NOT rescue this** — it hits the identical wall.
+> W5-as-corrected (scrub + gz + used-heap admission) is the best achievable; this question is now closed.
 
 ---
 
