@@ -1,0 +1,286 @@
+diff --git a/apps/kernel/src/glue.js b/experiments/kernel-prev/src/glue.js
+index c81a008..590e2ca 100644
+--- a/apps/kernel/src/glue.js
++++ b/experiments/kernel-prev/src/glue.js
+@@ -381,6 +381,130 @@ const REBIND_SRC = `
+     debug: function (...a) { __hostConsole('debug', a); },
+   };
+ 
++  // BUG-FAFO-1 / preview-class: in-VM util.inspect-style value formatter. Runs INSIDE the sandbox
++  // (deterministic, pure, present on restore since it travels in REBIND_SRC) and returns a bounded
++  // string so non-plain builtins (Map/Set/Date/RegExp/Symbol/typed arrays/Promise) render usefully
++  // instead of JSON.stringify => "{}". Depth + length capped so the host arg stays small. Display
++  // only: no engine/determinism/snapshot impact. See docs/glue-changelog.md.
++  Object.defineProperty(globalThis, '__engramInspect', {
++    value: function (v, maxDepth, maxItems, maxStr) {
++      maxDepth = maxDepth == null ? 4 : maxDepth;
++      maxItems = maxItems == null ? 100 : maxItems;
++      maxStr = maxStr == null ? 256 : maxStr;
++      var TA = (function () {
++        var names = ['Int8Array','Uint8Array','Uint8ClampedArray','Int16Array','Uint16Array',
++          'Int32Array','Uint32Array','Float32Array','Float64Array','BigInt64Array','BigUint64Array'];
++        var out = [];
++        for (var i = 0; i < names.length; i++) { if (typeof globalThis[names[i]] === 'function') out.push(names[i]); }
++        return out;
++      })();
++      function clipStr(s) {
++        if (s.length > maxStr) return s.slice(0, maxStr) + '…(' + s.length + ')';
++        return s;
++      }
++      function quote(s) {
++        try { return JSON.stringify(s); } catch (_) { return '"' + String(s) + '"'; }
++      }
++      function typedArrayName(x) {
++        for (var i = 0; i < TA.length; i++) { if (x instanceof globalThis[TA[i]]) return TA[i]; }
++        if (x instanceof ArrayBuffer) return 'ArrayBuffer';
++        return null;
++      }
++      function ins(x, depth, seen) {
++        var t = typeof x;
++        if (x === null) return 'null';
++        if (t === 'undefined') return 'undefined';
++        if (t === 'number') return Object.is(x, -0) ? '-0' : String(x);
++        if (t === 'boolean') return String(x);
++        if (t === 'bigint') return String(x) + 'n';
++        if (t === 'string') return quote(clipStr(x));
++        if (t === 'symbol') return x.toString();
++        if (t === 'function') {
++          var fn = x.name ? 'Function: ' + x.name : 'Function (anonymous)';
++          return '[' + fn + ']';
++        }
++        // objects
++        if (seen.indexOf(x) !== -1) return '[Circular]';
++        // Date
++        if (x instanceof Date) {
++          var iso;
++          try { iso = isNaN(x.getTime()) ? 'Invalid Date' : x.toISOString(); } catch (_) { iso = 'Invalid Date'; }
++          return iso;
++        }
++        // RegExp
++        if (x instanceof RegExp) return x.toString();
++        // Error
++        if (x instanceof Error) {
++          var em = x.message ? x.name + ': ' + x.message : x.name;
++          return em;
++        }
++        // Promise (best-effort; settling handled host-side before we get here)
++        if (typeof Promise === 'function' && x instanceof Promise) return 'Promise { <pending> }';
++        var taName = typedArrayName(x);
++        if (taName) {
++          if (taName === 'ArrayBuffer') return 'ArrayBuffer(' + x.byteLength + ')';
++          var n = x.length, parts = [], lim = Math.min(n, maxItems);
++          for (var i = 0; i < lim; i++) parts.push(String(x[i]));
++          if (n > lim) parts.push('… ' + (n - lim) + ' more');
++          return taName + '(' + n + ') [ ' + parts.join(', ') + ' ]';
++        }
++        if (depth >= maxDepth) {
++          if (Array.isArray(x)) return '[Array]';
++          if (x instanceof Map) return '[Map]';
++          if (x instanceof Set) return '[Set]';
++          return '[Object]';
++        }
++        seen = seen.concat([x]);
++        // Map
++        if (typeof Map === 'function' && x instanceof Map) {
++          var mparts = [], mc = 0;
++          for (var ent of x) {
++            if (mc >= maxItems) { mparts.push('… ' + (x.size - mc) + ' more'); break; }
++            mparts.push(ins(ent[0], depth + 1, seen) + ' => ' + ins(ent[1], depth + 1, seen));
++            mc++;
++          }
++          return 'Map(' + x.size + ')' + (mparts.length ? ' { ' + mparts.join(', ') + ' }' : ' {}');
++        }
++        // Set
++        if (typeof Set === 'function' && x instanceof Set) {
++          var sparts = [], sc = 0;
++          for (var sv of x) {
++            if (sc >= maxItems) { sparts.push('… ' + (x.size - sc) + ' more'); break; }
++            sparts.push(ins(sv, depth + 1, seen));
++            sc++;
++          }
++          return 'Set(' + x.size + ')' + (sparts.length ? ' { ' + sparts.join(', ') + ' }' : ' {}');
++        }
++        // Array
++        if (Array.isArray(x)) {
++          var aparts = [], al = Math.min(x.length, maxItems);
++          for (var ai = 0; ai < al; ai++) aparts.push(ins(x[ai], depth + 1, seen));
++          if (x.length > al) aparts.push('… ' + (x.length - al) + ' more');
++          return '[ ' + aparts.join(', ') + ' ]';
++        }
++        // plain / class object
++        var keys;
++        try { keys = Object.keys(x); } catch (_) { keys = []; }
++        var ctor = '';
++        try {
++          var cn = x.constructor && x.constructor.name;
++          if (cn && cn !== 'Object') ctor = cn + ' ';
++        } catch (_) {}
++        var oparts = [], ol = Math.min(keys.length, maxItems);
++        for (var oi = 0; oi < ol; oi++) {
++          var k = keys[oi], kv;
++          try { kv = ins(x[k], depth + 1, seen); } catch (_) { kv = '<unreadable>'; }
++          var kdisp = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : quote(k);
++          oparts.push(kdisp + ': ' + kv);
++        }
++        if (keys.length > ol) oparts.push('… ' + (keys.length - ol) + ' more');
++        return ctor + (oparts.length ? '{ ' + oparts.join(', ') + ' }' : '{}');
++      }
++      try { return ins(v, 0, []); } catch (e) { return '[uninspectable: ' + String(e) + ']'; }
++    },
++    writable: true, configurable: true, enumerable: false,
++  });
++
+   // Host tool boundary: host.<name>/<ns>.<name>(...args) -> __hostCall (JSON args) via a
+   // recursive proxy. host.fetch + host.subLM are special async cases. See docs/glue-changelog.md.
+   function __mkHostProxy(prefix) {
+@@ -1422,6 +1546,19 @@ export class GlueKernel {
+       } catch (_) {}
+       return { value: null, valuePreview: `[Function${nm ? ": " + nm : " (anonymous)"}]`, valueType: "function" };
+     }
++    // Symbol: JSON.stringify can't carry it (dump => null). Render "Symbol(desc)" via the in-VM
++    // inspector. docs/glue-changelog.md.
++    if (t === "symbol") {
++      const s = this._inspect(h) || "Symbol()";
++      return { value: s, valuePreview: s, valueType: "symbol" };
++    }
++    // Promise: a bare top-level promise value (no explicit await) — settle it (bounded by the tick
++    // budget) and preview the RESOLVED value, else "Promise { <pending> }". BUG-FAFO-1.
++    try {
++      if (t === "object" && h.isPromise) {
++        return this._previewPromise(h);
++      }
++    } catch (_) {}
+     // P3 (error-as-VALUE): a RETURNED Error previews as "{}" (non-enumerable fields); detect it
+     // and surface name+message(+short stack). docs/glue-changelog.md.
+     try {
+@@ -1442,12 +1579,37 @@ export class GlueKernel {
+         return { value, valuePreview: preview, valueType: "error" };
+       }
+     } catch (_) {}
+-    // object / array: structured dump
++    // object / array / Map / Set / Date / RegExp / typed array: util.inspect-style preview via the
++    // in-VM inspector (Map/Set/Date/RegExp no longer render "{}"). `value` keeps the structured dump
++    // for plain objects/arrays (round-trippable); inspector-only types carry the string in `value`.
++    // docs/glue-changelog.md.
++    let preview;
++    try {
++      preview = this._inspect(h);
++    } catch (_) {
++      preview = null;
++    }
++    let dumped;
++    let isArr = false;
++    try {
++      dumped = this.kernel.dump(h);
++      isArr = Array.isArray(dumped);
++    } catch (_) {
++      dumped = undefined;
++    }
++    if (preview != null) {
++      if (preview.length > 4096) preview = preview.slice(0, 4096) + "…";
++      return {
++        value: dumped !== undefined ? dumped : preview,
++        valuePreview: preview,
++        valueType: isArr ? "array" : "object",
++      };
++    }
++    // Inspector failed (rare): fall back to the structured dump, then toString.
+     try {
+-      const dumped = this.kernel.dump(h);
+-      let preview = JSON.stringify(dumped);
+-      if (preview && preview.length > 4096) preview = preview.slice(0, 4096) + "…";
+-      return { value: dumped, valuePreview: preview, valueType: Array.isArray(dumped) ? "array" : "object" };
++      let p = JSON.stringify(dumped);
++      if (p && p.length > 4096) p = p.slice(0, 4096) + "…";
++      return { value: dumped, valuePreview: p, valueType: isArr ? "array" : "object" };
+     } catch (_) {
+       try {
+         return { value: null, valuePreview: h.toString(), valueType: t };
+@@ -1457,6 +1619,87 @@ export class GlueKernel {
+     }
+   }
+ 
++  // Call the in-VM __engramInspect(value) -> bounded preview string (display only). Bounded inside
++  // the VM so the returned host arg stays small (protects HOST_ARG_MAX). docs/glue-changelog.md.
++  _inspect(h) {
++    let fnH;
++    try {
++      fnH = this.kernel.getGlobal().consume((g) => g.getProp("__engramInspect"));
++    } catch (_) {
++      fnH = null;
++    }
++    if (!fnH) {
++      try {
++        // REBIND_SRC always installs it; this guards a snapshot that predates the formatter.
++        this.kernel.evalCode("typeof __engramInspect").dispose?.();
++      } catch (_) {}
++      return null;
++    }
++    try {
++      if (fnH.typeof !== "function") { try { fnH.dispose?.(); } catch (_) {} return null; }
++      const resH = this.kernel.callFunction(fnH, this.kernel.undefined, h);
++      const s = resH.toString();
++      try { resH.dispose?.(); } catch (_) {}
++      return s;
++    } catch (_) {
++      return null;
++    } finally {
++      try { fnH.dispose?.(); } catch (_) {}
++    }
++  }
++
++  // BUG-FAFO-1: a bare top-level Promise result — drive executePendingJobs() (bounded by the tick
++  // budget) to settlement, then preview the RESOLVED value (or rejection). Still pending after the
++  // budget -> "Promise { <pending> }". Display only; does not change the eval/_drivePromise path.
++  // docs/glue-changelog.md.
++  _previewPromise(h) {
++    const budget = this.config.cellBudgetTicks > 0 ? this.config.cellBudgetTicks : 200000;
++    const MAX_ROUNDS = 20000;
++    let state = 0;
++    try { state = h.promiseState; } catch (_) { state = 0; }
++    // Drive pending jobs (bounded by the tick budget) to settle the promise synchronously.
++    for (let round = 0; state === 0 && round < MAX_ROUNDS; round++) {
++      this.instrLeft = budget;
++      let ran = 0;
++      try { ran = this.kernel.executePendingJobs(); } catch (_) { ran = 0; }
++      this.instrLeft = Infinity;
++      try { state = h.promiseState; } catch (_) { state = 0; }
++      if (state !== 0) break;
++      if (!(ran > 0)) break; // no jobs ran and still pending -> genuinely pending (e.g. awaits host I/O)
++    }
++    if (state === 0) {
++      return { value: null, valuePreview: "Promise { <pending> }", valueType: "promise" };
++    }
++    // Settled: read the result handle synchronously (qjs_promise_result), preview the inner value.
++    let resH = null;
++    try {
++      const ptr = this.kernel._getExports().qjs_promise_result(h.ptr);
++      resH = new h.constructor(this.kernel, ptr);
++    } catch (_) {
++      resH = null;
++    }
++    if (!resH) {
++      return { value: null, valuePreview: "Promise { <settled> }", valueType: "promise" };
++    }
++    try {
++      const inner = this._preview(resH);
++      if (state === 2) {
++        // Rejected: surface the reason, tagged so the client can distinguish.
++        const reason =
++          inner.valueType === "error" ? inner.valuePreview : (inner.valuePreview ?? String(inner.value));
++        return { value: inner.value, valuePreview: `Promise { <rejected> ${reason} }`, valueType: "promise" };
++      }
++      // Fulfilled: preview the resolved value directly (Node-REPL behavior).
++      return {
++        value: inner.value,
++        valuePreview: `Promise { ${inner.valuePreview} }`,
++        valueType: inner.valueType === "error" ? "error" : inner.valueType,
++      };
++    } finally {
++      try { resH.dispose?.(); } catch (_) {}
++    }
++  }
++
+   // P0: used-heap measurement (shrinks after free+GC unlike the monotonic buffer). docs/glue-changelog.md.
+   _usedHeapBytes() {
+     try {
