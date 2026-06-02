@@ -61,6 +61,7 @@
   h3:first-child { border-top: 0; padding-top: 0; }
   .hint { color: var(--muted); font-size: 11px; }
   .toolbar { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+  .e2e { margin-bottom: 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); padding: 10px; }
   code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; font-family: var(--mono); }
 </style>
 </head>
@@ -81,14 +82,16 @@
       <button id="hibernate" title="force-evict in-memory kernel; durable snapshot kept">Hibernate</button>
       <button id="reconnect" title="reconnect to the same durable session id">Reconnect</button>
       <button id="resetSession" title="drop kernel + clear snapshot">Reset</button>
+      <button id="runE2e" title="run the deployed UI-to-kernel acceptance check">Run E2E</button>
     </div>
+    <div class="e2e out" id="e2eOut" data-status="idle"><span class="log">E2E idle</span></div>
     <div id="cells"></div>
   </main>
 
   <aside>
     <h3>Session</h3>
     <label>Kernel endpoint (wss)</label>
-    <input id="cfgEndpoint" value="wss://engram-kernel.umg-bhalla88.workers.dev" />
+    <input id="cfgEndpoint" value="wss://engram-bench-w4.umg-bhalla88.workers.dev" />
     <label>API key (only for engram-cloud; blank for engram-kernel)</label>
     <input id="cfgApiKey" placeholder="md_… (leave blank for v093)" />
     <label>Session id (reconnect to restore state)</label>
@@ -100,7 +103,7 @@
 
     <h3>Config</h3>
     <label>Clock</label>
-    <select id="cfgClock"><option value="seeded">seeded (deterministic)</option><option value="system">system</option></select>
+    <select id="cfgClock"><option value="seeded">seeded (deterministic)</option><option value="real">real</option></select>
     <label>RNG seed</label>
     <input id="cfgSeed" value="42" />
     <label>Stdlib modules (comma, or "true" = default set)</label>
@@ -135,6 +138,8 @@
 // ---------------------------------------------------------------------------
 
 const $ = (id) => document.getElementById(id);
+const DEFAULT_ENDPOINT = "wss://engram-bench-w4.umg-bhalla88.workers.dev";
+const qs = new URLSearchParams(location.search);
 const LS = {
   get k(){ return localStorage.getItem("md_session"); },
   set k(v){ localStorage.setItem("md_session", v); },
@@ -145,6 +150,9 @@ const LS = {
 };
 
 function randId() { return "nb-" + Math.random().toString(36).slice(2, 10); }
+function queryEndpoint() {
+  return qs.get("endpoint") || qs.get("kernel") || "";
+}
 
 class Kernel {
   constructor() { this.ws = null; this.queue = Promise.resolve(); this.onState = () => {}; }
@@ -391,6 +399,69 @@ async function runRlm(useLambda) {
   } catch (e) { out.innerHTML = `<span class='err'>${esc(String(e.message||e))}</span>`; }
 }
 
+// ---- deployed system E2E -----------------------------------------------------
+function e2eLine(cls, s) { return '<div class="' + cls + '">' + esc(s) + '</div>'; }
+function pass(name, detail = "") { return e2eLine("val", "PASS " + name + (detail ? " :: " + detail : "")); }
+function fail(name, detail = "") { return e2eLine("err", "FAIL " + name + (detail ? " :: " + detail : "")); }
+async function runDeployedE2e() {
+  const out = $("e2eOut");
+  out.dataset.status = "running";
+  out.innerHTML = e2eLine("log", "running deployed UI -> kernel E2E...");
+  const oldSession = $("cfgSession").value;
+  const testSession = "ui-e2e-" + Date.now().toString(36);
+  const lines = [];
+  try {
+    persistConn();
+    $("cfgSession").value = testSession;
+    LS.k = testSession;
+    kernel.close();
+    kernel.setConfig({ clock: "seeded", rngSeed: 777, modules: true, fetch: true, cellBudgetTicks: 200000 });
+
+    const setup = await kernel.eval("globalThis.x=42; globalThis.inc=()=>++x; x");
+    const setupOk = setup.ok !== false && setup.value === 42;
+    lines.push(setupOk ? pass("eval writes durable state", "value=" + setup.value) : fail("eval writes durable state", JSON.stringify(setup)));
+
+    await kernel.evict();
+    const cold = await kernel.gen();
+    const coldOk = cold.ok !== false && cold.inMemory === false;
+    lines.push(coldOk ? pass("hibernate drops in-memory kernel", "inMemory=" + cold.inMemory) : fail("hibernate drops in-memory kernel", JSON.stringify(cold)));
+
+    const restored = await kernel.eval("x");
+    const restoredOk = restored.ok !== false && restored.value === 42 && /restore/.test(restored.restoreSource || "");
+    lines.push(restoredOk ? pass("cold restore keeps heap state", "value=" + restored.value + " source=" + restored.restoreSource) : fail("cold restore keeps heap state", JSON.stringify(restored)));
+
+    const closure = await kernel.eval("inc()");
+    const closureOk = closure.ok !== false && closure.value === 43;
+    lines.push(closureOk ? pass("closure survives restore", "value=" + closure.value) : fail("closure survives restore", JSON.stringify(closure)));
+
+    const blocked = await kernel.eval("'x';" + " ".repeat(3 * 1024 * 1024));
+    const blockedOk = blocked.ok === false && blocked.error && blocked.error.name === "ProtocolSizeError";
+    lines.push(blockedOk ? pass("oversized source guard", blocked.error.name) : fail("oversized source guard", JSON.stringify(blocked).slice(0, 400)));
+
+    const wedge = await kernel.send({ t: "wedgeTest", spikeMb: 22 }, 60000);
+    const wedgeOk = !!(wedge && wedge.checkpoint && wedge.checkpoint.ok !== false && wedge.checkpoint.scrubbed === true);
+    lines.push(wedgeOk ? pass("W5 spike/free checkpoint", "scrubbed=" + wedge.checkpoint.scrubbed + " gz=" + wedge.checkpoint.sizeGz) : fail("W5 spike/free checkpoint", JSON.stringify(wedge).slice(0, 400)));
+
+    await kernel.evict();
+    const wedgeRestore = await kernel.eval("x");
+    const wedgeRestoreOk = wedgeRestore.ok !== false && wedgeRestore.value === 43 && /restore/.test(wedgeRestore.restoreSource || "");
+    lines.push(wedgeRestoreOk ? pass("post-wedge cold restore", "value=" + wedgeRestore.value + " source=" + wedgeRestore.restoreSource) : fail("post-wedge cold restore", JSON.stringify(wedgeRestore)));
+
+    const ok = lines.every((s) => !s.includes(">FAIL "));
+    out.dataset.status = ok ? "pass" : "fail";
+    out.innerHTML = lines.join("") + e2eLine(ok ? "final" : "err", ok ? "E2E PASS" : "E2E FAIL");
+    return { ok, session: testSession, endpoint: $("cfgEndpoint").value, details: lines.map((l) => l.replace(/<[^>]+>/g, "")) };
+  } catch (e) {
+    out.dataset.status = "fail";
+    out.innerHTML = lines.join("") + fail("E2E exception", String(e.message || e));
+    return { ok: false, session: testSession, endpoint: $("cfgEndpoint").value, error: String(e.message || e) };
+  } finally {
+    $("cfgSession").value = oldSession || testSession;
+    LS.k = $("cfgSession").value;
+    refreshState();
+  }
+}
+
 // ---- wiring ----------------------------------------------------------------
 function ensureSession() {
   if (!$("cfgSession").value) $("cfgSession").value = LS.k || randId();
@@ -403,6 +474,7 @@ $("newSession").onclick = () => { $("cfgSession").value = randId(); LS.k = $("cf
 $("reconnect").onclick = async () => { persistConn(); kernel.close(); kernel.setConfig(buildConfig()); await kernel.open(); refreshState(); };
 $("hibernate").onclick = async () => { await kernel.evict(); refreshState(); };
 $("resetSession").onclick = async () => { await kernel.reset(); refreshState(); };
+$("runE2e").onclick = () => runDeployedE2e();
 $("applyConfig").onclick = async () => {
   persistConn();
   $("cfgSession").value = randId(); LS.k = $("cfgSession").value;
@@ -412,15 +484,24 @@ $("applyConfig").onclick = async () => {
 $("runRlm").onclick = () => runRlm(false);
 $("runLambda").onclick = () => runRlm(true);
 
-// boot — restore persisted connection (P1 fix: endpoint/key survive reload, not just the session id)
-if (LS.ep) $("cfgEndpoint").value = LS.ep;
-if (LS.key) $("cfgApiKey").value = LS.key;
+// boot — URL params win, then persisted connection, then the deployed candidate default.
+// Examples:
+//   /?endpoint=wss://engram-bench-w4.umg-bhalla88.workers.dev&e2e=1
+//   /?endpoint=wss://engram-kernel.umg-bhalla88.workers.dev
+const epFromQuery = queryEndpoint();
+if (epFromQuery) $("cfgEndpoint").value = epFromQuery;
+else $("cfgEndpoint").value = LS.ep || DEFAULT_ENDPOINT;
+if (qs.get("apiKey")) $("cfgApiKey").value = qs.get("apiKey");
+else if (LS.key) $("cfgApiKey").value = LS.key;
+if (qs.get("session")) $("cfgSession").value = qs.get("session");
 const persistConn = () => { LS.ep = $("cfgEndpoint").value; LS.key = $("cfgApiKey").value.trim(); };
 ensureSession();
 kernel.setConfig(buildConfig());
 addCell('// durable across reload: increment a counter that lives in the heap\nglobalThis.n = (globalThis.n||0) + 1;\nconsole.log("ran", n, "times");\nn');
 addCell('// closures survive hibernation too\nglobalThis.inc = globalThis.inc || (()=>++globalThis.n);\ninc()');
 kernel.open().then(refreshState).catch(refreshState);
+window.__ENGRAM_E2E__ = runDeployedE2e;
+if (qs.get("e2e") === "1") setTimeout(() => runDeployedE2e(), 250);
 setInterval(refreshState, 15000);
 </script>
 </body>
