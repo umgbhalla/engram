@@ -47,8 +47,9 @@ so a session sleeps when idle and wakes with full live state, no replay.
 `entry.mjs` CompiledWasm wrapper, `wrangler.jsonc`, `stdlib-src/`, `scripts/`).
 `apps/cloud/` = multi-tenant supervisor → `engram-cloud` (`src/supervisor.js`, `vendor/`).
 `apps/ui/` = notebook SPA → `engram-ui`. `packages/sdk/` = `@engram/sdk`, `packages/cli/` = `@engram/cli`.
-`experiments/v1-facet/` = V1 facet proof. `experiments/exp-*/` = 7 proven experiments.
+`tests/{kernel,ui}/` = smoke/obs/bench harnesses (out of app/lib code).
 `scripts/deploy.ts` = deploy driver; root `package.json` has `deploy:{kernel,cloud,ui,all}`.
+Experiments + v1-facet spike **deleted** (findings: `docs/results/exp-*.md`, `v1-facet-spike.md`; code in git history).
 Older kernels `v0`→`v0.8` + version-named dirs were **pruned/renamed** — recover from git history or
 `v0.N-milestone` tags. `context/` = external repos (shallow submodules; `context/include.md` indexes them).
 Provenance below references old `v0.9.3/`/`v1.2/`/`ui/` paths = now `apps/kernel`/`apps/cloud`/`apps/ui`.

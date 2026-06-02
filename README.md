@@ -106,11 +106,11 @@ apps/cloud/                           ── multi-tenant SaaS (engram-cloud)
   vendor/           vendored quickjs dist + Tier-0 extension .wasm
 apps/ui/                              ── notebook SPA (engram-ui)
 packages/sdk/  packages/cli/          ── @engram/sdk, engram CLI
-experiments/v1-facet/                 ── V1 facet spike (proof)
-experiments/exp-*/                    ── 7 proven experiments (EXP-1,4b,5a,6,7,8,9)
 context/                              ── external repos (shallow submodules; see include.md)
-docs/                                 ── feasibility, experiments, ADRs, per-version results
+docs/                                 ── feasibility, ADRs, per-version + experiment results
 ```
+
+> **Experiments + the v1-facet spike were deleted** once their findings shipped (multi-tenant landed in `apps/cloud`). The proofs live as write-ups in `docs/results/exp-*.md` + `v1-facet-spike.md`; recover the code from git history if ever needed.
 
 > **Older kernels `v0`→`v0.8` were pruned from the working tree** to keep it lean. Recover any from git history or the `v0.N-milestone` tags.
 
