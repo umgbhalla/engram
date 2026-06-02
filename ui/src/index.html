@@ -106,7 +106,7 @@
     <label>Stdlib modules (comma, or "true" = default set)</label>
     <input id="cfgModules" value="true" />
     <label>Fetch allowlist (comma hosts, "true"=all, "false"=none)</label>
-    <input id="cfgFetch" value="false" />
+    <input id="cfgFetch" value="true" />
     <button id="applyConfig" style="margin-top:10px;width:100%">Apply config (fresh session)</button>
     <p class="hint">Config is set on session create; apply makes a new session id so it takes effect on a fresh heap.</p>
 
@@ -227,8 +227,9 @@ function buildConfig() {
   let modules = true;
   if (modulesRaw && modulesRaw !== "true") modules = modulesRaw === "false" ? false : modulesRaw.split(",").map(s => s.trim()).filter(Boolean);
   const fetchRaw = $("cfgFetch").value.trim();
-  let fetch = false;
-  if (fetchRaw === "true") fetch = true; else if (fetchRaw && fetchRaw !== "false") fetch = fetchRaw.split(",").map(s => s.trim()).filter(Boolean);
+  let fetch = true; // full-allow by default (matches kernel default); "false" blocks, csv = allowlist
+  if (fetchRaw === "false") fetch = false;
+  else if (fetchRaw && fetchRaw !== "true") fetch = fetchRaw.split(",").map(s => s.trim()).filter(Boolean);
   return {
     clock: $("cfgClock").value,
     rngSeed: Number($("cfgSeed").value) || 0,
