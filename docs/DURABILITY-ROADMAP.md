@@ -117,23 +117,26 @@ real workerd; baked stdlib identical to runtime-injected; snapshots from baked s
 ## R2-tail mitigation — cold-restore latency for big incompressible heaps (real-CF-exposed)
 
 **Real-CF finding:** >2MB-gz heaps route to R2; R2 GET = ~300ms warm / ~900ms cold / ~1.8s p95 — the
-single biggest owned restore cost. Round-4 r4 evaluated mitigations (local sim, calibrated to the real
-927ms/1768ms numbers; needs real-CF confirm before shipping):
+single biggest owned restore cost. **NOW REAL-CF-MEASURED** (engram-bench, `docs/R2TAIL-REALCF.md`).
+The round-4 local sim was **WRONG on 2 of 3** — real numbers below supersede it:
 
 ```
-   mitigation                         result
+   mitigation                         REAL-CF result (sim claim → actual)
    ──────────                         ──────
-   chunked-parallel GET, 1 big object 1.14× only (cold is connection-latency-bound, not bandwidth)
-   chunked-parallel, multi-object     3.9× (4-obj) / 7.65× (8-obj) — only if baseline was serial
-   streaming gunzip                   free ~20-130ms overlap on the chunked path
-   ★ HOT-TIER: keep image in DO-SQLite ~0ms synchronous (∞× vs R2); kernel ALREADY chunks SQLite
-   ★ prefer-SQLite via gz-9            compressible 5MB → 98KB gz, stays under 2MB line, avoids R2
+   chunked-parallel, multi-object     SIM 3.9×/7.65×  →  REAL 0.44-0.98× REGRESSION + k≥16 hits
+                                      workerd connection cap. R2 cold GET is connection-bound,
+                                      not bandwidth-bound. DROP.
+   prefer-SQLite via gz-9             SIM flips tier  →  REAL <1% (0.67-0.80%) smaller, NEVER flips
+                                      an incompressible image under the 2MB line. DROP.
+   ★ HOT-TIER: gz image in DO-SQLite  SIM ~0ms        →  REAL readMs=0 (no GET), confirmed. Restore
+     64KB rows                        ≤66ms @5MB, ~2s @20MB (pure gunzip). SHIP.
 ```
 
-**Recommendation:** the win is **avoid R2 for restore-critical images** — raise the overflow threshold +
-gz-9, and hot-tier (keep in SQLite 64KB rows) when the raw image is large but the session is latency-
-sensitive. Chunked-parallel only matters for the multi-object base+delta+oplog restore shape. Build as a
-routing-policy tweak after the core stack; re-measure on real CF.
+**Recommendation (updated, real-CF):** **HOT-TIER is the decisive and only real win.** Keep the gz
+image in DO-SQLite 64KB rows (above the 2MB-gz R2-overflow line) for latency-sensitive sessions whose
+gz is still ≲ a few MB → restore is in-turn ~0ms read + gunzip CPU, eliminating the 0.9–3.9s R2 GET
+tail. **Drop chunked-parallel and gz-9** — both fail on real CF (regression / <1%). Gunzip cost grows
+with raw size (~2s @20MB), so hot-tier wins clearest for smaller gz. Build as a routing-policy tweak.
 
 ## Parked (door open, no parity reason now)
 

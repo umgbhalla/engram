@@ -15,7 +15,8 @@
 //   GET  /metrics             {bytesWritten:{sqlite,r2}, peakImage, deltaCount, oplogLen,...}
 
 import { QuickJS } from "quickjs-wasi";
-import { DOStore } from "./store.mjs";
+import { gzipSync, gunzipSync } from "node:zlib";
+import { DOStore, CHUNK_BYTES, gz } from "./store.mjs";
 import { Session } from "./session.mjs";
 import combined from "./combined.mjs";
 import { WORKLOADS, ALIASES } from "./workloads.mjs";
@@ -531,9 +532,381 @@ export class KernelDO {
     });
   }
 
+  // ===== R2-TAIL MITIGATION MODES ==========================================
+  // Build a real QuickJS heap image of ~targetMb raw by allocating incompressible
+  // (entropy) data so gzip can't cheat. Returns {image, rawBytes, usedHeap}.
+  async _buildImage(targetMb) {
+    const s = new Session();
+    await s.create();
+    // ~targetMb of unique-byte strings => incompressible, mirrors a real working set.
+    const cell = `var blob=[]; for(let i=0;i<${targetMb};i++){ var s=""; for(let j=0;j<131072;j++){ s+=String.fromCharCode((i*2654435761 + j*2246822519)&0xff,((i*40503+j*12345)>>3)&0xff,(i^j^(j<<3))&0xff,(i*7+j*131)&0xff,(j*5)&0xff,(i+j)&0xff,(j>>2)&0xff,(i*13)&0xff); } blob.push(s); } blob.length`;
+    s.eval(cell);
+    const image = s.dump();
+    const usedHeap = s.usedHeap();
+    s.dispose();
+    return { image, rawBytes: image.byteLength, usedHeap };
+  }
+
+  // MODE 1: HOT-TIER. Force a ~5MB gzip image to be stored SPLIT across DO-SQLite
+  // 64KB rows (bypassing the >=2MB R2-overflow rule), then restore from those rows.
+  // Measures whether SQLite chunked storage dodges the R2-GET cold tail entirely.
+  async _hotTier(body) {
+    const mb = body.mb || 5;
+    const built = await this._buildImage(mb);
+    const gzBytes = await gz(built.image); // platform gzip (level ~6)
+    const key = `bench/${this.doId}/hottier/img`;
+
+    // write: chunk gz bytes straight into blob_chunk (no R2, regardless of size)
+    const w0 = Date.now();
+    this.ctx.storage.sql.exec(`DELETE FROM blob_chunk WHERE key = ?`, key);
+    let seq = 0;
+    for (let i = 0; i < gzBytes.byteLength; i += CHUNK_BYTES) {
+      const c = gzBytes.subarray(i, Math.min(i + CHUNK_BYTES, gzBytes.byteLength));
+      this.ctx.storage.sql.exec(`INSERT INTO blob_chunk (key, seq, data) VALUES (?, ?, ?)`, key, seq, c);
+      seq++;
+    }
+    const writeMs = Date.now() - w0;
+
+    // read back: concat all rows -> gunzip -> deserialize -> restore VM
+    const r0 = Date.now();
+    const chunks = [];
+    for (const r of this.ctx.storage.sql.exec(`SELECT data FROM blob_chunk WHERE key = ? ORDER BY seq`, key)) {
+      chunks.push(new Uint8Array(r.data));
+    }
+    let total = 0; for (const c of chunks) total += c.byteLength;
+    const merged = new Uint8Array(total); let o = 0;
+    for (const c of chunks) { merged.set(c, o); o += c.byteLength; }
+    const readMs = Date.now() - r0;
+
+    const g0 = Date.now();
+    const ds = new DecompressionStream("gzip");
+    const dw = ds.writable.getWriter(); dw.write(merged); dw.close();
+    const raw = new Uint8Array(await new Response(ds.readable).arrayBuffer());
+    const gunzipMs = Date.now() - g0;
+
+    const i0 = Date.now();
+    const snap = QuickJS.deserializeSnapshot(raw);
+    const sess = new Session();
+    sess.vm = await QuickJS.restore(snap, sess._opts());
+    const instantiateMs = Date.now() - i0;
+    const probe = String(sess.eval("blob.length"));
+    sess.dispose();
+    this.ctx.storage.sql.exec(`DELETE FROM blob_chunk WHERE key = ?`, key);
+
+    return json({
+      ok: true, mode: "hot-tier-sqlite-rows", mb,
+      rawImageBytes: built.rawBytes, gzBytes: gzBytes.byteLength, nRows: seq,
+      restoreSource: "sqlite-restore",
+      writeMs, readMs, gunzipMs, instantiateMs,
+      totalRestoreMs: readMs + gunzipMs + instantiateMs,
+      fidelity: probe === String(mb), probeBlobLen: probe,
+      note: "gz image forced into DO-SQLite 64KB rows (no R2); restore reads rows in-turn (no network GET)",
+    });
+  }
+
+  // MODE 2: chunked-parallel. Store a big gz image as K R2 objects, restore via
+  // Promise.all concurrent GET. Measures whether parallel R2 GETs beat one big GET.
+  async _chunkedParallel(body) {
+    const mb = body.mb || 5;
+    const k = body.k || 8;
+    const built = await this._buildImage(mb);
+    const gzBytes = await gz(built.image);
+    const base = `bench/${this.doId}/chunkpar/`;
+    const partLen = Math.ceil(gzBytes.byteLength / k);
+
+    const w0 = Date.now();
+    const writes = [];
+    const parts = [];
+    for (let i = 0; i < k; i++) {
+      const start = i * partLen;
+      if (start >= gzBytes.byteLength) break;
+      const part = gzBytes.subarray(start, Math.min(start + partLen, gzBytes.byteLength));
+      parts.push({ key: `${base}p${i}`, len: part.byteLength });
+      writes.push(this.env.SNAPSHOTS.put(`${base}p${i}`, part));
+    }
+    await Promise.all(writes);
+    const writeMs = Date.now() - w0;
+
+    // PARALLEL restore: concurrent GET of all K objects
+    const r0 = Date.now();
+    const objs = await Promise.all(parts.map((p) => this.env.SNAPSHOTS.get(p.key)));
+    const bufs = await Promise.all(objs.map((o) => o.arrayBuffer()));
+    const readMs = Date.now() - r0;
+
+    let total = 0; for (const b of bufs) total += b.byteLength;
+    const merged = new Uint8Array(total); let o = 0;
+    for (const b of bufs) { merged.set(new Uint8Array(b), o); o += b.byteLength; }
+
+    const g0 = Date.now();
+    const ds = new DecompressionStream("gzip");
+    const dw = ds.writable.getWriter(); dw.write(merged); dw.close();
+    const raw = new Uint8Array(await new Response(ds.readable).arrayBuffer());
+    const gunzipMs = Date.now() - g0;
+
+    const i0 = Date.now();
+    const snap = QuickJS.deserializeSnapshot(raw);
+    const sess = new Session();
+    sess.vm = await QuickJS.restore(snap, sess._opts());
+    const instantiateMs = Date.now() - i0;
+    const probe = String(sess.eval("blob.length"));
+    sess.dispose();
+
+    // SEQUENTIAL baseline: one big GET of the whole gz for comparison
+    const wholeKey = `${base}whole`;
+    await this.env.SNAPSHOTS.put(wholeKey, gzBytes);
+    const sr0 = Date.now();
+    const wholeObj = await this.env.SNAPSHOTS.get(wholeKey);
+    await wholeObj.arrayBuffer();
+    const seqReadMs = Date.now() - sr0;
+
+    await Promise.all([...parts.map((p) => this.env.SNAPSHOTS.delete(p.key)), this.env.SNAPSHOTS.delete(wholeKey)]);
+
+    return json({
+      ok: true, mode: "chunked-parallel-r2", mb, k: parts.length,
+      rawImageBytes: built.rawBytes, gzBytes: gzBytes.byteLength, partBytes: partLen,
+      restoreSource: "r2-restore",
+      writeMs, parallelReadMs: readMs, seqWholeReadMs: seqReadMs,
+      readSpeedupVsSeq: seqReadMs > 0 ? Number((seqReadMs / readMs).toFixed(2)) : null,
+      gunzipMs, instantiateMs, totalRestoreMs: readMs + gunzipMs + instantiateMs,
+      fidelity: probe === String(mb), probeBlobLen: probe,
+      note: "K R2 objects fetched concurrently via Promise.all vs one whole-object GET",
+    });
+  }
+
+  // MODE 3: prefer-SQLite-gz9. Compress with zlib level 9. Measure gz9 size vs the
+  // platform gzip (~level 6), and whether a normally-R2 image (>=2MB gz) now fits
+  // under the 2MB-gz SQLite threshold (=> dodges R2 entirely).
+  async _preferGz9(body) {
+    const mb = body.mb || 5;
+    const built = await this._buildImage(mb);
+
+    const p0 = Date.now();
+    const gzPlatform = await gz(built.image);
+    const platformMs = Date.now() - p0;
+
+    const z0 = Date.now();
+    const gz9 = gzipSync(Buffer.from(built.image.buffer, built.image.byteOffset, built.image.byteLength), { level: 9 });
+    const gz9Ms = Date.now() - z0;
+    const gz9u = new Uint8Array(gz9.buffer, gz9.byteOffset, gz9.byteLength);
+
+    const THRESH = 2 * 1024 * 1024;
+    const platformWouldR2 = gzPlatform.byteLength >= THRESH;
+    const gz9WouldR2 = gz9u.byteLength >= THRESH;
+    const nowFitsSqlite = platformWouldR2 && !gz9WouldR2;
+
+    // verify gz9 round-trips and the route it would take (sqlite vs r2)
+    const route = gz9WouldR2 ? "r2" : "sqlite";
+    let fidelity = false, probe = "n/a", restoreMs = 0;
+    if (route === "sqlite") {
+      // store gz9 in SQLite rows, read back, gunzip via zlib, restore
+      const key = `bench/${this.doId}/gz9/img`;
+      this.ctx.storage.sql.exec(`DELETE FROM blob_chunk WHERE key = ?`, key);
+      let seq = 0;
+      for (let i = 0; i < gz9u.byteLength; i += CHUNK_BYTES) {
+        const c = gz9u.subarray(i, Math.min(i + CHUNK_BYTES, gz9u.byteLength));
+        this.ctx.storage.sql.exec(`INSERT INTO blob_chunk (key, seq, data) VALUES (?, ?, ?)`, key, seq, c);
+        seq++;
+      }
+      const r0 = Date.now();
+      const chunks = [];
+      for (const r of this.ctx.storage.sql.exec(`SELECT data FROM blob_chunk WHERE key = ? ORDER BY seq`, key)) {
+        chunks.push(new Uint8Array(r.data));
+      }
+      let total = 0; for (const c of chunks) total += c.byteLength;
+      const merged = new Uint8Array(total); let o = 0;
+      for (const c of chunks) { merged.set(c, o); o += c.byteLength; }
+      const raw = gunzipSync(Buffer.from(merged.buffer, merged.byteOffset, merged.byteLength));
+      const snap = QuickJS.deserializeSnapshot(new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength));
+      const sess = new Session();
+      sess.vm = await QuickJS.restore(snap, sess._opts());
+      probe = String(sess.eval("blob.length"));
+      sess.dispose();
+      restoreMs = Date.now() - r0;
+      fidelity = probe === String(mb);
+      this.ctx.storage.sql.exec(`DELETE FROM blob_chunk WHERE key = ?`, key);
+    }
+
+    return json({
+      ok: true, mode: "prefer-sqlite-gz9", mb,
+      rawImageBytes: built.rawBytes,
+      platformGzBytes: gzPlatform.byteLength, platformGzMs: platformMs,
+      gz9Bytes: gz9u.byteLength, gz9Ms,
+      gz9ReductionVsPlatformPct: Number(((1 - gz9u.byteLength / gzPlatform.byteLength) * 100).toFixed(2)),
+      sqliteThresholdBytes: THRESH,
+      platformRoute: platformWouldR2 ? "r2" : "sqlite",
+      gz9Route: route,
+      nowFitsSqlite,
+      restoreMsSqlite: restoreMs, fidelity, probeBlobLen: probe,
+      note: nowFitsSqlite
+        ? "gz9 shrank a normally-R2 image under 2MB => routes to SQLite, dodges R2 cold GET"
+        : "gz9 did not change the routing tier for this size",
+    });
+  }
+
+  // ===== BAKE-OFF: HOT-TIER (DO-SQLite rows) vs R2 restore, SAME 5MB image ====
+  // Build ONE incompressible ~mb image, store it BOTH ways once, then loop N restore
+  // reps per tier measuring totalMs = read + gunzip + deserialize + VM-restore (the
+  // full path a cold wake pays in-turn). Reports both distributions (p50/p95) + the
+  // SQLite-size cost of holding the gz image as 64KB rows. Apples-to-apples: identical
+  // bytes, identical gunzip + deserialize + restore, only the read source differs.
+  async _bakeoffRestore(body) {
+    const mb = body.mb || 5;
+    const n = body.n || 10;
+
+    // 1. build ONE image, gzip it ONCE. QuickJS string heaps compress ~8:1 so a valid
+    // restorable image can't reach a 5MB GZ without crossing the snapshot-dump crash
+    // ceiling (~18MB raw). To faithfully measure the READ-tier cost for a ~5MB STORED
+    // blob (the size the baseline measured), pad the stored payload to padToMb with
+    // incompressible random bytes APPENDED after the real gz; on read we slice the real
+    // gz prefix back out (4-byte LE length header) so the VM still restores correctly.
+    // Both tiers store + read the identical padded blob => identical read cost.
+    const padToMb = body.padToMb != null ? body.padToMb : 5;
+    const built = await this._buildImage(mb);
+    const realGz = await gz(built.image);
+    const realGzLen = realGz.byteLength;
+    const targetBytes = Math.round(padToMb * 1024 * 1024);
+    const headerLen = 4;
+    const padLen = Math.max(0, targetBytes - headerLen - realGzLen);
+    const gzBytes = new Uint8Array(headerLen + realGzLen + padLen);
+    new DataView(gzBytes.buffer).setUint32(0, realGzLen, true);
+    gzBytes.set(realGz, headerLen);
+    // incompressible random pad so the STORED blob ~= targetBytes (gzip can't shrink it)
+    if (padLen > 0) {
+      const padView = gzBytes.subarray(headerLen + realGzLen);
+      for (let i = 0; i < padView.byteLength; i += 65536) {
+        crypto.getRandomValues(padView.subarray(i, Math.min(i + 65536, padView.byteLength)));
+      }
+    }
+    const gzLen = gzBytes.byteLength;
+    const unpad = (blob) => {
+      const n = new DataView(blob.buffer, blob.byteOffset, blob.byteLength).getUint32(0, true);
+      return blob.subarray(headerLen, headerLen + n);
+    };
+
+    const sqliteKey = `bench/${this.doId}/bakeoff/sqlite`;
+    const r2Key = `bench/${this.doId}/bakeoff/r2`;
+
+    // 2. store HOT-TIER (SQLite 64KB rows, forced regardless of size)
+    this.ctx.storage.sql.exec(`DELETE FROM blob_chunk WHERE key = ?`, sqliteKey);
+    let nRows = 0;
+    for (let i = 0; i < gzLen; i += CHUNK_BYTES) {
+      const c = gzBytes.subarray(i, Math.min(i + CHUNK_BYTES, gzLen));
+      this.ctx.storage.sql.exec(`INSERT INTO blob_chunk (key, seq, data) VALUES (?, ?, ?)`, sqliteKey, nRows, c);
+      nRows++;
+    }
+    // measure the SQLite holding cost (database_size delta is global; measure the rows)
+    const rowBytes = [...this.ctx.storage.sql.exec(
+      `SELECT SUM(LENGTH(data)) AS b, COUNT(*) AS n FROM blob_chunk WHERE key = ?`, sqliteKey)][0];
+    let dbSize = null;
+    try { dbSize = this.ctx.storage.sql.databaseSize; } catch {}
+
+    // 3. store R2 (one object)
+    await this.env.SNAPSHOTS.put(r2Key, gzBytes);
+
+    const restoreFrom = async (padded) => {
+      const raw = unpad(padded); // slice real gz prefix out of the padded blob
+      const g0 = Date.now();
+      const ds = new DecompressionStream("gzip");
+      const dw = ds.writable.getWriter(); dw.write(raw); dw.close();
+      const plain = new Uint8Array(await new Response(ds.readable).arrayBuffer());
+      const gunzipMs = Date.now() - g0;
+      const i0 = Date.now();
+      const snap = QuickJS.deserializeSnapshot(plain);
+      const sess = new Session();
+      sess.vm = await QuickJS.restore(snap, sess._opts());
+      const instantiateMs = Date.now() - i0;
+      const probe = String(sess.eval("blob.length"));
+      sess.dispose();
+      return { gunzipMs, instantiateMs, fidelity: probe === String(mb) };
+    };
+
+    const sqliteReps = [];
+    const r2Reps = [];
+    let fidelityOk = true;
+
+    for (let rep = 0; rep < n; rep++) {
+      // --- HOT-TIER restore: read rows in-turn, no network ---
+      {
+        const t0 = Date.now();
+        const r0 = Date.now();
+        const chunks = [];
+        for (const r of this.ctx.storage.sql.exec(`SELECT data FROM blob_chunk WHERE key = ? ORDER BY seq`, sqliteKey)) {
+          chunks.push(new Uint8Array(r.data));
+        }
+        let total = 0; for (const c of chunks) total += c.byteLength;
+        const merged = new Uint8Array(total); let o = 0;
+        for (const c of chunks) { merged.set(c, o); o += c.byteLength; }
+        const readMs = Date.now() - r0;
+        const rest = await restoreFrom(merged);
+        sqliteReps.push({ readMs, gunzipMs: rest.gunzipMs, instantiateMs: rest.instantiateMs, totalMs: Date.now() - t0 });
+        if (!rest.fidelity) fidelityOk = false;
+      }
+      // --- R2 restore: GET the object (network), then identical restore ---
+      {
+        const t0 = Date.now();
+        const r0 = Date.now();
+        const obj = await this.env.SNAPSHOTS.get(r2Key);
+        const raw = new Uint8Array(await obj.arrayBuffer());
+        const readMs = Date.now() - r0;
+        const rest = await restoreFrom(raw);
+        r2Reps.push({ readMs, gunzipMs: rest.gunzipMs, instantiateMs: rest.instantiateMs, totalMs: Date.now() - t0 });
+        if (!rest.fidelity) fidelityOk = false;
+      }
+    }
+
+    // cleanup
+    this.ctx.storage.sql.exec(`DELETE FROM blob_chunk WHERE key = ?`, sqliteKey);
+    await this.env.SNAPSHOTS.delete(r2Key);
+
+    const pctl = (arr, p) => {
+      const s = [...arr].sort((a, b) => a - b);
+      const idx = Math.min(s.length - 1, Math.floor((p / 100) * s.length));
+      return s[idx];
+    };
+    const summarize = (reps) => {
+      const tot = reps.map((r) => r.totalMs);
+      const rd = reps.map((r) => r.readMs);
+      return {
+        totalMs: { p50: pctl(tot, 50), p95: pctl(tot, 95), min: Math.min(...tot), max: Math.max(...tot), all: tot },
+        readMs: { p50: pctl(rd, 50), p95: pctl(rd, 95), max: Math.max(...rd) },
+        gunzipMsP50: pctl(reps.map((r) => r.gunzipMs), 50),
+        instantiateMsP50: pctl(reps.map((r) => r.instantiateMs), 50),
+      };
+    };
+
+    return json({
+      ok: true,
+      mode: "bakeoff-restore-hottier-vs-r2",
+      mb, n,
+      image: { rawImageBytes: built.rawBytes, realGzBytes: realGzLen, storedBlobBytes: gzLen, padBytes: padLen, usedHeap: built.usedHeap },
+      fidelity: fidelityOk,
+      hotTier: {
+        restoreSource: "sqlite-restore",
+        ...summarize(sqliteReps),
+        sqliteCost: {
+          gzBytesStored: gzLen,
+          rowBytesSum: rowBytes ? Number(rowBytes.b) : null,
+          nRows: rowBytes ? Number(rowBytes.n) : nRows,
+          chunkBytes: CHUNK_BYTES,
+          overheadVsGzPct: rowBytes ? Number((((Number(rowBytes.b) - gzLen) / gzLen) * 100).toFixed(3)) : null,
+          databaseSizeBytes: dbSize,
+        },
+      },
+      r2: {
+        restoreSource: "r2-restore",
+        ...summarize(r2Reps),
+      },
+      note: "SAME gz image fed to both tiers; only the read source differs. R2 reps are warm-bucket in-loop GETs (cold tail is higher, see baseline ~908ms p50). Hot-tier reads SQLite rows in-turn (no network).",
+    });
+  }
+
   async fetch(request) {
     const url = new URL(request.url);
     try {
+      if (request.method === "POST" && url.pathname === "/bakeoff-restore") {
+        const body = await request.json().catch(() => ({}));
+        return await this._bakeoffRestore(body);
+      }
       if (request.method === "POST" && url.pathname === "/spike") {
         const body = await request.json().catch(() => ({}));
         return await this._spike(body.spikeMb || 48, body.kind || "repeat");
@@ -599,6 +972,18 @@ export class KernelDO {
       if (request.method === "POST" && url.pathname === "/baseline") {
         const body = await request.json().catch(() => ({}));
         return await this._baseline(body.workload || "long");
+      }
+      if (request.method === "POST" && url.pathname === "/hot-tier") {
+        const body = await request.json().catch(() => ({}));
+        return await this._hotTier(body);
+      }
+      if (request.method === "POST" && url.pathname === "/chunked-parallel") {
+        const body = await request.json().catch(() => ({}));
+        return await this._chunkedParallel(body);
+      }
+      if (request.method === "POST" && url.pathname === "/prefer-sqlite-gz9") {
+        const body = await request.json().catch(() => ({}));
+        return await this._preferGz9(body);
       }
       if (request.method === "POST" && url.pathname === "/limits") {
         const body = await request.json().catch(() => ({}));
