@@ -8,6 +8,21 @@
 >
 > Status: PROVEN in prototype, NOT yet built into `apps/kernel`. Spec only. Build gated on owner OK +
 > evict→cold-restore regression (per the session goal guardrails).
+>
+> **⚠ REAL-CF CORRECTION (`docs/REALCF-VALIDATION.md`, measured on a scratch worker):** the prototype's
+> 97.46% reclaim was a *fresh-instance-on-restore* artifact of the in-process sim. On **real workerd**:
+> - **Raw `memory.buffer` reclaim = 0%.** workerd linear memory is monotonic (1.25→18MB, stays 18MB
+>   after free), and a *restored* fresh instance re-blits the full linear memory (re-dump 18.09MB). So
+>   §2's "fresh instance starts small" assumption is **FALSE on workerd** — the restored image keeps the
+>   high-water-mark size.
+> - **What DOES work: used-heap / gz reclaim = 99.6%** (16.84MB live → 66KB after free + GC). The
+>   *stored* image (gzipped, after `_scrubArena` zeroes freed pages) shrinks; the *running buffer* does not.
+>
+> **Revised W5 goal:** W5 reclaims the **stored/gz image size** (un-wedges the dump ceiling — the actual
+> P0), NOT the running raw buffer. The §2 "restore at minimal size" step is unreliable on workerd and must
+> be treated as best-effort, not a guarantee. True raw-buffer reclaim needs the parked native-rquickjs
+> build (which re-creates the instance from serialized roots). The dump-ceiling un-wedge still holds:
+> a scrubbed+gzipped freed-spike image fits under the ceiling even though the raw buffer stays large.
 
 ---
 

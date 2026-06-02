@@ -127,8 +127,10 @@ efficiency layered on a proven base. Never batch all four into one deploy.
 ```
    ⚠ high  W5 live-extent math: off-by-one truncates a live page → corruption
            → mitigation: derive from QuickJS getMemoryUsage high-addr + pad + post-blit verify; gate §5.1
-   ⚠ high  workerd may not honor a smaller initial memory after grow (sim can't test)
-           → BLOCK on docs/REALCF-VALIDATION.md m2 result before trusting W5 reclaim in prod
+   ✗ RESOLVED-NEGATIVE  workerd does NOT honor a smaller initial memory after grow
+           → REALCF m2 measured: raw-buffer reclaim = 0% (monotonic; restore re-blits full image).
+             W5 reclaims the STORED/gz image (un-wedges the dump ceiling — the real P0), NOT the
+             running raw buffer. Drop the "restore at minimal size" guarantee; keep scrub+gz reclaim.
    ⚠ med   delta corruption bricks restore if E6 net absent → ship W4 only WITH E6 (never alone)
    ⚠ med   glue byte-shift invalidates live snapshots → journal-replay migrates (expected, announce)
    ✓ low   determinism — all additions are exact-bytes or seeded-recorded, zero new entropy
