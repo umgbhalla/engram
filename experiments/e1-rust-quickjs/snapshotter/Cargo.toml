@@ -1,0 +1,14 @@
+[package]
+name = "snapshotter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rquickjs = { path = "/Users/umang/hub/zonko/montydyn/experiments/_src/rquickjs", default-features = false, features = ["std", "bindgen"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "z"
+lto = true

@@ -1,0 +1,8 @@
+# throwaway local-experiment build artifacts — keep only source + findings
+_src/
+_bin/
+**/target/
+**/node_modules/
+*.wasm
+*.bin
+*.snap

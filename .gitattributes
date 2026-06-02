@@ -6,6 +6,7 @@ apps/cloud/vendor/**      linguist-vendored
 
 # Test / bench / obs harnesses — not product source.
 tests/**                  linguist-generated
+experiments/**            linguist-generated
 **/smoke*.mjs             linguist-generated
 **/obs-*.mjs              linguist-generated
 **/bench/**               linguist-generated
