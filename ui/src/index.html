@@ -88,9 +88,9 @@
   <aside>
     <h3>Session</h3>
     <label>Kernel endpoint (wss)</label>
-    <input id="cfgEndpoint" value="wss://montydyn-v092.umg-bhalla88.workers.dev" />
-    <label>API key (only for montydyn-v12; blank for v092)</label>
-    <input id="cfgApiKey" placeholder="md_… (leave blank for v092)" />
+    <input id="cfgEndpoint" value="wss://montydyn-v093.umg-bhalla88.workers.dev" />
+    <label>API key (only for montydyn-v12; blank for v093)</label>
+    <input id="cfgApiKey" placeholder="md_… (leave blank for v093)" />
     <label>Session id (reconnect to restore state)</label>
     <div class="row">
       <input id="cfgSession" />
@@ -138,6 +138,10 @@ const $ = (id) => document.getElementById(id);
 const LS = {
   get k(){ return localStorage.getItem("md_session"); },
   set k(v){ localStorage.setItem("md_session", v); },
+  get ep(){ return localStorage.getItem("md_endpoint"); },
+  set ep(v){ localStorage.setItem("md_endpoint", v); },
+  get key(){ return localStorage.getItem("md_apikey") || ""; },
+  set key(v){ localStorage.setItem("md_apikey", v||""); },
 };
 
 function randId() { return "nb-" + Math.random().toString(36).slice(2, 10); }
@@ -395,10 +399,11 @@ function ensureSession() {
 $("addCell").onclick = () => addCell();
 $("runAll").onclick = async () => { for (const el of $("cells").children) await el._run(); };
 $("newSession").onclick = () => { $("cfgSession").value = randId(); LS.k = $("cfgSession").value; kernel.close(); refreshState(); };
-$("reconnect").onclick = async () => { kernel.close(); kernel.setConfig(buildConfig()); await kernel.open(); refreshState(); };
+$("reconnect").onclick = async () => { persistConn(); kernel.close(); kernel.setConfig(buildConfig()); await kernel.open(); refreshState(); };
 $("hibernate").onclick = async () => { await kernel.evict(); refreshState(); };
 $("resetSession").onclick = async () => { await kernel.reset(); refreshState(); };
 $("applyConfig").onclick = async () => {
+  persistConn();
   $("cfgSession").value = randId(); LS.k = $("cfgSession").value;
   kernel.close(); kernel.setConfig(buildConfig()); await kernel.open();
   await kernel.eval("1"); refreshState();
@@ -406,7 +411,10 @@ $("applyConfig").onclick = async () => {
 $("runRlm").onclick = () => runRlm(false);
 $("runLambda").onclick = () => runRlm(true);
 
-// boot
+// boot — restore persisted connection (P1 fix: endpoint/key survive reload, not just the session id)
+if (LS.ep) $("cfgEndpoint").value = LS.ep;
+if (LS.key) $("cfgApiKey").value = LS.key;
+const persistConn = () => { LS.ep = $("cfgEndpoint").value; LS.key = $("cfgApiKey").value.trim(); };
 ensureSession();
 kernel.setConfig(buildConfig());
 addCell('// durable across reload: increment a counter that lives in the heap\nglobalThis.n = (globalThis.n||0) + 1;\nconsole.log("ran", n, "times");\nn');
