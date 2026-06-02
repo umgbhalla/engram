@@ -206,6 +206,7 @@ Full numbers: `docs/results/SUMMARY.md`.
 | File | What |
 |---|---|
 | `CLAUDE.md` | source of truth: full context trail, journey, milestones, key facts |
+| `docs/DESIGN.md` | **deep internals** — layering, eval lifecycle, snapshot/restore, state machine, guards, multi-tenant containment (text-first diagrams) |
 | `docs/feasibility.md` | feasibility study + architecture (verdict, snapshot mechanism, risks) |
 | `docs/experiments.md` | the 10-experiment phased plan |
 | `docs/decisions.md` | ADRs — 0001 drop Dynamic Worker Loader · 0002 heap-snapshot · 0003 facets-for-V1 |
