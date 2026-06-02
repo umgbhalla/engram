@@ -15,5 +15,5 @@ _bin/
 e3-chiwawa/
 **/*.h
 **/*.wat
-experiments/**/package.json
+**/package.json
 w7-wasmtime-dirtypage/
