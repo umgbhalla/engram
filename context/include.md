@@ -14,6 +14,7 @@ Read-only reference. Init with `git submodule update --init --depth 1`.
 | `perry` | PerryTS/perry | Native TS compiler (SWC→LLVM, Rust). AOT, not REPL — wrong axis for live kernel, but ref for a possible compile-the-session fast-path. | TS frontend, WASM target emission |
 | `wizer` | bytecodealliance/wizer | WASM pre-initialization snapshot tool. Reference for what state is/ isn't capturable (refuses funcref/externref churn). | how it snapshots memory+globals; table limitations |
 | `dynos` | threepointone/dynos | Dynamic Worker Loader wrapper reference (if we ever load kernels per-tenant). | `LOADER.get/load`, module map, globalOutbound |
+| `beautiful-mermaid` | lukilabs/beautiful-mermaid | Diagram styling reference. Custom SVG renderer (not Mermaid theming) driven by CSS vars `--bg/--fg/--line/--accent/--muted`; curated palettes (github-dark, tokyo-night, dracula, nord, …). Source of the README's themed `%%{init}%%` block. | `src/theme.ts` palettes, color-mix derivation rules |
 
 ## Notes
 - Submodules are `--depth 1` shallow. To update one: `cd context/<dir> && git fetch --depth 1 && git checkout <rev>`.

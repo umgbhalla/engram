@@ -25,3 +25,6 @@
 [submodule "context/dynos"]
 	path = context/dynos
 	url = https://github.com/threepointone/dynos
+[submodule "context/beautiful-mermaid"]
+	path = context/beautiful-mermaid
+	url = https://github.com/lukilabs/beautiful-mermaid.git

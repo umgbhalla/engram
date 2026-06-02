@@ -21,16 +21,20 @@ V8 isolates **cannot** hibernate a live kernel — there is no heap-snapshot API
 
 No journaling, no source replay. We literally persist the heap. That single property is the whole product.
 
-```
-              ┌────────────────────── Durable Object (one per session) ──────────────────────┐
-   WS / HTTP  │                                                                                │
-  ───────────▶│  Rust DO shell ──▶ JS glue ──▶ QuickJS (WASM)   live namespace: x, inc(), …    │
-              │       │                              │                                          │
-              │       │   snapshot = memory.buffer + globals + entropy counters                 │
-              │       ▼                              ▼                                          │
-              │  SQLite (chunked 64KB rows, <2MB gz)   ──overflow──▶  R2 (engram-snapshots)      │
-              └────────────────────────────────────────────────────────────────────────────────┘
-                       idle ⇒ DO evicted, heap gone     wake ⇒ new instance, restore bytes, resume
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'background':'#0d1117','primaryColor':'#161b22','primaryTextColor':'#e6edf3','primaryBorderColor':'#3d444d','lineColor':'#3d444d','secondaryColor':'#161b22','tertiaryColor':'#0d1117','fontFamily':'Inter, system-ui, sans-serif','edgeLabelBackground':'#0d1117','clusterBkg':'#0d1117','clusterBorder':'#3d444d','titleColor':'#e6edf3'}}}%%
+flowchart TD
+  client(["WS / HTTP client"]) -->|"frames: create · eval · ping"| do
+
+  subgraph do["Durable Object — one per session"]
+    direction TB
+    shell["Rust DO shell"] --> glue["JS glue"] --> qjs["QuickJS (WASM)<br/>live namespace: x, inc(), pending promises"]
+    qjs -.->|"snapshot = memory.buffer<br/>+ globals + entropy counters"| sqlite[("SQLite<br/>chunked 64KB rows, &lt;2MB gz")]
+    sqlite -->|"overflow &gt;2MB gz"| r2[("R2<br/>engram-snapshots")]
+  end
+
+  do -->|"idle ⇒ DO evicted, heap gone"| sleep(["💤 hibernated"])
+  sleep -->|"wake ⇒ new instance,<br/>blit bytes back, resume mid-namespace"| do
 ```
 
 ---
@@ -129,6 +133,24 @@ docs/                                 ── feasibility, experiments, ADRs, per
 ---
 
 ## How it works (deeper)
+
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'background':'#0d1117','primaryColor':'#161b22','primaryTextColor':'#e6edf3','primaryBorderColor':'#3d444d','lineColor':'#3d444d','secondaryColor':'#161b22','tertiaryColor':'#0d1117','fontFamily':'Inter, system-ui, sans-serif','actorBkg':'#161b22','actorBorder':'#3d444d','actorTextColor':'#e6edf3','signalColor':'#3d444d','signalTextColor':'#9198a1','noteBkgColor':'#161b22','noteBorderColor':'#3d444d','noteTextColor':'#e6edf3','labelBoxBkgColor':'#161b22','labelBoxBorderColor':'#3d444d','labelTextColor':'#e6edf3','sequenceNumberColor':'#0d1117'}}}%%
+sequenceDiagram
+  autonumber
+  participant G as JS glue
+  participant Q as QuickJS (WASM)
+  participant S as SQLite / R2
+  Note over G,Q: eval completes
+  G->>Q: read memory.buffer + globals + entropy counters
+  G->>G: admit on used heap (memoryUsedSize, not monotonic buffer)
+  G->>S: gzip → SQLite chunks (&lt;2MB) else R2 overflow<br/>(crash-atomic via write-coalescing)
+  Note over G,S: 💤 idle ⇒ DO evicted, instance gone
+  G->>Q: new instance, re-instantiate Tier-0 natives at fixed bases
+  S-->>G: read chunks → gunzip
+  G->>Q: blit heap bytes back + restore globals
+  Q-->>G: execution continues mid-namespace (no replay)
+```
 
 ### Snapshot / restore
 1. After a cell evals, glue reads `memory.buffer`, mutable globals, and entropy counters.
