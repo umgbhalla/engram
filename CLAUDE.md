@@ -88,7 +88,7 @@ literally persist the heap.
 ## Architecture (target)
 
 - **Kernel** = script interpreter compiled Rust → WASM.
-  - JS first: **QuickJS-ng → WASM** (built-in snapshot API; quickjs-wasi precedent). Boa = higher-risk alt (no snapshot API).
+  - JS first: **QuickJS-ng → WASM** (built-in snapshot API; quickjs-wasi precedent). Boa = viable alt — **now proven snapshottable by pure memory-blit** (non-moving `boa_gc`, fixed funcref table; W2 in `docs/WASM-EXPEDITIONS-2.md`), ~2× size, unproven at kernel parity.
   - Python later: **RustPython** (single-memory, snapshottable). Pyodide BLOCKED on CF (side-table capture unreachable).
 - **Host** = Cloudflare **Durable Object** (identity + SQLite + alarms + WebSocket
   hibernation). Holds the snapshot; orchestrates lifecycle.
