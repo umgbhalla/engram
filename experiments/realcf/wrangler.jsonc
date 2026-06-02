@@ -1,0 +1,28 @@
+{
+  // THROWAWAY benchmark worker. Standalone DO that runs the COMBINED durability stack
+  // (W5 compaction + W4 byte-delta + E6 oplog) on real Cloudflare so the bake-off claims
+  // can be measured. Reuses the existing engram-snapshots R2 bucket but ONLY under the
+  // bench/<doId>/ key prefix. Does NOT touch engram-kernel / engram-cloud / engram-ui.
+  "name": "engram-bench",
+  "main": "src/entry.mjs",
+  "compatibility_date": "2025-05-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  // quickjs.wasm bundled as CompiledWasm => importable as a precompiled WebAssembly.Module
+  // (workerd forbids runtime WebAssembly.compile of arbitrary bytes). quickjs-wasi accepts
+  // a WebAssembly.Module directly, so no Rust glue is needed.
+  "rules": [
+    { "type": "CompiledWasm", "globs": ["src/quickjs.wasm"], "fallthrough": true }
+  ],
+
+  "durable_objects": {
+    "bindings": [{ "name": "KERNEL_DO", "class_name": "KernelDO" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["KernelDO"] }],
+
+  // R2: the EXISTING engram-snapshots bucket. All keys written under bench/<doId>/.
+  "r2_buckets": [
+    { "binding": "SNAPSHOTS", "bucket_name": "engram-snapshots" }
+  ]
+}
