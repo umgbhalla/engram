@@ -1,10 +1,10 @@
-# @montydyn/sdk
+# @engram/sdk
 
-Configurable **codemode / RLM infrastructure** over the durable, hibernating montydyn
-QuickJS-WASM kernel on Cloudflare. Embeds montydyn as a code-execution backend for Code Mode
+Configurable **codemode / RLM infrastructure** over the durable, hibernating Engram
+QuickJS-WASM kernel on Cloudflare. Embeds Engram as a code-execution backend for Code Mode
 and Recursive Language Models (RLM).
 
-## Why montydyn
+## Why Engram
 
 - `eval` = a durable REPL cell; `execute(code, fns)` = the Cloudflare **Code Mode** contract.
 - The `host.<name>()` boundary = Code Mode's `fns` / rlms' marshaled sub-calls.
@@ -31,17 +31,17 @@ and Recursive Language Models (RLM).
 ## Install
 
 ```
-npm i @montydyn/sdk ws
+npm i @engram/sdk ws
 ```
 
 ## Quick start
 
 ```js
-import { connect, MontydynExecutor } from "@montydyn/sdk";
+import { connect, EngramExecutor } from "@engram/sdk";
 import WebSocket from "ws"; // Node; browsers use the native WebSocket
 
 const s = await connect({
-  endpoint: "wss://montydyn-v091.<acct>.workers.dev",
+  endpoint: "wss://engram-kernel.<acct>.workers.dev",
   id: "my-session",
   config: { clock: "seeded", modules: true, fetch: ["api.example.com"] },
   WebSocket,
@@ -51,7 +51,7 @@ const s = await connect({
 await s.eval("globalThis.x = 41; x + 1");        // -> { ok, value, valuePreview, logs, error? }
 
 // 2. Code Mode drop-in
-const ex = new MontydynExecutor({ endpoint, id, config, WebSocket });
+const ex = new EngramExecutor({ endpoint, id, config, WebSocket });
 const { result, logs } = await ex.execute(
   "(() => { const n = host.adder(40, 2); return { n }; })()",
   { adder: (a, b) => a + b },                    // fns injected as host.<name>
@@ -103,9 +103,9 @@ reachable endpoint.
 
 ## Adapters
 
-- `MontydynExecutor` — Cloudflare Code Mode executor: `execute(code, fns) -> {result, error?, logs}`.
-  Usable with `createCodeTool({ executor: new MontydynExecutor(...) })`.
-- `MontydynEnv` — rlms-style environment adapter: `run(code)`, `setContextVar(name, value)`,
+- `EngramExecutor` — Cloudflare Code Mode executor: `execute(code, fns) -> {result, error?, logs}`.
+  Usable with `createCodeTool({ executor: new EngramExecutor(...) })`.
+- `EngramEnv` — rlms-style environment adapter: `run(code)`, `setContextVar(name, value)`,
   `installDeps(modules)`.
 
 ## Caveats

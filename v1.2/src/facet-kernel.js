@@ -1,4 +1,4 @@
-// montydyn V1.0 — Kernel FACET (dynamically loaded DurableObject class).
+// Engram V1.0 — Kernel FACET (dynamically loaded DurableObject class).
 //
 // The facet IS the kernel. It runs the ported v0.8 GlueKernel (real quickjs-wasi
 // engine, seeded determinism, loop-budget + mid-cell memory tripwire + 18MB dump

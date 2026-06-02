@@ -1,4 +1,4 @@
-// @montydyn/sdk — type surface for the configurable codemode / RLM infrastructure.
+// @engram/sdk — type surface for the configurable codemode / RLM infrastructure.
 
 export interface SessionConfig {
   clock?: "seeded" | "real";
@@ -52,7 +52,7 @@ export interface RLMResult {
 export type ToolHandler = (...args: any[]) => unknown | Promise<unknown>;
 export type SubLMHandler = (req: { prompt: string; opts: Record<string, unknown> }) => string | Promise<string>;
 export type RootModel = (ctx: {
-  query: string; contextName: string; step: number; history: any[]; session: MontydynSession;
+  query: string; contextName: string; step: number; history: any[]; session: EngramSession;
 }) => string | null | Promise<string | null>;
 
 export interface ConnectOptions {
@@ -64,7 +64,7 @@ export interface ConnectOptions {
   autoReconnect?: boolean;
 }
 
-export class MontydynSession {
+export class EngramSession {
   id: string;
   config: SessionConfig;
   eval(src: string, timeoutMs?: number): Promise<EvalResult>;
@@ -109,7 +109,7 @@ export interface LambdaRLMResult {
   subLMCalls: number;
 }
 
-export function connect(opts: ConnectOptions): Promise<MontydynSession>;
+export function connect(opts: ConnectOptions): Promise<EngramSession>;
 
 /** v0.9.2 AGENT code-mode adapter: durable per-agent session; host tools = the agent tool surface. */
 export interface AgentTurnResult {
@@ -122,8 +122,8 @@ export interface AgentTurnResult {
   toolCalls: Array<{ tool: string; args: any[]; ok: boolean; result?: any; error?: string; ts: number }>;
 }
 export class Agent {
-  constructor(session: MontydynSession, opts?: { tools?: Record<string, ToolHandler> });
-  session: MontydynSession;
+  constructor(session: EngramSession, opts?: { tools?: Record<string, ToolHandler> });
+  session: EngramSession;
   registerTool(name: string, handler: ToolHandler): this;
   turn(code: string): Promise<AgentTurnResult>;
   hibernate(): Promise<any>;
@@ -133,13 +133,13 @@ export class Agent {
 }
 export function createAgent(opts: ConnectOptions & { tools?: Record<string, ToolHandler>; onSubLM?: SubLMHandler }): Promise<Agent>;
 
-export class MontydynExecutor {
+export class EngramExecutor {
   constructor(opts: ConnectOptions);
   execute(code: string, fns?: Record<string, ToolHandler>): Promise<ExecuteResult>;
   close(): Promise<void>;
 }
 
-export class MontydynEnv {
+export class EngramEnv {
   constructor(opts: ConnectOptions);
   run(code: string): Promise<{ stdout: string; result: unknown; error?: string }>;
   setContextVar(name: string, value: unknown): Promise<number>;
@@ -149,9 +149,9 @@ export class MontydynEnv {
 
 declare const _default: {
   connect: typeof connect;
-  MontydynSession: typeof MontydynSession;
-  MontydynExecutor: typeof MontydynExecutor;
-  MontydynEnv: typeof MontydynEnv;
+  EngramSession: typeof EngramSession;
+  EngramExecutor: typeof EngramExecutor;
+  EngramEnv: typeof EngramEnv;
   Agent: typeof Agent;
   createAgent: typeof createAgent;
 };

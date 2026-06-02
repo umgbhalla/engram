@@ -1,4 +1,4 @@
-// montydyn V1.0 — SupervisorDO (a NORMAL SQLite-backed DurableObject) + Worker entry.
+// Engram V1.0 — SupervisorDO (a NORMAL SQLite-backed DurableObject) + Worker entry.
 //
 // ADR-0003 architecture. The supervisor owns everything a facet cannot:
 //   - ROUTING: sessionId -> kernel FACET (ctx.facets.get(facetName, ...)). Sharded at
@@ -583,7 +583,7 @@ export class SupervisorDO extends DurableObject {
       if (p === "/health") return J({ ok: true, codeId: KERNEL_CODE_ID, engineHash: ENGINE_HASH });
 
       return J({
-        service: "montydyn-v12",
+        service: "engram-cloud",
         arch: "SupervisorDO (per-tenant API-key auth + AE metering + routing + adaptive-keep-warm + WS-proxy + mediated-egress) + per-session KernelFacet ({wasm}, own SQLite, stdlib+Tier-0 extensions)",
         auth: "data-plane routes require x-api-key (or ?apiKey=) mapping to a tenant; else 401. Admin routes (/admin/keys ...) require x-admin-token.",
         routes: ["/connect (WS)", "/eval?session=&src=", "POST /configure[?latencySensitive=1]", "/stdlib", "/warm", "/checkpoint", "/status", "/evict", "/sessions", "/health", "GET /usage?tenant=&window=", "POST /admin/keys (mint)", "GET /admin/keys (list)", "DELETE /admin/keys (revoke)"],
@@ -616,7 +616,7 @@ export class HttpGateway extends WorkerEntrypoint {
     const block = (why) =>
       new Response(JSON.stringify({ error: "egress blocked by gateway", host, tenant, why }), {
         status: 403,
-        headers: { "content-type": "application/json", "x-montydyn-egress": "blocked" },
+        headers: { "content-type": "application/json", "x-engram-egress": "blocked" },
       });
     if (!host) return block("unresolvable-host");
     if (deny && deny.includes(host)) return block("denylisted");
@@ -634,7 +634,7 @@ export class HttpGateway extends WorkerEntrypoint {
 // the x-md-tenant header so the SupervisorDO routes/isolates by the key's tenant — a client
 // can never pick another tenant's scope.
 const AUTH_SHARD = "sup-auth"; // the canonical shard that owns the authoritative tenant registry
-const AE_DATASET = "montydyn_kernel"; // the Analytics Engine dataset name (AE SQL FROM clause)
+const AE_DATASET = "engram_kernel"; // the Analytics Engine dataset name (AE SQL FROM clause)
 
 function j(o, code = 200) {
   return new Response(JSON.stringify(o, null, 2), { status: code, headers: { "content-type": "application/json" } });

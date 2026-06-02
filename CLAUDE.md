@@ -1,6 +1,11 @@
-# montydyn — Durable Hibernating Kernel
+# Engram — Durable Hibernating Kernel
 
 > Single source of truth for this repo. `AGENTS.md` is a symlink to this file.
+>
+> **Provenance:** formerly montydyn (renamed to Engram on the rebrand). The heap snapshot IS an
+> engram — a memory trace. The on-disk folder stays named `montydyn`; only the brand/repo identity
+> and the deployed worker names changed. Deployed: `engram-kernel` (v0.9.3), `engram-cloud` (v1.2),
+> `engram-ui` (ui). Older `montydyn-v0X`/`montydyn-v1X` worker names below are historical provenance.
 
 ## Context trail — read this first in a new session
 
@@ -53,7 +58,7 @@ so a session sleeps when idle and wakes with full live state, no replay.
 
 **Shipped after V1.0:** **v0.9.1** big-context fix (chunked store, multi-MB survives cold-restore) · **V1.1** multi-tenant facet at v0.8 parity + adaptive keep-warm · **v1.2** per-tenant API-key auth + AE metering + `/usage` (billable SaaS seam) · **v0.9.2** bounded **lambda-RLM** combinators (SPLIT/MAP/REDUCE, terminates) + durable **agent code-mode** adapter · **notebook UI** (`montydyn-ui`: durable browser REPL + RLM demo) · **v0.9.3** native-C giant-alloc backstop (no WS-1006) + engine-migration journal + scale-validated (0% err @150 concurrent, bad-facet isolation).
 
-**PRODUCT COMPLETE (arc end):** montydyn is a durable, hibernating, **multi-tenant codemode/RLM REPL platform** — kernel + auth/metering + lambda-RLM + agent mode + SDK + CLI + UI, scale-validated, all known holes closed. Deployed: `montydyn-v093` (codemode kernel) · `montydyn-v12` (multi-tenant SaaS) · `montydyn-ui` (notebook). **Remaining to GA (NOT auto-done):** npm-publish `@montydyn/sdk` (needs owner OK) · scale-at-1000s · docs site · R2 stale-key prune (needs R2 S3 token). **Python kernel: DROPPED per owner.**
+**PRODUCT COMPLETE (arc end):** Engram is a durable, hibernating, **multi-tenant codemode/RLM REPL platform** — kernel + auth/metering + lambda-RLM + agent mode + SDK + CLI + UI, scale-validated, all known holes closed. Deployed (post-rebrand): `engram-kernel` (codemode kernel, from v0.9.3/) · `engram-cloud` (multi-tenant SaaS, from v1.2/) · `engram-ui` (notebook, from ui/). **Remaining to GA (NOT auto-done):** npm-publish `@engram/sdk` (needs owner OK) · scale-at-1000s · docs site · R2 stale-key prune (needs R2 S3 token). **Python kernel: DROPPED per owner.**
 
 ## Goal
 

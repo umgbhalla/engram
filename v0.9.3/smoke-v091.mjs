@@ -1,4 +1,4 @@
-// montydyn v0.9.1 SMOKE — the HIGH context-store-chunking fix.
+// engram v0.9.1 SMOKE — the HIGH context-store-chunking fix.
 //
 // Proves: setContext a ~5MB blob (with a needle) -> host.ctx.len/grep find it warm
 // -> EVICT (drop in-memory) -> cold restore -> the 5MB context SURVIVES intact

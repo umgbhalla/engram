@@ -1,7 +1,7 @@
-// @montydyn/sdk — configurable codemode / RLM infrastructure over the durable montydyn kernel.
+// @engram/sdk — configurable codemode / RLM infrastructure over the durable Engram kernel.
 //
-//   import { connect, MontydynExecutor } from "@montydyn/sdk";
-//   const s = await connect({ endpoint: "wss://montydyn-v09...workers.dev", id: "sess",
+//   import { connect, EngramExecutor } from "@engram/sdk";
+//   const s = await connect({ endpoint: "wss://engram-kernel...workers.dev", id: "sess",
 //                             config: { clock: "seeded", modules: true } });
 //   await s.eval("globalThis.x = 41; x + 1");      // -> { ok, value, valuePreview, logs, error? }
 //   await s.execute(code, fns);                    // Code Mode drop-in -> { result, error?, logs }
@@ -38,12 +38,12 @@ export async function connect(opts = {}) {
   const id = opts.id || "default";
   const base = String(endpoint).replace(/\/+$/, "");
   const wsUrl = `${base}/ws?id=${encodeURIComponent(id)}`;
-  const session = new MontydynSession(WS, wsUrl, opts);
+  const session = new EngramSession(WS, wsUrl, opts);
   await session._open();
   return session;
 }
 
-export class MontydynSession {
+export class EngramSession {
   constructor(WS, wsUrl, opts) {
     this.WS = WS;
     this.wsUrl = wsUrl;
@@ -214,7 +214,7 @@ ${inject}
 
   // ---- the depth-1 RLM loop (E2E) ------------------------------------------
   /**
-   * Run the canonical depth-1 RLM loop on montydyn. The ROOT 'LM' (a pluggable rootModel that
+   * Run the canonical depth-1 RLM loop on Engram. The ROOT 'LM' (a pluggable rootModel that
    * writes JS cells) sees the query + the context handle surface; it emits code that
    * greps/chunks host.ctx and queues sub-LM prompts via host.subLM(prompt). The SDK orchestrates:
    * it runs each cell, drains any queued sub-LM prompts through the CLIENT-SIDE model backend
@@ -497,18 +497,18 @@ function defaultRootModel({ query, contextName, step }) {
 
 /**
  * Cloudflare Code Mode executor (drop-in for DynamicWorkerExecutor):
- *   const ex = new MontydynExecutor({ endpoint, id, config });
+ *   const ex = new EngramExecutor({ endpoint, id, config });
  *   await ex.execute(code, fns) -> { result, error?, logs }
  */
-export class MontydynExecutor {
+export class EngramExecutor {
   constructor(opts = {}) { this.opts = opts; this.session = null; }
   async _session() { if (!this.session) this.session = await connect(this.opts); return this.session; }
   async execute(code, fns = {}) { const s = await this._session(); return s.execute(code, fns); }
   async close() { if (this.session) this.session.close(); this.session = null; }
 }
 
-/** rlms-style environment adapter (so a JS RLM scaffold can select environment='montydyn'). */
-export class MontydynEnv {
+/** rlms-style environment adapter (so a JS RLM scaffold can select environment='engram'). */
+export class EngramEnv {
   constructor(opts = {}) { this.opts = opts; this.session = null; }
   async _session() { if (!this.session) this.session = await connect(this.opts); return this.session; }
   async run(code) {
@@ -525,7 +525,7 @@ export class MontydynEnv {
 // v0.9.2 — AGENT CODE-MODE ADAPTER
 //
 // Gives an AI agent a DURABLE per-agent session: the agent writes JS that runs in its OWN
-// montydyn facet/session; the registered host tools (host.<name>()) ARE the agent's tool surface;
+// engram facet/session; the registered host tools (host.<name>()) ARE the agent's tool surface;
 // multi-turn state lives in the snapshot (hibernates between turns, restores on the next turn).
 // This is the Code Mode paradigm ("write code" is the one tool; tools render as a typed API) on
 // top of the durable kernel — the differentiator nobody else has is hibernation BETWEEN turns.
@@ -544,7 +544,7 @@ export class MontydynEnv {
 // ===========================================================================
 export class Agent {
   /**
-   * @param {MontydynSession} session
+   * @param {EngramSession} session
    * @param {{tools?:Record<string,Function>}} [opts]
    */
   constructor(session, opts = {}) {
@@ -725,4 +725,4 @@ export async function createAgent(opts = {}) {
   return new Agent(session, { tools: opts.tools });
 }
 
-export default { connect, MontydynSession, MontydynExecutor, MontydynEnv, Agent, createAgent };
+export default { connect, EngramSession, EngramExecutor, EngramEnv, Agent, createAgent };

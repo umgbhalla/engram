@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>montydyn — durable notebook</title>
+<title>Engram — durable notebook</title>
 <style>
   :root {
     --bg: #0c0e14; --panel: #141823; --panel2: #1b2030; --border: #262d40;
@@ -66,7 +66,7 @@
 </head>
 <body>
 <header>
-  <h1>montydyn</h1>
+  <h1>Engram</h1>
   <span class="sub">durable hibernating notebook · codemode kernel</span>
   <div class="grow"></div>
   <span class="pill" id="statePill"><span class="dot off" id="stateDot"></span><span id="stateTxt">disconnected</span></span>
@@ -88,8 +88,8 @@
   <aside>
     <h3>Session</h3>
     <label>Kernel endpoint (wss)</label>
-    <input id="cfgEndpoint" value="wss://montydyn-v093.umg-bhalla88.workers.dev" />
-    <label>API key (only for montydyn-v12; blank for v093)</label>
+    <input id="cfgEndpoint" value="wss://engram-kernel.umg-bhalla88.workers.dev" />
+    <label>API key (only for engram-cloud; blank for engram-kernel)</label>
     <input id="cfgApiKey" placeholder="md_… (leave blank for v093)" />
     <label>Session id (reconnect to restore state)</label>
     <div class="row">
@@ -126,11 +126,11 @@
 
 <script type="module">
 // ---------------------------------------------------------------------------
-// montydyn browser client — speaks the kernel WS protocol directly.
+// Engram browser client — speaks the kernel WS protocol directly.
 //   /ws?id=<session>  ;  {t:"create",config} {t:"eval",src} {t:"gen"} {t:"evict"}
 //   {t:"reset"} {t:"setContext",name,blob} {t:"final"}
-// For montydyn-v12 the WS path is /connect?session=<id>&apiKey=<key>; we autodetect.
-// The cooperative subLM RLM loop is implemented here (mirrors @montydyn/sdk) so it runs
+// For engram-cloud the WS path is /connect?session=<id>&apiKey=<key>; we autodetect.
+// The cooperative subLM RLM loop is implemented here (mirrors @engram/sdk) so it runs
 // fully against the REMOTE kernel — the kernel never reaches back to the browser.
 // ---------------------------------------------------------------------------
 

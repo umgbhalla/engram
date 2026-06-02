@@ -1,4 +1,4 @@
-// montydyn v0.3 P3 smoke: real fetch egress + allowlist + error-as-value preview,
+// engram v0.3 P3 smoke: real fetch egress + allowlist + error-as-value preview,
 // plus no-regression on durability/determinism/loop-preemption.
 // Usage: node smoke-p3.mjs <wss-base>
 import WebSocket from "ws";

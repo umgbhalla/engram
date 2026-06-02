@@ -1,4 +1,4 @@
-// montydyn v0.9.3 SMOKE — HARDENING: native-C giant-alloc backstop + engine-migration journal.
+// engram v0.9.3 SMOKE — HARDENING: native-C giant-alloc backstop + engine-migration journal.
 //
 // (a) NATIVE-C GIANT-ALLOC BACKSTOP: a 258MB structuredClone / giant typed-array fill now
 //     clean-rejects as a typed NativeAllocLimitError with the SOCKET ALIVE, and the next eval

@@ -1,4 +1,4 @@
-// montydyn v0.6 — JS glue boundary. Driven by the Rust Durable Object shell (lib.rs).
+// Engram (glue) — JS glue boundary. Driven by the Rust Durable Object shell (lib.rs).
 //
 // V0.6 — CONFIGURABLE IN-VM STDLIB:
 //   A curated set of pure-JS, QuickJS-safe libraries (lodash-es, dayjs, nanoid, uuid,

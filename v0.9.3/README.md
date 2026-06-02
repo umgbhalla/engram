@@ -1,4 +1,4 @@
-# montydyn v0.3 — durable stateful JS kernel + real fetch egress
+# Engram (v0.3) — durable stateful JS kernel + real fetch egress
 
 V0.3 builds on V0.2 (all V0.2 hardening kept) and adds the two **P3** items:
 
@@ -21,7 +21,7 @@ SQLite-first snapshot, BUG-1 error handling, dynamic config persistence, used-he
 admission, interrupt-tick loop preemption, kv-state persistence).
 
 Deployed worker: **`montydyn-v03`** — `https://montydyn-v03.<account>.workers.dev`
-(V0/V0.1/V0.2 workers left intact). R2 `montydyn-snapshots` reused (overflow; keys
+(V0/V0.1/V0.2 workers left intact). R2 `engram-snapshots` reused (overflow; keys
 namespaced under `v03/`).
 
 ## P3 fetch usage

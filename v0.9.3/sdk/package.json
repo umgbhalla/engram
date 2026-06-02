@@ -1,8 +1,8 @@
 {
-  "name": "@montydyn/sdk",
+  "name": "@engram/sdk",
   "version": "0.9.2",
-  "description": "Configurable codemode / RLM infrastructure over the durable hibernating montydyn QuickJS-WASM kernel on Cloudflare.",
-  "keywords": ["montydyn", "codemode", "rlm", "quickjs", "cloudflare", "durable-object", "repl", "sandbox"],
+  "description": "Configurable codemode / RLM infrastructure over the durable hibernating Engram QuickJS-WASM kernel on Cloudflare.",
+  "keywords": ["engram", "codemode", "rlm", "quickjs", "cloudflare", "durable-object", "repl", "sandbox"],
   "repository": { "type": "git", "url": "git+https://github.com/umgbhalla/montydyn.git", "directory": "v0.9.1/sdk" },
   "sideEffects": false,
   "engines": { "node": ">=18" },

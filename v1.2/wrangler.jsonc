@@ -1,12 +1,12 @@
 {
-  // montydyn V1.1 — multi-tenant kernel via DO Facets, at v0.8 feature parity.
+  // Engram V1.1 — multi-tenant kernel via DO Facets, at v0.8 feature parity.
   // SupervisorDO (normal SQLite DO): routing + adaptive keep-warm + WS-proxy + worker_loaders
   //   + mediated per-tenant egress (HttpGateway WorkerEntrypoint as the facet globalOutbound).
   // Per-session KernelFacet (dynamically loaded via LOADER): own SQLite, {wasm} engine,
   //   configurable in-VM stdlib (lodash/dayjs/nanoid/uuid/zod, mathjs opt-in) + the 5 Tier-0
   //   native extensions (crypto.subtle/getRandomValues/randomUUID, TextEncoder/Decoder, URL,
   //   structuredClone, Headers) delivered via {text}/{js}/{wasm} loader modules.
-  "name": "montydyn-v12",
+  "name": "engram-cloud",
   "main": "src/supervisor.js",
   "compatibility_date": "2026-04-01",
   "compatibility_flags": ["nodejs_compat"],
@@ -45,9 +45,9 @@
   // Reuse pre-existing infra (namespaced v1/ keys). SQLite-first snapshot is in the
   // facet; R2 is the overflow target and AE is telemetry.
   "r2_buckets": [
-    { "binding": "SNAPSHOTS", "bucket_name": "montydyn-snapshots" }
+    { "binding": "SNAPSHOTS", "bucket_name": "engram-snapshots" }
   ],
   "analytics_engine_datasets": [
-    { "binding": "AE", "dataset": "montydyn_kernel" }
+    { "binding": "AE", "dataset": "engram_kernel" }
   ]
 }

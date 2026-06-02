@@ -1,4 +1,4 @@
-// montydyn v0.9.2 SMOKE — LAMBDA-RLM typed combinators + AGENT code-mode adapter.
+// engram v0.9.2 SMOKE — LAMBDA-RLM typed combinators + AGENT code-mode adapter.
 //
 // (a) lambdaRLM answers a query over a >1MB context using SPLIT/MAP/REDUCE with a STUB leaf
 //     oracle, and TERMINATES within the cost budget — a deliberately over-decomposing query is

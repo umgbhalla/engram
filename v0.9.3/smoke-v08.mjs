@@ -1,4 +1,4 @@
-// montydyn v0.8 smoke — Feature A (mid-cell used-heap tripwire) + Feature B (Tier-0
+// engram v0.8 smoke — Feature A (mid-cell used-heap tripwire) + Feature B (Tier-0
 // extensions) + survival across evict/cold-restore + determinism.
 // Usage: node smoke-v08.mjs [wss-base] [coldIdleMs]
 import WebSocket from "ws";

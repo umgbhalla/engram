@@ -1,4 +1,4 @@
-// montydyn v0.9 codemode/RLM smoke. Covers:
+// engram v0.9 codemode/RLM smoke. Covers:
 //   (a) setContext ~1MB host-side; eval uses host.ctx.grep/chunk WITHOUT the blob in the VM.
 //   (b) execute(code,fns) Code Mode drop-in -> {result,logs}.
 //   (c) depth-1 RLM loop E2E with a fake/stub model backend (grep+subLM+final).
@@ -6,7 +6,7 @@
 //   (e) no regression vs v08 (stdlib, loop preempt, kv, crypto).
 // Usage: node smoke-v09.mjs [wss-base]
 import WebSocket from "ws";
-import { connect, MontydynExecutor } from "./sdk/index.mjs";
+import { connect, EngramExecutor } from "./sdk/index.mjs";
 
 const BASE = process.argv[2] || "wss://montydyn-v09.umg-bhalla88.workers.dev";
 const results = [];
@@ -55,7 +55,7 @@ const rec = (name, pass, detail) => { results.push({ name, pass }); console.log(
 
   // (b) execute(code, fns) Code Mode drop-in.
   console.log("\n== (b) execute(code, fns) Code Mode drop-in ==");
-  const ex = new MontydynExecutor({ endpoint: BASE, id: `v09exec-${Date.now()}`, config: { clock: "seeded" }, WebSocket });
+  const ex = new EngramExecutor({ endpoint: BASE, id: `v09exec-${Date.now()}`, config: { clock: "seeded" }, WebSocket });
   const out = await ex.execute(
     `(() => { console.log('hello from cell'); const sum = host.adder(40, 2); return { sum }; })()`,
     { adder: (a, b) => a + b },

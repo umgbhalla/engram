@@ -1,4 +1,4 @@
-//! montydyn v0 — durable hibernating QuickJS REPL kernel.
+//! engram v0 — durable hibernating QuickJS REPL kernel.
 //!
 //! Architecture = PATH (b) (proven by EXP-4b): Rust DurableObject shell +
 //! thin JS glue boundary (entry.mjs imports quickjs.wasm as CompiledWasm) doing

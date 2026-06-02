@@ -1,8 +1,10 @@
-# montydyn — Product State
+# Engram — Product State
 
 _As of 2026-06_
 
-## What montydyn IS now
+> Formerly montydyn (renamed to Engram on the rebrand). The heap snapshot IS an engram.
+
+## What Engram IS now
 
 A **durable, multi-tenant codemode REPL**: a sandboxed JavaScript execution kernel that runs untrusted/agent-authored code with persistent, hibernatable state — exposed as a notebook UI, an SDK, a CLI, and an HTTP/WS API.
 
@@ -14,17 +16,16 @@ Capabilities, end to end:
 - **Auth + metering.** Per-tenant API-key auth (admin minting route); Analytics Engine usage metering (`/usage`: evals, facetPeak, sessions).
 - **Multi-tenant scale (v12).** 64-shard / 128-facet-per-shard supervisor routing (FNV-1a). HTTP `/eval` data-plane. Clean typed rejection at cap (no crash).
 - **lambda-RLM.** Recursive-language-model needle-in-context orchestration (chunk → subLM → reduce → FINAL) over host context, in-VM and via SDK.
-- **Agent mode, SDK, CLI, UI.** `@montydyn/sdk` (Node, with `node:http` bridge); CLI; and a zero-dep browser notebook UI speaking the kernel WS protocol natively.
+- **Agent mode, SDK, CLI, UI.** `@engram/sdk` (Node, with `node:http` bridge); `engram` CLI; and a zero-dep browser notebook UI speaking the kernel WS protocol natively.
 
-## Deployed surface
+## Deployed surface (post-rebrand)
 
 | Surface | URL / artifact | Kernel |
 |---|---|---|
-| Notebook UI | https://montydyn-ui.umg-bhalla88.workers.dev | talks v092 (default) / v12 |
-| v0.9.2 kernel | montydyn-v092 | codemode + RLM + hibernation |
-| v0.9.3 kernel | https://montydyn-v093.umg-bhalla88.workers.dev | + native backstop + journal |
-| v12 (multi-tenant) | montydyn-v12 | v1.1-parity, sharded, auth, `/eval`, `/usage` |
-| SDK / CLI | `@montydyn/sdk` (NOT yet npm-published) | — |
+| Notebook UI | https://engram-ui.umg-bhalla88.workers.dev | defaults to engram-kernel; can target engram-cloud |
+| kernel (from v0.9.3/) | https://engram-kernel.umg-bhalla88.workers.dev | codemode + RLM + hibernation + native backstop + journal |
+| cloud / multi-tenant (from v1.2/) | engram-cloud | v1.1-parity, sharded, auth, `/eval`, `/usage` |
+| SDK / CLI | `@engram/sdk` + `@engram/cli` (NOT yet npm-published) | — |
 
 ## Operating envelope (numeric)
 

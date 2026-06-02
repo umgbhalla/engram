@@ -1,5 +1,5 @@
 {
-  "name": "montydyn-v093",
+  "name": "engram-kernel",
   // Wrapper entry: imports quickjs.wasm + the 5 Tier-0 extension .so as CompiledWasm
   // (wrangler-bundled), the stdlib bundle as a Text module, and re-exports the worker-build
   // output (Rust DO shim + quickjs-wasi JS glue).
@@ -34,14 +34,14 @@
 
   // R2 is OPTIONAL overflow only (images whose gzip image exceeds the SQLite hot
   // path). The default snapshot store is DO SQLite (single row <=~2MB, else chunked).
-  // v0.9 reuses the existing montydyn-snapshots bucket with v09/ keys.
+  // v0.9 reuses the existing engram-snapshots bucket with v09/ keys.
   "r2_buckets": [
-    { "binding": "SNAPSHOTS", "bucket_name": "montydyn-snapshots" }
+    { "binding": "SNAPSHOTS", "bucket_name": "engram-snapshots" }
   ],
 
   // V0.5 OBSERVABILITY: Analytics Engine dataset. Every kernel op emits a datapoint
   // (env.AE.writeDataPoint) with rich blobs/doubles. Queryable via the AE SQL API.
   "analytics_engine_datasets": [
-    { "binding": "AE", "dataset": "montydyn_kernel" }
+    { "binding": "AE", "dataset": "engram_kernel" }
   ]
 }

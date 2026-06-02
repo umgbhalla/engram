@@ -1,4 +1,4 @@
-// montydyn v0.9.2 — LAMBDA-RLM TYPED COMBINATORS (in-VM stdlib module).
+// engram v0.9.2 — LAMBDA-RLM TYPED COMBINATORS (in-VM stdlib module).
 //
 // The "lambda calculus" RLM from docs/research/rlm-and-codemode.md (arXiv:2603.20105,
 // "The Y-Combinator for LLMs"): replace canonical RLM's free-form code loop with TYPED,

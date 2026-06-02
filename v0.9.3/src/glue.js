@@ -1,4 +1,4 @@
-// montydyn v0.6 — JS glue boundary. Driven by the Rust Durable Object shell (lib.rs).
+// engram — JS glue boundary. Driven by the Rust Durable Object shell (lib.rs).
 //
 // V0.6 — CONFIGURABLE IN-VM STDLIB:
 //   A curated set of pure-JS, QuickJS-safe libraries (lodash-es, dayjs, nanoid, uuid,
@@ -741,7 +741,7 @@ function hostFnDefs(ctx) {
           }
           // Default User-Agent so UA-strict hosts (e.g. GitHub) don't 403; caller can override.
           if (!Object.keys(hdrs).some((k) => k.toLowerCase() === "user-agent")) {
-            hdrs["User-Agent"] = "montydyn/0.9 (+https://github.com/umgbhalla/montydyn)";
+            hdrs["User-Agent"] = "engram/0.9 (+https://github.com/umgbhalla/montydyn)";
           }
           reqInit.headers = hdrs;
           const resp = await fetch(urlObj.toString(), reqInit);

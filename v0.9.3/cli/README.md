@@ -1,24 +1,24 @@
-# montydyn CLI
+# engram CLI
 
 Launch a **configurable durable REPL** and run an **end-to-end depth-1 RLM loop** against the
-montydyn codemode kernel.
+Engram codemode kernel.
 
 ```
-npm i -g @montydyn/cli            # or: node cli/montydyn.mjs <cmd>
+npm i -g @engram/cli            # or: node cli/engram.mjs <cmd>
 ```
 
-Endpoint defaults to `$MONTYDYN_ENDPOINT` or `wss://montydyn-v09.<acct>.workers.dev`
+Endpoint defaults to `$ENGRAM_ENDPOINT` or `wss://engram-kernel.<acct>.workers.dev`
 (override with `--endpoint`).
 
 ## Commands
 
-### `montydyn repl`
+### `engram repl`
 
 Interactive durable REPL. Resumes the hibernated namespace if `--session <id>` exists, else
 creates it.
 
 ```
-montydyn repl [--session <id>] [--config <file>] [--tools <file>] [--context-file <path>]
+engram repl [--session <id>] [--config <file>] [--tools <file>] [--context-file <path>]
               [--endpoint <wss>] [--exec '<one cell>'] [--interactive]
 ```
 
@@ -33,13 +33,13 @@ montydyn repl [--session <id>] [--config <file>] [--tools <file>] [--context-fil
 
 ```
 # one-shot
-montydyn repl --session demo --exec 'globalThis.x = 41; x + 1'      # => 42
+engram repl --session demo --exec 'globalThis.x = 41; x + 1'      # => 42
 # context handle + piped cells
 printf 'host.ctx.len("context")\nhost.ctx.grep("TODO",{max:5}).length\n' \
-  | montydyn repl --session ctx --context-file ./big.txt
+  | engram repl --session ctx --context-file ./big.txt
 ```
 
-### `montydyn rlm <query> --context <file>`
+### `engram rlm <query> --context <file>`
 
 End-to-end canonical depth-1 RLM loop: binds the context as a host-side handle, drives the root
 model (which writes JS cells that grep/chunk the context + fan `host.subLM` over chunks), runs the
@@ -47,25 +47,25 @@ cells, fulfills sub-LM calls through a **pluggable, client-side model backend**,
 `host.final`.
 
 ```
-montydyn rlm <query> --context <file> [--model <stub|cmd:...>] [--depth 1] [--session <id>]
+engram rlm <query> --context <file> [--model <stub|cmd:...>] [--depth 1] [--session <id>]
 ```
 
 - `--model stub` (default) — deterministic fake LM, no API key (summarizes each chunk + reduces).
 - `--model cmd:<command>` — shells out per sub-LM call; the prompt is piped on stdin, stdout is the
   completion. e.g. `--model 'cmd:llm -m gpt-4o-mini'`.
-- Wire a real provider by importing `@montydyn/sdk` and passing your own `onSubLM` handler.
+- Wire a real provider by importing `@engram/sdk` and passing your own `onSubLM` handler.
 
 ```
-montydyn rlm "what is the answer" --context ./doc.txt --model stub
+engram rlm "what is the answer" --context ./doc.txt --model stub
 ```
 
-### `montydyn sessions [list|inspect <id>|rm <id>]`
+### `engram sessions [list|inspect <id>|rm <id>]`
 
 Durable session lifecycle. `list` shows sessions this CLI has touched (recorded in
-`~/.montydyn-sessions.json`); `inspect` prints live `gen` state; `rm` resets the durable snapshot
+`~/.engram-sessions.json`); `inspect` prints live `gen` state; `rm` resets the durable snapshot
 and forgets the session.
 
-### `montydyn trace <id>`
+### `engram trace <id>`
 
 Dump the session's generation / committed-cell state and the last recorded RLM final answer.
 
@@ -73,5 +73,5 @@ Dump the session's generation / committed-cell state and the last recorded RLM f
 
 - The model backend lives **client-side** (the SDK orchestrates sub-LM calls across cells against
   the remote kernel — the kernel never calls back to your machine).
-- Each session is a **durable** montydyn DO: Ctrl-C / idle resumes the namespace (and the context
+- Each session is a **durable** Engram DO: Ctrl-C / idle resumes the namespace (and the context
   handle) between cells with full live state, no replay.

@@ -1,4 +1,4 @@
-// montydyn v0.1 live smoke test. Proves: BUG-1 (throw -> ok:false + next eval works
+// engram v0.1 live smoke test. Proves: BUG-1 (throw -> ok:false + next eval works
 // + reset recovers), dynamic config persisted across evict (seeded clock + host tool),
 // output capture + value preview, runaway loop -> TimeoutError (not WS 1006), and
 // core durability (eval -> evict -> restore). Usage: node smoke.mjs <wss-base>

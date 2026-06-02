@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// montydyn — configurable durable REPL + depth-1 RLM loop CLI.
+// engram — configurable durable REPL + depth-1 RLM loop CLI.
 //
-//   montydyn repl   [--endpoint <wss>] [--session <id>] [--config <file>] [--tools <file>] [--context-file <path>]
-//   montydyn rlm <query> --context <file> [--model <stub|cmd:...>] [--depth 1] [--session <id>] [--endpoint <wss>]
-//   montydyn sessions [list|inspect <id>|rm <id>] [--endpoint <wss>] [--store <file>]
-//   montydyn trace <id> [--endpoint <wss>]
+//   engram repl   [--endpoint <wss>] [--session <id>] [--config <file>] [--tools <file>] [--context-file <path>]
+//   engram rlm <query> --context <file> [--model <stub|cmd:...>] [--depth 1] [--session <id>] [--endpoint <wss>]
+//   engram sessions [list|inspect <id>|rm <id>] [--endpoint <wss>] [--store <file>]
+//   engram trace <id> [--endpoint <wss>]
 //
 // The model backend for `rlm` is pluggable and lives CLIENT-SIDE (via the SDK's onSubLM bridge):
 //   --model stub          deterministic fake LM (no API key) — default; summarizes each chunk.
@@ -19,8 +19,8 @@ import { execSync } from "node:child_process";
 import WebSocket from "ws";
 import { connect } from "../sdk/index.mjs";
 
-const DEFAULT_ENDPOINT = process.env.MONTYDYN_ENDPOINT || "wss://montydyn-v09.umg-bhalla88.workers.dev";
-const STORE = path.join(os.homedir(), ".montydyn-sessions.json");
+const DEFAULT_ENDPOINT = process.env.ENGRAM_ENDPOINT || "wss://engram-kernel.umg-bhalla88.workers.dev";
+const STORE = path.join(os.homedir(), ".engram-sessions.json");
 
 function parseArgs(argv) {
   const out = { _: [] };
@@ -82,7 +82,7 @@ async function cmdRepl(args) {
     console.log(`setContext: ${r.len} chars host-side (name=context, cell=${r.cell})`);
   }
   const gen = await session.gen();
-  console.log(`montydyn repl  session=${id}  endpoint=${endpoint}  generation=${gen.generation}  inMemory=${gen.inMemory}`);
+  console.log(`engram repl  session=${id}  endpoint=${endpoint}  generation=${gen.generation}  inMemory=${gen.inMemory}`);
   // non-interactive: --exec runs one cell and exits (smoke-friendly). else interactive.
   if (args.exec) { const r = await session.eval(String(args.exec)); printEval(r); session.close(); return; }
   if (!process.stdin.isTTY && !args.interactive) {
@@ -91,7 +91,7 @@ async function cmdRepl(args) {
     for await (const line of rl) { if (line.trim()) printEval(await session.eval(line)); }
     session.close(); return;
   }
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: "montydyn> " });
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: "engram> " });
   rl.prompt();
   rl.on("line", async (line) => {
     const src = line.trim();
@@ -112,7 +112,7 @@ function printEval(r) {
 async function cmdRlm(args) {
   const endpoint = args.endpoint || DEFAULT_ENDPOINT;
   const query = args._[0];
-  if (!query) throw new Error("usage: montydyn rlm <query> --context <file>");
+  if (!query) throw new Error("usage: engram rlm <query> --context <file>");
   if (!args.context) throw new Error("--context <file> is required");
   const id = args.session || `rlm-${Date.now()}`;
   const config = readConfig(args.config);
@@ -171,6 +171,6 @@ async function cmdTrace(args) {
     else if (cmd === "rlm") await cmdRlm(args);
     else if (cmd === "sessions") await cmdSessions(args);
     else if (cmd === "trace") await cmdTrace(args);
-    else { console.log("montydyn <repl|rlm|sessions|trace>  (see cli/README.md)"); process.exit(cmd ? 1 : 0); }
+    else { console.log("engram <repl|rlm|sessions|trace>  (see cli/README.md)"); process.exit(cmd ? 1 : 0); }
   } catch (e) { console.error("ERROR:", e && e.message ? e.message : e); process.exit(1); }
 })();

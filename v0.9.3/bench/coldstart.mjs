@@ -1,4 +1,4 @@
-// montydyn v0.4 — LONG-TAIL cold-start bench harness (the infra experiment).
+// engram v0.4 — LONG-TAIL cold-start bench harness (the infra experiment).
 //
 // WHAT IT MEASURES
 //   The client-observed COLD-WAKE round-trip: from sending the first stateful op against
