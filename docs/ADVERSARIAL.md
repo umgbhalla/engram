@@ -86,3 +86,24 @@ Sandbox isolation, cross-session/cross-tenant isolation, SSRF blocking, protocol
 - R2 `engram-snapshots`: 4 scratch keys deleted (2 under `advcur/`, 2 under `advw4/`); both prefixes now list 0 objects. Only scratch-prefix keys touched; live keys untouched.
 - Final worker list confirmed: engram-* = **engram-kernel + engram-cloud + engram-ui** only (other workers `curl-worker`/`durelo`/`thinkx-api` are unrelated pre-existing, untouched).
 - No edits to `apps/`. No live worker redeployed. Report committed after teardown; follow-up correction commit clarifies the Rust local guard-gap wording.
+
+---
+
+## Follow-up fix validation — W4 protocol/source admission
+
+**Date:** 2026-06-02
+**Scratch target:** `engram-adv-w4` only. Live workers untouched.
+**Conclusion:** the W4 breach assumption is confirmed fixable without breaking W5's spike-then-free un-wedge path.
+
+**Patch:** W4 now rejects oversized inputs before they can inflate the VM:
+- WebSocket text frames above `MAX_WS_TEXT_BYTES = 8 MiB` return typed `ProtocolSizeError` before JSON parse.
+- `eval` source above `MAX_EVAL_SRC_BYTES = 2 MiB` returns typed `ProtocolSizeError` before VM eval.
+- W5/W4 snapshot serialization still keeps the 45 MiB safe-serialize ceiling for freed-spike images, so the W5 un-wedge behavior is preserved.
+
+**Live scratch proof:**
+- `attack-size-regression.mjs`: **6/6 PASS** — 3 MiB eval source rejected before VM eval; 9 MiB frame rejected before JSON parse; sockets stayed alive; 22 MiB spike-then-free checkpointed and cold-restored.
+- `verify-w4.mjs`: **9/9 PASS** — base+delta fidelity, closure/map/set/pending-promise survival, W5 wedge regression, seeded determinism.
+- `attack-tamper.mjs`: **5/5 SURVIVED** — corrupt base/delta vectors detected, no DO kill.
+- Prior still-valid runs in this session: `attack-recover.mjs` recoverability and `attack-suite3.mjs` engine-hash/cross-session/long-chain replay survived.
+
+**Teardown after follow-up:** `engram-adv-w4` deleted with Wrangler; Cloudflare worker list rechecked and shows only `engram-kernel`, `engram-cloud`, `engram-ui` under `engram-*` (`adv_count=0`).

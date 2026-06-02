@@ -318,14 +318,14 @@ impl DurableObject for KernelDO {
 
 impl KernelDO {
     fn r2_key(&self) -> String {
-        format!("v093/{}.qjs.gz", self.do_id)
+        format!("advw4/{}.qjs.gz", self.do_id)
     }
 
     /// Fresh, cell/epoch-scoped R2 key for the swap-then-delete overflow write.
     /// Each replace writes to a NEW key so the prior committed object survives until
     /// the new manifest commits (then the old key is deleted post-commit).
     fn r2_key_for(&self, cell: i64, epoch: i64) -> String {
-        format!("benchw4/{}/e{}-c{}.qjs.gz", self.do_id, epoch, cell)
+        format!("advw4/{}/e{}-c{}.qjs.gz", self.do_id, epoch, cell)
     }
 
     /// V0.5 OBSERVABILITY: emit one Analytics Engine datapoint for an op, and a
@@ -559,6 +559,79 @@ impl KernelDO {
                 let _ = js_sys::Function::from(release).call0(&JsValue::NULL);
                 self.emit(&Datapoint::new("final"));
                 Ok(json!({ "ok": true, "t": "final", "final": info, "generation": self.generation }))
+            }
+
+            // ADV SUITE-3 (TEST HOOK): tamper with the durable snapshot bytes to red-team the
+            // corruption-detection guards. mode: "flipChunk" (xor a byte in snap_chunks),
+            // "flipDelta" (xor a byte in a delta_chunks payload), "truncDelta" (delete the last
+            // delta row WITHOUT lowering manifest.delta_seq), "truncChunk" (delete last snap_chunk
+            // WITHOUT lowering n_chunks), "dropBase" (delete all snap_chunks but keep manifest).
+            // Test-only; never fires in normal operation.
+            "tamper" => {
+                let release = JsFuture::from(self.mutex.acquire()).await.map_err(to_err)?;
+                let mode = msg.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+                let sql = self.state.storage().sql();
+                let out = match mode {
+                    "truncDelta" => {
+                        sql.exec("DELETE FROM delta_chunks WHERE seq=(SELECT MAX(seq) FROM delta_chunks);", None).ok();
+                        json!({"did":"deleted last delta row, manifest delta_seq unchanged"})
+                    }
+                    "truncChunk" => {
+                        sql.exec("DELETE FROM snap_chunks WHERE seq=(SELECT MAX(seq) FROM snap_chunks);", None).ok();
+                        json!({"did":"deleted last snap_chunk, manifest n_chunks unchanged"})
+                    }
+                    "dropBase" => {
+                        sql.exec("DELETE FROM snap_chunks;", None).ok();
+                        json!({"did":"deleted all snap_chunks, manifest kept"})
+                    }
+                    "flipChunk" => {
+                        // read first chunk, xor byte 0, write back (count preserved).
+                        let cur = sql.exec("SELECT seq,data FROM snap_chunks ORDER BY seq ASC LIMIT 1;", None);
+                        if let Ok(c) = cur {
+                            let mut seq = -1i64; let mut data: Vec<u8> = Vec::new();
+                            for row in c.raw() { if let Ok(r)=row { for (i,v) in r.into_iter().enumerate() { match (i,v) {
+                                (0, worker::SqlStorageValue::Integer(n))=>seq=n,
+                                (1, worker::SqlStorageValue::Blob(b))=>data=b, _=>{} } } } }
+                            if !data.is_empty() && seq>=0 {
+                                let pos = data.len()/2; data[pos] ^= 0xFF;
+                                sql.exec("UPDATE snap_chunks SET data=? WHERE seq=?;", vec![data.clone().into(), seq.into()]).ok();
+                            }
+                        }
+                        json!({"did":"xor'd a byte mid-first-snap_chunk, count preserved"})
+                    }
+                    "flipDelta" => {
+                        let cur = sql.exec("SELECT seq,payload FROM delta_chunks ORDER BY seq ASC LIMIT 1;", None);
+                        if let Ok(c) = cur {
+                            let mut seq = -1i64; let mut data: Vec<u8> = Vec::new();
+                            for row in c.raw() { if let Ok(r)=row { for (i,v) in r.into_iter().enumerate() { match (i,v) {
+                                (0, worker::SqlStorageValue::Integer(n))=>seq=n,
+                                (1, worker::SqlStorageValue::Blob(b))=>data=b, _=>{} } } } }
+                            if !data.is_empty() && seq>=0 {
+                                let pos = data.len()/2; data[pos] ^= 0xFF;
+                                sql.exec("UPDATE delta_chunks SET payload=? WHERE seq=?;", vec![data.clone().into(), seq.into()]).ok();
+                            }
+                        }
+                        json!({"did":"xor'd a byte mid-first-delta payload, count preserved"})
+                    }
+                    "flipIndices" => {
+                        // Corrupt the gz'd index list of the first delta -> a bad grain index could
+                        // drive an out-of-range image.set (RangeError) or OOB write. We REPLACE the
+                        // indices blob with gz of a single huge u32 (0x7FFFFFFF) to push start out of range.
+                        let cur = sql.exec("SELECT seq FROM delta_chunks ORDER BY seq ASC LIMIT 1;", None);
+                        let mut seq=-1i64;
+                        if let Ok(c)=cur { for row in c.raw(){ if let Ok(r)=row { for (i,v) in r.into_iter().enumerate(){ if i==0 { if let worker::SqlStorageValue::Integer(n)=v { seq=n; } } } } } }
+                        if seq>=0 {
+                            // raw (non-gz) garbage; gunzip will fail first -> still a clean reject. Good enough
+                            // to prove no OOB. Use 8 bytes of 0xFF.
+                            let garbage: Vec<u8> = vec![0xFFu8; 8];
+                            sql.exec("UPDATE delta_chunks SET indices=? WHERE seq=?;", vec![garbage.into(), seq.into()]).ok();
+                        }
+                        json!({"did":"replaced first delta indices with garbage"})
+                    }
+                    other => json!({"did": format!("unknown tamper mode {other}")}),
+                };
+                let _ = js_sys::Function::from(release).call0(&JsValue::NULL);
+                Ok(json!({"ok": true, "t": "tamper", "mode": mode, "detail": out, "generation": self.generation}))
             }
 
             // V0.9.3 GAP 2 (TEST HOOK): simulate an ENGINE-HASH BUMP without rebuilding the wasm.

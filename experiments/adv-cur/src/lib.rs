@@ -88,32 +88,8 @@ extern "C" {
     fn eval_code(this: &GlueKernel, src: &str) -> js_sys::Promise;
     #[wasm_bindgen(method, js_name = dump)]
     fn dump(this: &GlueKernel) -> js_sys::Promise;
-    // W4 BYTE-DELTA: diff the current image against the retained host-side lastImage; resolves to
-    // {mode:"full"|"delta", gz, indicesGz?, nChanged, grain, imageLen, sizeRaw, sizeGz, usedHeap, ...}.
-    #[wasm_bindgen(method, js_name = dumpW4)]
-    fn dump_w4(this: &GlueKernel, force_full: bool) -> js_sys::Promise;
-    // W4: reconstruct base + ordered delta-chain, then blit. deltaList = JS Array of
-    // {gz:Uint8Array, indicesGz:Uint8Array, grain:number}.
-    #[wasm_bindgen(method, js_name = restoreW4)]
-    #[allow(clippy::too_many_arguments)]
-    fn restore_w4(
-        this: &GlueKernel,
-        base_gz: Uint8Array,
-        delta_list: &JsValue,
-        engine_hash: &str,
-        clock_calls: f64,
-        rng_calls: f64,
-        config_json: &str,
-        label: &str,
-        kv_json: &str,
-        used_heap: f64,
-        ctx_json: &str,
-    ) -> js_sys::Promise;
     #[wasm_bindgen(method, js_name = drop)]
     fn drop_kernel(this: &GlueKernel);
-    // W5 TEST HOOK: monotonic buffer byteLength + live used heap as a JSON string.
-    #[wasm_bindgen(method, js_name = memInfo)]
-    fn mem_info(this: &GlueKernel) -> String;
 
     #[wasm_bindgen(js_name = getEngineHash)]
     fn get_engine_hash() -> String;
@@ -129,10 +105,6 @@ extern "C" {
 const CHUNK_BYTES: usize = 64 * 1024;
 // gz image above this goes to R2 overflow instead of SQLite chunks (~2MB).
 const SQLITE_HOT_MAX: usize = 2 * 1024 * 1024;
-// Protocol/source admission guard. W4/W5 can safely admit freed-spike images,
-// but giant source/frame payloads must not enter JSON parse or the VM.
-const MAX_WS_TEXT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_EVAL_SRC_BYTES: usize = 2 * 1024 * 1024;
 
 #[durable_object]
 pub struct KernelDO {
@@ -201,22 +173,6 @@ impl DurableObject for KernelDO {
         )
         .expect("create ctx_chunks");
 
-        // W4 FINE-GRAIN BYTE-DELTA (docs/W4-BYTEDELTA-PLAN.md). The committed snapshot is a
-        // full (W5-compacted) BASE image (chunked in snap_chunks) PLUS an ordered chain of
-        // per-cell byte-deltas. Each delta row carries the gz'd changed-grain payload + gz'd
-        // Uint32 grain-index list. A full base every BASE_EVERY cells clears the chain and resets
-        // snap_chunks. The manifest gains base_seq / delta_seq / mode to drive restore.
-        let _ = sql.exec("ALTER TABLE snap_manifest ADD COLUMN base_seq INTEGER;", None);
-        let _ = sql.exec("ALTER TABLE snap_manifest ADD COLUMN delta_seq INTEGER;", None);
-        let _ = sql.exec("ALTER TABLE snap_manifest ADD COLUMN snap_mode TEXT;", None);
-        sql.exec(
-            "CREATE TABLE IF NOT EXISTS delta_chunks (
-                seq INTEGER PRIMARY KEY, payload BLOB, indices BLOB, grain INTEGER
-            );",
-            None,
-        )
-        .expect("create delta_chunks");
-
         // V0.9.3 GAP 2 — ENGINE-MIGRATION JOURNAL (ADR-0002). Snapshots are byte-coupled to the
         // engine build: the heap image is only restorable into the SAME quickjs.wasm hash. When the
         // engine hash changes (an engine upgrade), a heap restore MUST NOT silently fail. Alongside
@@ -277,23 +233,6 @@ impl DurableObject for KernelDO {
                 return Ok(());
             }
         };
-        if raw.len() > MAX_WS_TEXT_BYTES {
-            ws.send_with_str(
-                &json!({
-                    "ok": false,
-                    "error": {
-                        "name": "ProtocolSizeError",
-                        "message": format!(
-                            "websocket frame {} bytes > MAX_WS_TEXT_BYTES {}; refusing before JSON parse",
-                            raw.len(),
-                            MAX_WS_TEXT_BYTES
-                        )
-                    }
-                })
-                .to_string(),
-            )?;
-            return Ok(());
-        }
         let reply = match serde_json::from_str::<serde_json::Value>(&raw) {
             Ok(msg) => self
                 .handle(msg)
@@ -318,14 +257,14 @@ impl DurableObject for KernelDO {
 
 impl KernelDO {
     fn r2_key(&self) -> String {
-        format!("v093/{}.qjs.gz", self.do_id)
+        format!("advcur/{}.qjs.gz", self.do_id)
     }
 
     /// Fresh, cell/epoch-scoped R2 key for the swap-then-delete overflow write.
     /// Each replace writes to a NEW key so the prior committed object survives until
     /// the new manifest commits (then the old key is deleted post-commit).
     fn r2_key_for(&self, cell: i64, epoch: i64) -> String {
-        format!("benchw4/{}/e{}-c{}.qjs.gz", self.do_id, epoch, cell)
+        format!("advcur/{}/e{}-c{}.qjs.gz", self.do_id, epoch, cell)
     }
 
     /// V0.5 OBSERVABILITY: emit one Analytics Engine datapoint for an op, and a
@@ -561,6 +500,41 @@ impl KernelDO {
                 Ok(json!({ "ok": true, "t": "final", "final": info, "generation": self.generation }))
             }
 
+            // ADV SUITE-3 (TEST HOOK): tamper with the durable full-base snapshot (no delta chain
+            // in this kernel). modes: flipChunk / truncChunk / dropBase.
+            "tamper" => {
+                let release = JsFuture::from(self.mutex.acquire()).await.map_err(to_err)?;
+                let mode = msg.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+                let sql = self.state.storage().sql();
+                let out = match mode {
+                    "truncChunk" => {
+                        sql.exec("DELETE FROM snap_chunks WHERE seq=(SELECT MAX(seq) FROM snap_chunks);", None).ok();
+                        json!({"did":"deleted last snap_chunk, manifest n_chunks unchanged"})
+                    }
+                    "dropBase" => {
+                        sql.exec("DELETE FROM snap_chunks;", None).ok();
+                        json!({"did":"deleted all snap_chunks, manifest kept"})
+                    }
+                    "flipChunk" => {
+                        let cur = sql.exec("SELECT seq,data FROM snap_chunks ORDER BY seq ASC LIMIT 1;", None);
+                        if let Ok(c) = cur {
+                            let mut seq = -1i64; let mut data: Vec<u8> = Vec::new();
+                            for row in c.raw() { if let Ok(r)=row { for (i,v) in r.into_iter().enumerate() { match (i,v) {
+                                (0, worker::SqlStorageValue::Integer(n))=>seq=n,
+                                (1, worker::SqlStorageValue::Blob(b))=>data=b, _=>{} } } } }
+                            if !data.is_empty() && seq>=0 {
+                                let pos = data.len()/2; data[pos] ^= 0xFF;
+                                sql.exec("UPDATE snap_chunks SET data=? WHERE seq=?;", vec![data.clone().into(), seq.into()]).ok();
+                            }
+                        }
+                        json!({"did":"xor'd a byte mid-first-snap_chunk, count preserved"})
+                    }
+                    other => json!({"did": format!("unsupported tamper mode {other}")}),
+                };
+                let _ = js_sys::Function::from(release).call0(&JsValue::NULL);
+                Ok(json!({"ok": true, "t": "tamper", "mode": mode, "detail": out, "generation": self.generation}))
+            }
+
             // V0.9.3 GAP 2 (TEST HOOK): simulate an ENGINE-HASH BUMP without rebuilding the wasm.
             // Rewrites the committed snapshot manifest's engine_hash to a bogus value so the NEXT
             // cold restore sees snap.engine_hash != current and routes through the journal-replay
@@ -582,32 +556,6 @@ impl KernelDO {
                 let _ = js_sys::Function::from(release).call0(&JsValue::NULL);
                 Ok(json!({"ok": true, "t": "engineBump", "manifestEngineHash": fake,
                     "hadManifest": had, "generation": self.generation}))
-            }
-
-            // W5 TEST HOOK: force the spike-then-free WEDGE scenario, then prove un-wedge.
-            // 1) eval a big allocation that grows the monotonic linear buffer past the OLD 18MB
-            //    dump ceiling (default ~22MB), holding it in a global.
-            // 2) free it (null the global) + force GC so the USED heap drops but the buffer stays
-            //    at high-water-mark (WASM memory is monotonic — cannot shrink in place).
-            // 3) checkpoint() — under the OLD code this hard-rejected (SizeAdmissionError); under
-            //    W5 it must SUCCEED (used-heap admission + scrub + gz shrink). Returns before/after
-            //    buffer + used heap + the dump result so the un-wedge is observable.
-            "wedgeTest" => {
-                let release = JsFuture::from(self.mutex.acquire()).await.map_err(to_err)?;
-                let res = self.wedge_test_critical(&msg).await;
-                let _ = js_sys::Function::from(release).call0(&JsValue::NULL);
-                res
-            }
-
-            // W4 TEST HOOK: drive an N-cell session (each cell a small namespace mutation), and
-            // report per-cell stored bytes (gz delta-or-base) + the delta-chain length + base/delta
-            // mode, so the byte-delta write-reduction + chain bounding (BASE_EVERY=20) is observable.
-            // {t:"w4Bench", cells:200}.
-            "w4Bench" => {
-                let release = JsFuture::from(self.mutex.acquire()).await.map_err(to_err)?;
-                let res = self.w4_bench_critical(&msg).await;
-                let _ = js_sys::Function::from(release).call0(&JsValue::NULL);
-                res
             }
 
             other => Ok(json!({"ok": false, "error": format!("unknown msg type {other}")})),
@@ -718,142 +666,9 @@ impl KernelDO {
         }))
     }
 
-    /// W5 TEST HOOK: force the spike-then-free wedge, then prove the un-wedged checkpoint.
-    async fn wedge_test_critical(&self, msg: &serde_json::Value) -> Result<serde_json::Value> {
-        // How many MB to spike the linear buffer by (default 22MB: past the OLD 18MB dump ceiling).
-        let spike_mb = msg.get("spikeMb").and_then(|v| v.as_i64()).unwrap_or(22);
-        self.ensure_glue().await?;
-
-        let mem_of = || -> serde_json::Value {
-            self.glue
-                .borrow()
-                .as_ref()
-                .map(|g| serde_json::from_str::<serde_json::Value>(&g.mem_info()).unwrap_or_else(|_| json!({})))
-                .unwrap_or_else(|| json!({}))
-        };
-
-        // 1) SPIKE: allocate spike_mb of 1MB Uint8Arrays held in a global, growing the monotonic
-        //    linear buffer past the old 18MB ceiling.
-        let spike_src = format!(
-            "globalThis.__wedge=[];for(let i=0;i<{spike_mb};i++){{let a=new Uint8Array(1048576);a[0]=i&255;a[1048575]=i&255;globalThis.__wedge.push(a);}}globalThis.__wedge.length"
-        );
-        let p1 = {
-            let g = clone_glue(self.glue.borrow().as_ref().unwrap());
-            g.eval_code(&spike_src)
-        };
-        JsFuture::from(p1).await.map_err(to_err)?;
-        let mem_spiked = mem_of();
-
-        // 2) FREE: null the global + GC. Buffer stays at high-water-mark; used heap drops.
-        let p2 = {
-            let g = clone_glue(self.glue.borrow().as_ref().unwrap());
-            g.eval_code("globalThis.__wedge=null;0")
-        };
-        JsFuture::from(p2).await.map_err(to_err)?;
-        let mem_freed = mem_of();
-
-        // 3) CHECKPOINT: under the OLD code this hard-rejected (buffer > 18MB) → SizeAdmissionError
-        //    → permanently wedged. Under W5 it must SUCCEED (used-heap admission + scrub + gz shrink).
-        let sql = self.state.storage().sql();
-        let cell = read_int(&sql, "committedCell", -1) + 1;
-        let epoch = read_int(&sql, "epoch", 0);
-        let ckpt_res = self.checkpoint(cell, epoch).await;
-        let (ckpt, wedge_cleared) = match ckpt_res {
-            Ok(v) => {
-                let ok = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(true);
-                (v, ok)
-            }
-            Err(e) => (json!({ "ok": false, "error": format!("{e}") }), false),
-        };
-
-        let mut dp = Datapoint::new("wedgeTest");
-        dp.cell = cell;
-        dp.ok = wedge_cleared;
-        self.emit(&dp);
-
-        Ok(json!({
-            "ok": true, "t": "wedgeTest",
-            "spikeMb": spike_mb,
-            "memSpiked": mem_spiked,
-            "memFreed": mem_freed,
-            "checkpoint": ckpt,
-            // The headline: did the spiked-then-freed session CHECKPOINT (vs old SizeAdmissionError)?
-            "wedgeCleared": wedge_cleared,
-            "generation": self.generation,
-        }))
-    }
-
-    /// W4 TEST HOOK: drive an N-cell session and report per-cell stored bytes + chain length.
-    async fn w4_bench_critical(&self, msg: &serde_json::Value) -> Result<serde_json::Value> {
-        let cells = msg.get("cells").and_then(|v| v.as_i64()).unwrap_or(200).clamp(1, 1000);
-        // BASELINE MODE: force a FULL image dump every cell (the "200 full images" full-dump
-        // baseline) on the IDENTICAL workload, summing the actual stored gz bytes. Same eval
-        // shape, same SQLite store — apples-to-apples vs the W4 byte-delta path.
-        let baseline = msg.get("baseline").and_then(|v| v.as_bool()).unwrap_or(false);
-        self.ensure_glue().await?;
-        let mut per_cell: Vec<serde_json::Value> = Vec::with_capacity(cells as usize);
-        let mut total_gz: i64 = 0;
-        let mut full_count: i64 = 0;
-        let mut delta_count: i64 = 0;
-        let mut max_chain: i64 = 0;
-        for _ in 0..cells {
-            // Each cell mutates a SMALL slice of the namespace (a few keys on a growing object) —
-            // the realistic "most cells touch a small fraction of the heap" shape W4 targets.
-            let sql = self.state.storage().sql();
-            let cell = read_int(&sql, "committedCell", -1) + 1;
-            let epoch = read_int(&sql, "epoch", 0);
-            let src = format!(
-                "globalThis.__m=globalThis.__m||{{}};globalThis.__m['k{cell}']={cell}*7;Object.keys(globalThis.__m).length"
-            );
-            let p = {
-                let g = clone_glue(self.glue.borrow().as_ref().unwrap());
-                g.eval_code(&src)
-            };
-            JsFuture::from(p).await.map_err(to_err)?;
-            let ckpt = self.checkpoint_inner(cell, epoch, baseline).await?;
-            let mode = ckpt.get("mode").and_then(|v| v.as_str()).unwrap_or("full").to_string();
-            let size_gz = ckpt.get("sizeGz").and_then(|v| v.as_i64()).unwrap_or(0);
-            let delta_seq = ckpt.get("deltaSeq").and_then(|v| v.as_i64()).unwrap_or(0);
-            let n_changed = ckpt.get("nChanged").and_then(|v| v.as_i64()).unwrap_or(0);
-            total_gz += size_gz;
-            if mode == "delta" { delta_count += 1; } else { full_count += 1; }
-            if delta_seq > max_chain { max_chain = delta_seq; }
-            per_cell.push(json!({
-                "cell": cell, "mode": mode, "sizeGz": size_gz,
-                "deltaSeq": delta_seq, "nChanged": n_changed,
-            }));
-        }
-        self.emit(&Datapoint::new("w4Bench"));
-        Ok(json!({
-            "ok": true, "t": "w4Bench",
-            "baseline": baseline,
-            "cells": cells,
-            "totalStoredGz": total_gz,
-            "fullBases": full_count,
-            "deltas": delta_count,
-            "maxChainLen": max_chain,
-            "avgStoredGz": total_gz / cells.max(1),
-            "perCell": per_cell,
-            "generation": self.generation,
-        }))
-    }
-
     /// eval against the persisted namespace, then per-cell checkpoint to SQLite.
     async fn eval_critical(&self, msg: &serde_json::Value) -> Result<serde_json::Value> {
         let src = msg.get("src").and_then(|v| v.as_str()).unwrap_or("");
-        if src.len() > MAX_EVAL_SRC_BYTES {
-            return Ok(json!({
-                "ok": false,
-                "error": {
-                    "name": "ProtocolSizeError",
-                    "message": format!(
-                        "eval source {} bytes > MAX_EVAL_SRC_BYTES {}; refusing before VM eval",
-                        src.len(),
-                        MAX_EVAL_SRC_BYTES
-                    )
-                }
-            }));
-        }
         let before = self.glue.borrow().is_some();
 
         // First-eval config: {t:"eval", src, config:{...}} persists config before the
@@ -1065,7 +880,6 @@ impl KernelDO {
         // clear durable snapshot
         let sql = self.state.storage().sql();
         sql.exec("DELETE FROM snap_chunks;", None).ok();
-        sql.exec("DELETE FROM delta_chunks;", None).ok();
         sql.exec("DELETE FROM ctx_chunks;", None).ok();
         sql.exec("DELETE FROM snap_manifest;", None).ok();
         // V0.9.3 GAP 2: a reset starts a clean namespace, so the engine-migration journal is dropped too.
@@ -1191,13 +1005,8 @@ impl KernelDO {
             } else {
                 m.ctx_json.clone()
             };
-            // W4: `gz` is the BASE image; read the committed delta chain and reconstruct
-            // base + ordered deltas inside the glue (restoreW4). A full-base snapshot has
-            // delta_seq==0 → empty chain → identical to the W5 full restore.
-            let delta_list = self.read_delta_chain(m.delta_seq)?;
-            let src = JsFuture::from(glue.restore_w4(
+            let src = JsFuture::from(glue.restore(
                 gz,
-                delta_list.as_ref(),
                 &m.engine_hash,
                 m.clock_calls as f64,
                 m.rng_calls as f64,
@@ -1249,31 +1058,8 @@ impl KernelDO {
     /// Commit ordering is preserved: committedCell advances inside the same commit
     /// as the manifest, so it is never visible without a durable replacement.
     async fn checkpoint(&self, cell: i64, epoch: i64) -> Result<serde_json::Value> {
-        self.checkpoint_inner(cell, epoch, false).await
-    }
-
-    async fn checkpoint_inner(
-        &self,
-        cell: i64,
-        epoch: i64,
-        force_full_override: bool,
-    ) -> Result<serde_json::Value> {
-        // W4 BASE/DELTA DECISION (docs/W4-BYTEDELTA-PLAN.md). The committed snapshot is a full
-        // (W5-compacted) BASE plus a chain of per-cell byte-deltas. We force a full base when:
-        //   * there is no prior committed snapshot (cold/first cell), OR
-        //   * the prior chain would reach BASE_EVERY deltas (cap the restore chain length).
-        // glue.dumpW4 may ALSO down-grade to a full base (image length changed, or the delta is
-        // dense >= FALLBACK_PCT of full) — the returned `mode` is authoritative.
-        const BASE_EVERY: i64 = 20;
-        let prev = self.read_manifest();
-        let force_full = force_full_override || match &prev {
-            None => true,
-            Some(m) => m.delta_seq + 1 >= BASE_EVERY,
-        };
-
         let glue = clone_glue(self.glue.borrow().as_ref().unwrap());
-        let dump = JsFuture::from(glue.dump_w4(force_full)).await.map_err(to_err)?;
-        let mode = str_field(&dump, "mode").unwrap_or_else(|| "full".to_string());
+        let dump = JsFuture::from(glue.dump()).await.map_err(to_err)?;
         let gz: Uint8Array = Reflect::get(&dump, &JsValue::from_str("gz"))
             .map_err(to_err)?
             .into();
@@ -1288,112 +1074,26 @@ impl KernelDO {
         let stack_pointer = num_field(&dump, "stackPointer");
         let clock_calls = num_field(&dump, "clockCalls").unwrap_or(0.0) as i64;
         let rng_calls = num_field(&dump, "rngCalls").unwrap_or(0.0) as i64;
-        let grain = num_field(&dump, "grain").unwrap_or(256.0) as i64;
-        let n_changed = num_field(&dump, "nChanged").unwrap_or(0.0) as i64;
+        // P2: host-tool (kv) state, serialized in the glue, persisted alongside the snapshot.
         let kv_json = str_field(&dump, "kvJson").unwrap_or_else(|| "{}".to_string());
+        // V0.9: host-side context store, serialized in the glue, persisted alongside the snapshot.
         let ctx_json = str_field(&dump, "ctxJson").unwrap_or_else(|| "{}".to_string());
 
         let mut bytes = vec![0u8; gz.length() as usize];
         gz.copy_to(&mut bytes);
 
-        let is_delta = mode == "delta" && prev.is_some();
-
-        if is_delta {
-            // ---- DELTA PATH ----
-            // Keep the existing base (snap_chunks / R2 object / base manifest fields) intact;
-            // append ONE delta row + bump delta_seq. Tiny per-cell write (only the changed grains).
-            let pm = prev.as_ref().unwrap();
-            let delta_seq_new = pm.delta_seq; // 0-based row seq == prior chain length
-            // indicesGz blob alongside the changed-grain payload.
-            let idx_arr: Uint8Array = Reflect::get(&dump, &JsValue::from_str("indicesGz"))
-                .map_err(to_err)?
-                .into();
-            let mut idx_bytes = vec![0u8; idx_arr.length() as usize];
-            idx_arr.copy_to(&mut idx_bytes);
-
-            let ctx_bytes = ctx_json.as_bytes();
-            let sql = self.state.storage().sql();
-            // Preserve the base's store/key/engine/n_chunks/size; only the chain + per-cell meta move.
-            let base_store = pm.store.clone();
-            let base_r2_key = pm.r2_key.clone();
-            let base_engine = pm.engine_hash.clone();
-            let base_n_chunks = pm.n_chunks;
-            let txn = || -> Result<()> {
-                // Append the delta row (payload + indices, each a single BLOB — deltas are small).
-                sql.exec(
-                    "INSERT INTO delta_chunks(seq, payload, indices, grain) VALUES (?,?,?,?);",
-                    vec![delta_seq_new.into(), bytes.clone().into(), idx_bytes.clone().into(), grain.into()],
-                )
-                .map_err(|e| worker::Error::RustError(format!("delta insert: {e:?}")))?;
-                // Replace the ctx store (it can change per cell) and the manifest (base fields kept).
-                sql.exec("DELETE FROM ctx_chunks;", None)?;
-                let mut ctx_seq = 0i64;
-                for chunk in ctx_bytes.chunks(CHUNK_BYTES) {
-                    sql.exec(
-                        "INSERT INTO ctx_chunks(seq, data) VALUES (?, ?);",
-                        vec![ctx_seq.into(), chunk.to_vec().into()],
-                    )
-                    .map_err(|e| worker::Error::RustError(format!("ctx chunk insert: {e:?}")))?;
-                    ctx_seq += 1;
-                }
-                sql.exec("DELETE FROM snap_manifest;", None)?;
-                sql.exec(
-                    "INSERT INTO snap_manifest
-                        (id, cell, epoch, n_chunks, size_raw, size_gz, engine_hash,
-                         clock_calls, rng_calls, store, r2_key, created_ms, kv_json, used_heap,
-                         ctx_json, ctx_n_chunks, base_seq, delta_seq, snap_mode)
-                     VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
-                    vec![
-                        cell.into(),
-                        epoch.into(),
-                        base_n_chunks.into(),
-                        size_raw.into(),
-                        size_gz.into(),
-                        base_engine.clone().into(),
-                        clock_calls.into(),
-                        rng_calls.into(),
-                        base_store.clone().into(),
-                        base_r2_key.clone().into(),
-                        now_ms().into(),
-                        kv_json.clone().into(),
-                        used_heap.into(),
-                        "{}".to_string().into(),
-                        ctx_seq.into(),
-                        0i64.into(),
-                        (delta_seq_new + 1).into(),
-                        "delta".to_string().into(),
-                    ],
-                )
-                .map_err(|e| worker::Error::RustError(format!("manifest insert: {e:?}")))?;
-                sql.exec(
-                    "INSERT INTO meta(k,v) VALUES('committedCell',?)
-                     ON CONFLICT(k) DO UPDATE SET v=excluded.v;",
-                    vec![cell.to_string().into()],
-                )?;
-                Ok(())
-            };
-            txn()?;
-            return Ok(json!({
-                "cell": cell, "store": base_store, "mode": "delta",
-                "nChunks": base_n_chunks, "deltaSeq": delta_seq_new + 1,
-                "nChanged": n_changed, "grain": grain,
-                "sizeRaw": size_raw, "sizeGz": size_gz,
-                "usedHeap": used_heap, "bufferBytes": buffer_bytes, "scrubbed": scrubbed,
-                "stackPointer": stack_pointer,
-                "clockCalls": clock_calls, "rngCalls": rng_calls,
-            }));
-        }
-
-        // ---- FULL BASE PATH (W5 parity + reset the delta chain) ----
         // The OLD committed R2 key (if any) — needed for post-commit cleanup.
-        let old_r2_key: Option<String> = prev.as_ref().and_then(|m| {
+        // Read BEFORE we touch anything; this is the key the prior manifest points at.
+        let old_r2_key: Option<String> = self.read_manifest().and_then(|m| {
             if m.store == "r2" && !m.r2_key.is_empty() {
-                Some(m.r2_key.clone())
+                Some(m.r2_key)
             } else {
                 None
             }
         });
 
+        // R2 OVERFLOW PATH: write the new object under a FRESH key FIRST (the only
+        // .await before the SQL commit). Old object is untouched here.
         let to_r2 = bytes.len() > SQLITE_HOT_MAX;
         let (store, new_r2_key) = if to_r2 {
             let new_key = self.r2_key_for(cell, epoch);
@@ -1407,18 +1107,32 @@ impl KernelDO {
         // ---- ATOMIC SQL REPLACE (no .await inside) ----
         let sql = self.state.storage().sql();
         let r2_key_for_manifest = new_r2_key.clone();
+        // ATOMICITY via DO synchronous WRITE COALESCING. workerd does NOT allow raw
+        // `BEGIN`/`COMMIT`/SAVEPOINT against DO SQLite — it errors and tells you to use
+        // the transaction APIs, because every storage write performed within a SINGLE
+        // synchronous turn (no `.await` yielding to the event loop) is buffered and
+        // flushed ATOMICALLY by the DO output gate at the end of the turn. If the turn
+        // throws, the buffered writes are discarded → the prior committed snapshot is
+        // preserved. We therefore run the entire replace (DELETE + INSERTs + manifest +
+        // committedCell) with NO `.await` inside, getting all-or-nothing for free.
+        // (The only `.await` — the R2 put — happens BEFORE this block.)
+        // V0.9.1 HIGH-bug FIX: chunk the serialized host-side context store across ctx_chunks
+        // rows. A multi-MB context bound as a single ctx_json TEXT value hits SQLITE_TOOBIG (the
+        // statement/value cap) and the write fails — silently losing the context on cold restore
+        // (warm was fine, since the store lives in a host-side Map). Splitting into ~64KB BLOB
+        // rows (UTF-8 bytes) mirrors the snapshot chunking and persists multi-MB contexts.
         let ctx_bytes = ctx_json.as_bytes();
 
         let txn = || -> Result<(i64, i64)> {
-            // replace previous snapshot AND reset the delta chain.
+            // replace previous snapshot
             sql.exec("DELETE FROM snap_chunks;", None)?;
-            sql.exec("DELETE FROM delta_chunks;", None)?;
             sql.exec("DELETE FROM ctx_chunks;", None)?;
             sql.exec("DELETE FROM snap_manifest;", None)?;
 
             let n_chunks = if to_r2 {
                 0i64
             } else {
+                // SQLite chunked store (the default hot path).
                 let mut seq = 0i64;
                 for chunk in bytes.chunks(CHUNK_BYTES) {
                     sql.exec(
@@ -1431,6 +1145,8 @@ impl KernelDO {
                 seq
             };
 
+            // V0.9.1: chunk the context store (always SQLite — it never goes to R2). A 0-length
+            // context yields 0 rows (the empty "{}" still chunks to 1 tiny row, which is fine).
             let mut ctx_seq = 0i64;
             for chunk in ctx_bytes.chunks(CHUNK_BYTES) {
                 sql.exec(
@@ -1444,9 +1160,8 @@ impl KernelDO {
             sql.exec(
                 "INSERT INTO snap_manifest
                     (id, cell, epoch, n_chunks, size_raw, size_gz, engine_hash,
-                     clock_calls, rng_calls, store, r2_key, created_ms, kv_json, used_heap,
-                     ctx_json, ctx_n_chunks, base_seq, delta_seq, snap_mode)
-                 VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
+                     clock_calls, rng_calls, store, r2_key, created_ms, kv_json, used_heap, ctx_json, ctx_n_chunks)
+                 VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
                 vec![
                     cell.into(),
                     epoch.into(),
@@ -1461,15 +1176,16 @@ impl KernelDO {
                     now_ms().into(),
                     kv_json.clone().into(),
                     used_heap.into(),
+                    // ctx_json column is now LEGACY: the context lives in ctx_chunks. Store an
+                    // empty JSON object so a stray reader never mistakes a stale value for live.
                     "{}".to_string().into(),
                     ctx_seq.into(),
-                    0i64.into(),
-                    0i64.into(),
-                    "full".to_string().into(),
                 ],
             )
             .map_err(|e| worker::Error::RustError(format!("manifest insert: {e:?}")))?;
 
+            // COMMIT ORDERING: advance committedCell in the SAME synchronous turn as
+            // the manifest, so it is never durable without a matching snapshot.
             sql.exec(
                 "INSERT INTO meta(k,v) VALUES('committedCell',?)
                  ON CONFLICT(k) DO UPDATE SET v=excluded.v;",
@@ -1478,8 +1194,15 @@ impl KernelDO {
             Ok((n_chunks, ctx_seq))
         };
 
+        // Execute the whole replace synchronously. On any error we return Err WITHOUT
+        // awaiting, so the DO turn fails and the buffered writes are dropped — leaving
+        // the prior committed snapshot (and, on the R2 path, the prior R2 object, which
+        // we never deleted) fully intact. No torn/missing set is ever made durable.
         let (n_chunks, _ctx_n_chunks) = txn()?;
 
+        // POST-COMMIT: the new snapshot is now durable. Safe to delete the OLD R2
+        // object (swap-then-delete). Skip if the key is unchanged (shouldn't happen
+        // because keys are cell/epoch-scoped, but guard anyway). Best-effort.
         if let Some(old) = old_r2_key {
             if old != new_r2_key {
                 if let Ok(bucket) = self.env.bucket("SNAPSHOTS") {
@@ -1489,60 +1212,13 @@ impl KernelDO {
         }
 
         Ok(json!({
-            "cell": cell, "store": store, "mode": "full", "nChunks": n_chunks,
-            "deltaSeq": 0, "nChanged": 0, "grain": grain,
+            "cell": cell, "store": store, "nChunks": n_chunks,
             "sizeRaw": size_raw, "sizeGz": size_gz,
             "usedHeap": used_heap, "bufferBytes": buffer_bytes, "scrubbed": scrubbed,
             "stackPointer": stack_pointer,
             "clockCalls": clock_calls, "rngCalls": rng_calls,
             "r2Key": new_r2_key,
         }))
-    }
-
-    /// W4: read the committed delta chain (ordered by seq) as a JS Array of
-    /// {gz:Uint8Array, indicesGz:Uint8Array, grain:number} for glue.restoreW4.
-    fn read_delta_chain(&self, delta_seq: i64) -> Result<Array> {
-        let out = Array::new();
-        if delta_seq <= 0 {
-            return Ok(out);
-        }
-        let sql = self.state.storage().sql();
-        let cursor = sql
-            .exec("SELECT payload, indices, grain FROM delta_chunks ORDER BY seq ASC;", None)
-            .map_err(|e| worker::Error::RustError(format!("read deltas: {e:?}")))?;
-        let mut count = 0i64;
-        for row in cursor.raw() {
-            let row = row.map_err(|e| worker::Error::RustError(format!("delta row: {e:?}")))?;
-            let mut payload: Option<Vec<u8>> = None;
-            let mut indices: Option<Vec<u8>> = None;
-            let mut grain: i64 = 256;
-            for (i, val) in row.into_iter().enumerate() {
-                match (i, val) {
-                    (0, worker::SqlStorageValue::Blob(b)) => payload = Some(b),
-                    (1, worker::SqlStorageValue::Blob(b)) => indices = Some(b),
-                    (2, worker::SqlStorageValue::Integer(n)) => grain = n,
-                    _ => {}
-                }
-            }
-            let p = payload.unwrap_or_default();
-            let idx = indices.unwrap_or_default();
-            let p_arr = Uint8Array::new_with_length(p.len() as u32);
-            p_arr.copy_from(&p);
-            let i_arr = Uint8Array::new_with_length(idx.len() as u32);
-            i_arr.copy_from(&idx);
-            let obj = js_sys::Object::new();
-            Reflect::set(&obj, &JsValue::from_str("gz"), &p_arr).ok();
-            Reflect::set(&obj, &JsValue::from_str("indicesGz"), &i_arr).ok();
-            Reflect::set(&obj, &JsValue::from_str("grain"), &JsValue::from_f64(grain as f64)).ok();
-            out.push(&obj);
-            count += 1;
-        }
-        if count != delta_seq {
-            return Err(worker::Error::RustError(format!(
-                "CorruptDeltaError: delta count mismatch (manifest delta_seq={delta_seq}, read {count})"
-            )));
-        }
-        Ok(out)
     }
 
     fn read_manifest(&self) -> Option<Manifest> {
@@ -1565,12 +1241,10 @@ impl KernelDO {
             ctx_json: Option<String>,
             #[serde(default)]
             ctx_n_chunks: Option<i64>,
-            #[serde(default)]
-            delta_seq: Option<i64>,
         }
         let rows: Vec<Row> = sql
             .exec(
-                "SELECT cell,epoch,n_chunks,engine_hash,clock_calls,rng_calls,store,r2_key,kv_json,used_heap,ctx_json,ctx_n_chunks,delta_seq
+                "SELECT cell,epoch,n_chunks,engine_hash,clock_calls,rng_calls,store,r2_key,kv_json,used_heap,ctx_json,ctx_n_chunks
                  FROM snap_manifest WHERE id=1 LIMIT 1;",
                 None,
             )
@@ -1590,7 +1264,6 @@ impl KernelDO {
             used_heap: r.used_heap.unwrap_or(0),
             ctx_json: r.ctx_json.unwrap_or_else(|| "{}".to_string()),
             ctx_n_chunks: r.ctx_n_chunks.unwrap_or(0),
-            delta_seq: r.delta_seq.unwrap_or(0),
         })
     }
 
@@ -1803,8 +1476,6 @@ struct Manifest {
     ctx_json: String,
     // V0.9.1: number of ctx_chunks rows holding the chunked host-side context store.
     ctx_n_chunks: i64,
-    // W4: committed delta-chain length on top of the base in snap_chunks (0 => base only / W5 parity).
-    delta_seq: i64,
 }
 
 #[event(fetch)]

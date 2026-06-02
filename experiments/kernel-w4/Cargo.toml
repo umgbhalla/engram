@@ -1,0 +1,23 @@
+[package]
+name = "montydyn-v05"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+worker = { version = "0.8" }
+worker-macros = { version = "0.8" }
+# Pin to 0.2.121: worker-build 0.8.3 expects this exact wasm-bindgen; 0.2.122's
+# snippet package.json format breaks its parser (`invalid type: map, expected a string`).
+wasm-bindgen = "=0.2.121"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
