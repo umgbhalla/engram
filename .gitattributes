@@ -1,0 +1,17 @@
+# GitHub linguist: keep the language bar reflecting authored product code.
+
+# Vendored third-party code (quickjs dist, esbuilt stdlib bundles) — not ours.
+v1.2/vendor/**            linguist-vendored
+**/stdlib-src/*.js        linguist-vendored
+
+# Proven experiments + test/bench harnesses — not product source.
+experiments/**            linguist-generated
+**/smoke*.mjs             linguist-generated
+**/obs-*.mjs              linguist-generated
+**/bench/**               linguist-generated
+
+# Generated diagrams.
+docs/diagrams/*.svg       linguist-generated
+
+# Required binary delivery artifacts (already binary, but be explicit).
+*.wasm                    binary linguist-vendored
