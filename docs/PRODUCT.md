@@ -42,7 +42,7 @@ Capabilities, end to end:
 2. **Scale at 1000s** — verified to 150 concurrent; behavior at 1000s of concurrent sessions and full 64×128 saturation under sustained load is unproven.
 3. **Python kernel** — JS-only today; a second language runtime is a roadmap item, not built.
 4. **Docs site** — internal result docs exist; no public docs/quickstart/API reference site.
-5. **P1 lambda bug** — `lambdaRLM()` returns wrong answer for single-leaf (≤4000-char) contexts (`v0.9.2/stdlib-src/lambda.js`, mirror in SDK). Fix is small (normalize initial handle bounds) but currently ships broken.
+5. ~~P1 lambda bug~~ **FIXED** — single-leaf (≤4000-char) `lambdaRLM()` now slices correct bounds (`v0.9.3/stdlib-src/lambda.js:107`, `part.end != null` guard; mirrored in SDK).
 
 ### Carried risks
 - Engine-migration journal is **best-effort**: effectful cells (network/kv/entropy) cannot replay faithfully and are flagged; heap-snapshot remains the real durability mechanism.
