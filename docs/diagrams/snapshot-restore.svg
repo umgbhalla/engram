@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 446.474 445" width="446.474" height="445" style="--bg:#0d1117;--fg:#e6edf3;--line:#3d444d;--accent:#4493f8;--muted:#9198a1;--surface:#161b22;--border:#3d444d;background:var(--bg)">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter%2C%20system-ui%2C%20sans-serif:wght@400;500;600;700&amp;display=swap');
+  text { font-family: 'Inter, system-ui, sans-serif', system-ui, sans-serif; }
+  svg {
+    /* Derived from --bg and --fg (overridable via --line, --accent, etc.) */
+    --_text:          var(--fg);
+    --_text-sec:      var(--muted, color-mix(in srgb, var(--fg) 60%, var(--bg)));
+    --_text-muted:    var(--muted, color-mix(in srgb, var(--fg) 40%, var(--bg)));
+    --_text-faint:    color-mix(in srgb, var(--fg) 25%, var(--bg));
+    --_line:          var(--line, color-mix(in srgb, var(--fg) 50%, var(--bg)));
+    --_arrow:         var(--accent, color-mix(in srgb, var(--fg) 85%, var(--bg)));
+    --_node-fill:     var(--surface, color-mix(in srgb, var(--fg) 3%, var(--bg)));
+    --_node-stroke:   var(--border, color-mix(in srgb, var(--fg) 20%, var(--bg)));
+    --_group-fill:    var(--bg);
+    --_group-hdr:     color-mix(in srgb, var(--fg) 5%, var(--bg));
+    --_inner-stroke:  color-mix(in srgb, var(--fg) 12%, var(--bg));
+    --_key-badge:     color-mix(in srgb, var(--fg) 10%, var(--bg));
+  }
+</style>
+<defs>
+  <marker id="seq-arrow" markerWidth="8" markerHeight="5" refX="8" refY="2.5" orient="auto-start-reverse">
+    <polygon points="0 0, 8 2.5, 0 5" fill="var(--_arrow)" />
+  </marker>
+  <marker id="seq-arrow-open" markerWidth="8" markerHeight="5" refX="8" refY="2.5" orient="auto-start-reverse">
+    <polyline points="0 0, 8 2.5, 0 5" fill="none" stroke="var(--_arrow)" stroke-width="1" />
+  </marker>
+</defs>
+<line class="lifeline" data-actor="G" x1="70" y1="70" x2="70" y2="415" stroke="var(--_line)" stroke-width="0.75" stroke-dasharray="6 4" />
+<line class="lifeline" data-actor="Q" x1="214.0285" y1="70" x2="214.0285" y2="415" stroke="var(--_line)" stroke-width="0.75" stroke-dasharray="6 4" />
+<line class="lifeline" data-actor="S" x1="367.2655" y1="70" x2="367.2655" y2="415" stroke="var(--_line)" stroke-width="0.75" stroke-dasharray="6 4" />
+<g class="message" data-from="G" data-to="Q" data-label="read memory.buffer + globals + entropy" data-line-style="solid" data-arrow-head="filled" data-self="false">
+  <line x1="70" y1="90" x2="214.0285" y2="90" stroke="var(--_line)" stroke-width="1" marker-end="url(#seq-arrow)" />
+  <text x="142.01425" y="80" font-size="11" text-anchor="middle" font-weight="400" fill="var(--_text-muted)" dy="3.8499999999999996">read memory.buffer + globals + entropy</text>
+</g>
+<g class="message" data-from="G" data-to="G" data-label="admit on used heap (not monotonic buffer)" data-line-style="solid" data-arrow-head="filled" data-self="true">
+  <polyline points="70,130 100,130 100,150 70,150" fill="none" stroke="var(--_line)" stroke-width="1" marker-end="url(#seq-arrow)" />
+  <text x="108" y="140" font-size="11" text-anchor="start" font-weight="400" fill="var(--_text-muted)" dy="3.8499999999999996">admit on used heap (not monotonic buffer)</text>
+</g>
+<g class="message" data-from="G" data-to="S" data-label="gzip then SQLite chunks, else R2 overflow" data-line-style="solid" data-arrow-head="filled" data-self="false">
+  <line x1="70" y1="200" x2="367.2655" y2="200" stroke="var(--_line)" stroke-width="1" marker-end="url(#seq-arrow)" />
+  <text x="218.63275" y="190" font-size="11" text-anchor="middle" font-weight="400" fill="var(--_text-muted)" dy="3.8499999999999996">gzip then SQLite chunks, else R2 overflow</text>
+</g>
+<g class="message" data-from="G" data-to="Q" data-label="new instance, re-instantiate Tier-0 natives at fixed bases" data-line-style="solid" data-arrow-head="filled" data-self="false">
+  <line x1="70" y1="255" x2="214.0285" y2="255" stroke="var(--_line)" stroke-width="1" marker-end="url(#seq-arrow)" />
+  <text x="142.01425" y="245" font-size="11" text-anchor="middle" font-weight="400" fill="var(--_text-muted)" dy="3.8499999999999996">new instance, re-instantiate Tier-0 natives at fixed bases</text>
+</g>
+<g class="message" data-from="S" data-to="G" data-label="read chunks then gunzip" data-line-style="solid" data-arrow-head="filled" data-self="false">
+  <line x1="367.2655" y1="295" x2="70" y2="295" stroke="var(--_line)" stroke-width="1" marker-end="url(#seq-arrow)" />
+  <text x="218.63275" y="285" font-size="11" text-anchor="middle" font-weight="400" fill="var(--_text-muted)" dy="3.8499999999999996">read chunks then gunzip</text>
+</g>
+<g class="message" data-from="G" data-to="Q" data-label="blit heap bytes back + restore globals" data-line-style="solid" data-arrow-head="filled" data-self="false">
+  <line x1="70" y1="335" x2="214.0285" y2="335" stroke="var(--_line)" stroke-width="1" marker-end="url(#seq-arrow)" />
+  <text x="142.01425" y="325" font-size="11" text-anchor="middle" font-weight="400" fill="var(--_text-muted)" dy="3.8499999999999996">blit heap bytes back + restore globals</text>
+</g>
+<g class="message" data-from="Q" data-to="G" data-label="continues mid-namespace (no replay)" data-line-style="solid" data-arrow-head="filled" data-self="false">
+  <line x1="214.0285" y1="375" x2="70" y2="375" stroke="var(--_line)" stroke-width="1" marker-end="url(#seq-arrow)" />
+  <text x="142.01425" y="365" font-size="11" text-anchor="middle" font-weight="400" fill="var(--_text-muted)" dy="3.8499999999999996">continues mid-namespace (no replay)</text>
+</g>
+<g class="note" data-position="over" data-actors="G,S">
+  <polygon points="135.12174999999996,208 296.14374999999995,208 302.14374999999995,214 302.14374999999995,231 135.12174999999996,231" fill="var(--bg)" stroke="var(--_node-stroke)" stroke-width="0.75" />
+  <polygon points="296.14374999999995,208 302.14374999999995,214 296.14374999999995,214" fill="var(--_inner-stroke)" stroke="var(--_node-stroke)" stroke-width="0.75" />
+  <text x="218.63275" y="219.5" font-size="11" text-anchor="middle" font-weight="400" fill="var(--_text-muted)" dy="3.8499999999999996">idle: DO evicted, instance gone</text>
+</g>
+<g class="actor" data-id="G" data-label="JS glue" data-type="participant">
+  <rect x="30" y="30" width="80" height="40" rx="4" ry="4" fill="var(--_node-fill)" stroke="var(--_node-stroke)" stroke-width="1" />
+  <text x="70" y="50" font-size="13" text-anchor="middle" font-weight="500" fill="var(--_text)" dy="4.55">JS glue</text>
+</g>
+<g class="actor" data-id="Q" data-label="QuickJS WASM" data-type="participant">
+  <rect x="150" y="30" width="128.057" height="40" rx="4" ry="4" fill="var(--_node-fill)" stroke="var(--_node-stroke)" stroke-width="1" />
+  <text x="214.0285" y="50" font-size="13" text-anchor="middle" font-weight="500" fill="var(--_text)" dy="4.55">QuickJS WASM</text>
+</g>
+<g class="actor" data-id="S" data-label="SQLite / R2" data-type="participant">
+  <rect x="318.05699999999996" y="30" width="98.41699999999999" height="40" rx="4" ry="4" fill="var(--_node-fill)" stroke="var(--_node-stroke)" stroke-width="1" />
+  <text x="367.2655" y="50" font-size="13" text-anchor="middle" font-weight="500" fill="var(--_text)" dy="4.55">SQLite / R2</text>
+</g>
+</svg>

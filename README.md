@@ -21,23 +21,7 @@ V8 isolates **cannot** hibernate a live kernel — there is no heap-snapshot API
 
 No journaling, no source replay. We literally persist the heap. That single property is the whole product.
 
-```
-   WS / HTTP client
-        │  frames: create · eval · ping
-        ▼
-   ┌ Durable Object — one per session ──────────────────────────────────┐
-   │                                                                     │
-   │   Rust DO shell ──▶ JS glue ──▶ QuickJS (WASM)                       │
-   │                                   live namespace: x, inc(), promises│
-   │                                       │                             │
-   │                  snapshot = memory.buffer + globals + entropy        │
-   │                                       ▼                             │
-   │   SQLite  (chunked 64KB rows, <2MB gz)  ──overflow──▶  R2 snapshots  │
-   └─────────────────────────────────────────────────────────────────────┘
-        │  idle ⇒ DO evicted, heap gone        ▲  wake ⇒ new instance,
-        ▼                                       │  blit bytes, resume
-     hibernated  ─────────────────────────────┘     mid-namespace (no replay)
-```
+<p align="center"><img src="docs/diagrams/architecture.svg" alt="Engram architecture — client → Rust DO shell → JS glue → QuickJS WASM → SQLite/R2, hibernate and resume" width="640"></p>
 
 ---
 
@@ -136,22 +120,13 @@ docs/                                 ── feasibility, experiments, ADRs, per
 
 ## How it works (deeper)
 
-```
-   glue                 QuickJS (WASM)            SQLite / R2
-    │                        │                         │
-    │  ── eval completes ──▶ │                         │
-    │ ◀─ memory.buffer + globals + entropy counters ─  │
-    │  admit on used heap (memoryUsedSize, not buffer)  │
-    │  ── gzip ─────────────────────────────────────▶ │  SQLite chunks <2MB,
-    │                                                  │  else R2 overflow
-    │                                                  │  (crash-atomic)
-   ─┴── 💤 idle ⇒ DO evicted, instance gone ───────────┴────────────────────
-    │                        │                         │
-    │  ── new instance, re-instantiate Tier-0 natives at fixed bases ──▶ │
-    │ ◀──────────────── read chunks ── gunzip ──────── │
-    │  ── blit heap bytes back + restore globals ────▶ │
-    │ ◀─ execution continues mid-namespace (no replay) │
-```
+<p align="center"><img src="docs/diagrams/snapshot-restore.svg" alt="Snapshot/restore round-trip between JS glue, QuickJS WASM, and SQLite/R2" width="460"></p>
+
+<p align="center">
+  <img src="docs/diagrams/session-states.svg" alt="Session state machine: created → warm → hibernated → restoring/replaying" width="420">
+  &nbsp;&nbsp;
+  <img src="docs/diagrams/multi-tenant.svg" alt="Multi-tenant: sessionId → supervisor shard → kernel facets" width="420">
+</p>
 
 ### Snapshot / restore
 1. After a cell evals, glue reads `memory.buffer`, mutable globals, and entropy counters.
