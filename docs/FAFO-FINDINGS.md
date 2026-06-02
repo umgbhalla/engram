@@ -43,6 +43,28 @@ a Promise — no "if result is a thenable, settle it then preview the resolution
 (or `Promise { <pending> }` if still pending after the budget). Pure preview/host-side change; no engine,
 determinism, or snapshot-format impact. Add to the fix queue alongside the W4 ceiling regression.
 
+### BUG-FAFO-1 is the narrow case of a wider preview-class bug
+
+`_preview` JSON-serializes the result, so any non-plain built-in renders uselessly (data is FINE — only the
+displayed preview is wrong; E5 proved the underlying values round-trip 21/21):
+
+```
+   eval                  live preview     correct REPL preview
+   ────                  ────────────     ────────────────────
+   new Map([["a",1]])    "{}"             Map(1) { "a" => 1 }
+   new Set([1,2,3])      "{}"             Set(3) { 1, 2, 3 }
+   new Date(0)           "{}"             1970-01-01T00:00:00.000Z
+   /re/g                 "{}"             /re/g
+   Symbol("s")           null             Symbol(s)
+   Promise.resolve(7)    "{}"             7  (settle first)
+   ── render OK: class instance {x:1}, function [Function: f], 10n, Uint8Array, plain/nested objects
+```
+
+**Verdict:** the snapshot/durability core is correct; the kernel's **value-preview formatter is the weak
+spot** — it should special-case Map/Set/Date/RegExp/Symbol/Promise (and ideally show `Map(n)`/`Set(n)`
+tags) like Node's `util.inspect`, instead of `JSON.stringify`. Single host-side function (`_preview` in
+glue.js / a Rust formatter if the kernel goes Rust). P2, high user-visible value for a notebook product.
+
 ## Not bugs, noted
 
 - `host.fetch` works (github 200, 26-byte body) — the `{}` people saw was BUG-FAFO-1, not a fetch failure.
