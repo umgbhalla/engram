@@ -17,3 +17,6 @@ e3-chiwawa/
 **/*.wat
 **/package.json
 w7-wasmtime-dirtypage/
+
+# simulated R2/SQLite store scratch
+**/store/
