@@ -710,7 +710,13 @@ function hostFnDefs(ctx) {
       // socket stays alive and the kernel usable.
       let urlObj, init;
       try {
-        urlObj = enforceFetchAllow(urlStr, ctx.config ? ctx.config.fetch : false);
+        // "full allow for now": when config.fetch is UNSET, default to true (allow all).
+        // Set config.fetch:false (or an allowlist) to restrict. Multi-tenant (v1.2) keeps
+        // its own per-tenant gateway + deny-by-default at the supervisor regardless.
+        urlObj = enforceFetchAllow(
+          urlStr,
+          ctx.config && ctx.config.fetch !== undefined ? ctx.config.fetch : true,
+        );
       } catch (e) {
         const d = vm.newPromise();
         const errH = vm.newError(e instanceof Error ? e : new Error(String(e)));
@@ -727,11 +733,17 @@ function hostFnDefs(ctx) {
       const work = (async () => {
         try {
           const reqInit = {};
+          const hdrs = {};
           if (init && typeof init === "object") {
             if (init.method) reqInit.method = String(init.method);
-            if (init.headers && typeof init.headers === "object") reqInit.headers = init.headers;
+            if (init.headers && typeof init.headers === "object") Object.assign(hdrs, init.headers);
             if (init.body != null) reqInit.body = typeof init.body === "string" ? init.body : JSON.stringify(init.body);
           }
+          // Default User-Agent so UA-strict hosts (e.g. GitHub) don't 403; caller can override.
+          if (!Object.keys(hdrs).some((k) => k.toLowerCase() === "user-agent")) {
+            hdrs["User-Agent"] = "montydyn/0.9 (+https://github.com/umgbhalla/montydyn)";
+          }
+          reqInit.headers = hdrs;
           const resp = await fetch(urlObj.toString(), reqInit);
           const headers = {};
           let n = 0;
@@ -1000,7 +1012,10 @@ function normalizeConfig(cfg) {
     cellBudgetMs: Number.isFinite(cfg.cellBudgetMs) && cfg.cellBudgetMs > 0
       ? Math.min(cfg.cellBudgetMs | 0, 60000)
       : 5000,
-    fetch: cfg.fetch === true ? true : Array.isArray(cfg.fetch) ? cfg.fetch : false,
+    // "full allow for now" default: unset -> true (allow all). Explicit false blocks;
+    // an array is a hostname allowlist. (Single-tenant v093; v1.2 supervisor still has its
+    // own per-tenant gateway + deny default for untrusted multi-tenant.)
+    fetch: cfg.fetch === false ? false : Array.isArray(cfg.fetch) ? cfg.fetch : true,
     // V0.9: the sub-LM bridge endpoint (the SDK client stands this up; the model backend lives
     // client-side). host.subLM(prompt,opts) POSTs {prompt,opts} here. A string, else null.
     subLMEndpoint: typeof cfg.subLMEndpoint === "string" ? cfg.subLMEndpoint : null,
