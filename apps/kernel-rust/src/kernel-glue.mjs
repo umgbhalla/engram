@@ -9,6 +9,331 @@
 //     from inside wasip1 (host.fetch -> DO-side fetch with allowlist).
 //
 // The engine ABI (C exports) is documented in engine/src/lib.rs.
+//
+// NOTE: the REPL-persistence transform (transformCell + helpers, below) is INLINED here rather
+// than imported from a sibling .mjs because wasm-bindgen only copies THIS referenced module into
+// the build snippet dir — a sibling import would not resolve at bundle time.
+
+// ============================================================================================
+// REPL-persistence transform — Node-REPL-style top-level-declaration persistence.
+//
+// PROBLEM: the engine evals a no-await statement/declaration cell via indirect global
+// `(0, eval)(src)` (engine/src/lib.rs install_cell, mode 'global'). In QuickJS (and V8),
+// indirect global eval gives top-level `let`/`const`/`class`/`function` declarations their
+// OWN lexical scope — they do NOT become properties of globalThis. So across cells only
+// `var x` and bare `x = …` persisted; `let`/`const`/`function`/`class` vanished.
+//
+// FIX (pre-eval source rewrite, deterministic): scan the cell at brace-depth 0 ONLY, rewrite
+// top-level (depth-0, statement-start) declarations into GLOBAL assignments so the bindings
+// persist — WITHOUT changing the cell's completion value (the last expression still returns).
+//
+// REWRITE (in-place keyword-span edits, body untouched):
+//   * `let X`/`const X`  → DROP the keyword → `X = …` (sloppy indirect eval makes it a GLOBAL).
+//     Handles `let a=1,b=2` (comma sequence) and `const {a,b}=o` / `const [x,,y]=arr` (the
+//     pattern is wrapped in `( … )` so the leading `{` is an object pattern, not a block).
+//     Bare `let x;` → `void(globalThis.x ??= undefined)`.
+//   * `function NAME(…){…}` → `globalThis.NAME = function NAME(…){…};` (named fn EXPRESSION:
+//     NAME stays visible inside for recursion; trailing `;` terminates the expr statement).
+//   * `class NAME …{…}`     → `globalThis.NAME = class NAME …{…};`.
+//
+// SAFETY: a real tiny tokenizer tracks string/template/regex/line+block-comment state and
+// {}()[] depth. We ONLY rewrite at depth 0 at a statement boundary, so `for(let i…)`, a `let`
+// in a nested block/function/arrow, and any keyword inside a string/template/regex/comment are
+// untouched. We BAIL the WHOLE transform (return source UNCHANGED → plain eval) on ANY
+// ambiguity: `async function`, `function*`, `export`, unterminated string/regex, unbalanced
+// braces, or an unparseable declarator. Never corrupts the cell.
+//
+// HOISTING CAVEAT (accepted): rewriting `function f(){}` to an assignment removes the var-hoist,
+// so calling `f()` on a line ABOVE the declaration within the SAME cell no longer works (rare;
+// safer). Cross-cell calls are unaffected.
+
+const __KW = new Set(["let", "const", "function", "class"]);
+function __isIdentStart(c) { return /[A-Za-z_$]/.test(c); }
+function __isIdentPart(c) { return /[A-Za-z0-9_$]/.test(c); }
+
+function transformCell(src) {
+  if (typeof src !== "string" || src.length === 0) return src;
+  if (!/(?:^|[^.\w$])(let|const|function|class)[^\w$]/.test(src)) return src;
+  let edits;
+  try {
+    edits = __planEdits(src);
+  } catch {
+    return src;
+  }
+  if (!edits) return src;
+  if (!edits.length) return src;
+  edits.sort((a, b) => b.at - a.at);
+  let out = src;
+  for (const e of edits) out = out.slice(0, e.at) + e.replacement + out.slice(e.at + e.consume);
+  return out;
+}
+
+function __planEdits(src) {
+  const n = src.length;
+  let i = 0;
+  let depth = 0;
+  let atStmtStart = true;
+  let prev = "start";
+  let pendingAsyncOrExport = false;
+  const edits = [];
+
+  function skipTrivia() {
+    while (i < n) {
+      const c = src[i];
+      if (c === " " || c === "\t" || c === "\r" || c === "\n") i++;
+      else if (c === "/" && src[i + 1] === "/") { i += 2; while (i < n && src[i] !== "\n") i++; }
+      else if (c === "/" && src[i + 1] === "*") { i += 2; while (i < n && !(src[i] === "*" && src[i + 1] === "/")) i++; i += 2; }
+      else break;
+    }
+  }
+
+  while (i < n) {
+    skipTrivia();
+    if (i >= n) break;
+    const c = src[i];
+
+    if (c === '"' || c === "'" || c === "`") {
+      let j = i; if (!__skipString(src, () => j, (v) => (j = v), c)) return null; i = j;
+      prev = "val"; atStmtStart = false; pendingAsyncOrExport = false; continue;
+    }
+
+    if (c === "/") {
+      const regexOk = prev === "start" || prev === "op" || prev === "kw" || prev === "open" ||
+        prev === "comma" || prev === "semi" || prev === "stmt";
+      if (regexOk) {
+        let j = i; if (!__skipRegex(src, () => j, (v) => (j = v))) return null; i = j;
+        prev = "val"; atStmtStart = false; pendingAsyncOrExport = false; continue;
+      }
+      i++; prev = "op"; atStmtStart = false; continue;
+    }
+
+    if (c === "{" || c === "(" || c === "[") { depth++; i++; prev = "open"; atStmtStart = false; pendingAsyncOrExport = false; continue; }
+    if (c === "}" || c === ")" || c === "]") {
+      depth--; if (depth < 0) return null; i++;
+      prev = c === ")" || c === "]" ? "val" : "closebrace";
+      if (depth === 0 && c === "}") atStmtStart = true;
+      pendingAsyncOrExport = false; continue;
+    }
+    if (c === ";") { i++; prev = "semi"; if (depth === 0) atStmtStart = true; pendingAsyncOrExport = false; continue; }
+    if (c === ",") { i++; prev = "comma"; pendingAsyncOrExport = false; continue; }
+
+    if (__isIdentStart(c)) {
+      const start = i;
+      i++;
+      while (i < n && __isIdentPart(src[i])) i++;
+      const word = src.slice(start, i);
+
+      if (depth === 0 && atStmtStart && __KW.has(word)) {
+        if (pendingAsyncOrExport) return null;
+        let j = i;
+        const edit = __handleDeclaration(src, word, start, () => j, (v) => (j = v));
+        i = j;
+        if (!edit) return null;
+        if (edit.edit) edits.push(edit.edit);
+        if (edit.edits) for (const e of edit.edits) edits.push(e);
+        atStmtStart = true; prev = "stmt"; pendingAsyncOrExport = false; continue;
+      }
+
+      if (word === "async" || word === "export") { pendingAsyncOrExport = true; prev = "kw"; atStmtStart = false; continue; }
+      if (["return", "typeof", "instanceof", "in", "of", "new", "delete", "void",
+           "do", "else", "yield", "await", "case", "throw"].includes(word)) prev = "kw";
+      else prev = "val";
+      atStmtStart = false; pendingAsyncOrExport = false; continue;
+    }
+
+    i++; prev = "op"; atStmtStart = false; pendingAsyncOrExport = false;
+  }
+
+  if (depth !== 0) return null;
+  return edits;
+}
+
+function __handleDeclaration(src, kw, kwStart, getI, setI) {
+  const n = src.length;
+  let i = getI();
+
+  function ws() {
+    while (i < n) {
+      const c = src[i];
+      if (c === " " || c === "\t" || c === "\r" || c === "\n") i++;
+      else if (c === "/" && src[i + 1] === "/") { i += 2; while (i < n && src[i] !== "\n") i++; }
+      else if (c === "/" && src[i + 1] === "*") { i += 2; while (i < n && !(src[i] === "*" && src[i + 1] === "/")) i++; i += 2; }
+      else break;
+    }
+  }
+
+  if (kw === "function" || kw === "class") {
+    ws();
+    if (kw === "function" && src[i] === "*") return null;
+    if (!__isIdentStart(src[i])) return null;
+    const ns = i; i++; while (i < n && __isIdentPart(src[i])) i++;
+    const name = src.slice(ns, i);
+    if (!skipToBlockEnd()) return null;
+    const bodyEnd = i;
+    setI(i);
+    return {
+      edits: [
+        { at: kwStart, consume: 0, replacement: `globalThis[${JSON.stringify(name)}] = ` },
+        { at: bodyEnd, consume: 0, replacement: ";" },
+      ],
+    };
+  }
+
+  ws();
+  if (i >= n) return null;
+  const firstNonKw = i;
+  const startsWithPattern = src[i] === "{" || src[i] === "[";
+
+  if (!validateDeclaratorList()) return null;
+  ws();
+  let hadSemi = false;
+  if (src[i] === ";") { i++; hadSemi = true; }
+  setI(i);
+
+  const declText = src.slice(firstNonKw, hadSemi ? i - 1 : i);
+  if (!/=/.test(declText) && !startsWithPattern) {
+    const names = declText.split(",").map((s) => s.trim()).filter(Boolean);
+    if (names.length && names.every((nm) => /^[A-Za-z_$][\w$]*$/.test(nm))) {
+      const body = names.map((nm) => `globalThis[${JSON.stringify(nm)}] ??= undefined`).join(", ");
+      return { edit: { at: kwStart, consume: (hadSemi ? i - 1 : i) - kwStart, replacement: `void(${body})` } };
+    }
+    return null;
+  }
+
+  const declEnd = hadSemi ? i - 1 : i;
+  if (startsWithPattern) {
+    return { edit: { at: kwStart, consume: declEnd - kwStart, replacement: "(" + src.slice(firstNonKw, declEnd) + ")" } };
+  }
+  return { edit: { at: kwStart, consume: firstNonKw - kwStart, replacement: "" } };
+
+  function validateDeclaratorList() {
+    while (true) {
+      ws();
+      if (i >= n) break;
+      const c = src[i];
+      if (c === "{" || c === "[") { if (!skipBalanced()) return false; }
+      else if (__isIdentStart(c)) { i++; while (i < n && __isIdentPart(src[i])) i++; }
+      else return false;
+      ws();
+      if (src[i] === "=") { i++; if (!skipInitializer()) return false; }
+      ws();
+      if (src[i] === ",") { i++; continue; }
+      break;
+    }
+    return true;
+  }
+  function skipBalanced() {
+    const open = src[i];
+    let d = 0;
+    while (i < n) {
+      const c = src[i];
+      if (c === '"' || c === "'" || c === "`") { let j = i; if (!__skipString(src, () => j, (v) => (j = v), c)) return false; i = j; continue; }
+      if (c === "/" && src[i + 1] === "/") { i += 2; while (i < n && src[i] !== "\n") i++; continue; }
+      if (c === "/" && src[i + 1] === "*") { i += 2; while (i < n && !(src[i] === "*" && src[i + 1] === "/")) i++; i += 2; continue; }
+      if (c === "{" || c === "[" || c === "(") { d++; i++; continue; }
+      if (c === "}" || c === "]" || c === ")") { d--; i++; if (d === 0) return true; continue; }
+      i++;
+    }
+    return false;
+  }
+  function skipInitializer() {
+    let d = 0;
+    while (i < n) {
+      const c = src[i];
+      if (c === '"' || c === "'" || c === "`") { let j = i; if (!__skipString(src, () => j, (v) => (j = v), c)) return false; i = j; continue; }
+      if (c === "/" && src[i + 1] === "/") { i += 2; while (i < n && src[i] !== "\n") i++; continue; }
+      if (c === "/" && src[i + 1] === "*") { i += 2; while (i < n && !(src[i] === "*" && src[i + 1] === "/")) i++; i += 2; continue; }
+      if (c === "/") {
+        const pc = prevNonWs();
+        if (pc === "" || "=+-*%&|^!<>?:(,[{~".includes(pc)) { let j = i; if (!__skipRegex(src, () => j, (v) => (j = v))) return false; i = j; continue; }
+        i++; continue;
+      }
+      if (c === "(" || c === "[" || c === "{") { d++; i++; continue; }
+      if (c === ")" || c === "]" || c === "}") { if (d === 0) return true; d--; i++; continue; }
+      if (d === 0 && (c === "," || c === ";")) return true;
+      i++;
+    }
+    return true;
+  }
+  function prevNonWs() {
+    let j = i - 1;
+    while (j >= 0 && /\s/.test(src[j])) j--;
+    return j >= 0 ? src[j] : "";
+  }
+  function skipToBlockEnd() {
+    while (i < n && src[i] !== "{") {
+      const c = src[i];
+      if (c === '"' || c === "'" || c === "`") { let j = i; if (!__skipString(src, () => j, (v) => (j = v), c)) return false; i = j; continue; }
+      if (c === "/" && src[i + 1] === "/") { i += 2; while (i < n && src[i] !== "\n") i++; continue; }
+      if (c === "/" && src[i + 1] === "*") { i += 2; while (i < n && !(src[i] === "*" && src[i + 1] === "/")) i++; i += 2; continue; }
+      i++;
+    }
+    if (src[i] !== "{") return false;
+    let d = 0;
+    while (i < n) {
+      const c = src[i];
+      if (c === '"' || c === "'" || c === "`") { let j = i; if (!__skipString(src, () => j, (v) => (j = v), c)) return false; i = j; continue; }
+      if (c === "/" && src[i + 1] === "/") { i += 2; while (i < n && src[i] !== "\n") i++; continue; }
+      if (c === "/" && src[i + 1] === "*") { i += 2; while (i < n && !(src[i] === "*" && src[i + 1] === "/")) i++; i += 2; continue; }
+      if (c === "{") { d++; i++; continue; }
+      if (c === "}") { d--; i++; if (d === 0) return true; continue; }
+      i++;
+    }
+    return false;
+  }
+}
+
+function __skipString(src, getI, setI, q) {
+  const n = src.length;
+  let i = getI();
+  i++;
+  while (i < n) {
+    const c = src[i];
+    if (c === "\\") { i += 2; continue; }
+    if (q === "`") {
+      if (c === "`") { i++; setI(i); return true; }
+      if (c === "$" && src[i + 1] === "{") {
+        i += 2; let d = 1;
+        while (i < n && d > 0) {
+          const cc = src[i];
+          if (cc === "\\") { i += 2; continue; }
+          if (cc === "{") { d++; i++; continue; }
+          if (cc === "}") { d--; i++; continue; }
+          if (cc === '"' || cc === "'" || cc === "`") { let j = i; if (!__skipString(src, () => j, (v) => (j = v), cc)) return false; i = j; continue; }
+          i++;
+        }
+        continue;
+      }
+      i++;
+    } else {
+      if (c === q) { i++; setI(i); return true; }
+      if (c === "\n") { setI(i); return false; }
+      i++;
+    }
+  }
+  setI(i);
+  return false;
+}
+
+function __skipRegex(src, getI, setI) {
+  const n = src.length;
+  let i = getI();
+  i++;
+  let inClass = false;
+  while (i < n) {
+    const c = src[i];
+    if (c === "\\") { i += 2; continue; }
+    if (c === "[") { inClass = true; i++; continue; }
+    if (c === "]") { inClass = false; i++; continue; }
+    if (c === "/" && !inClass) { i++; break; }
+    if (c === "\n") { setI(i); return false; }
+    i++;
+  }
+  while (i < n && __isIdentPart(src[i])) i++;
+  setI(i);
+  return true;
+}
+// ============================================================================================
 
 // The precompiled engine WebAssembly.Module, exposed on globalThis by entry.mjs
 // (CompiledWasm import — workerd forbids runtime WebAssembly.compile of bytes).
@@ -391,7 +716,13 @@ class GlueKernel {
   async evalCode(src) {
     try {
       const ex = this._ex();
-      const srcBytes = TEXT_ENC.encode(src);
+      // REPL-persistence transform: rewrite top-level let/const/function/class declarations
+      // into global assignments so they persist across cells (Node-REPL semantics), preserving
+      // the completion value. Pure deterministic pre-eval source rewrite; falls back to the
+      // ORIGINAL source on any ambiguity (never corrupts the cell). See src/repl-transform.mjs.
+      let transformed = src;
+      try { transformed = transformCell(src); } catch { transformed = src; }
+      const srcBytes = TEXT_ENC.encode(transformed);
       this._writeScratch(srcBytes);
       // per-cell guards: interrupt-tick budget + per-cell buffer-growth cap (pages).
       // The budget counts INTERRUPT-HANDLER invocations (QuickJS fires the handler
