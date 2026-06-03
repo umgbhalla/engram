@@ -3,13 +3,13 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "dev": "vite",
     "typecheck": "tsc --noEmit",
-    "build": "tsc --noEmit && esbuild src/worker.ts --bundle --format=esm --target=es2022 --loader:.html=text --outfile=dist/worker.mjs",
+    "build": "tsc --noEmit && vite build",
     "deploy": "npm run build && wrangler deploy"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4",
-    "esbuild": "^0.24.0",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "vite": "^6.0.0"
   }
 }

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Engram — durable notebook</title>
+</head>
+<body>
+<header>
+  <h1>Engram</h1>
+  <span class="sub">durable hibernating notebook · rquickjs-Rust kernel</span>
+  <div class="grow"></div>
+  <span class="pill" id="statePill"><span class="dot off" id="stateDot"></span><span id="stateTxt">disconnected</span></span>
+  <span class="pill" id="genPill" title="kernel generation / committed cell">gen –</span>
+</header>
+
+<div class="layout">
+  <main>
+    <div class="toolbar">
+      <button class="primary" id="addCell">+ Cell</button>
+      <button id="runAll">Run all</button>
+      <button id="hibernate" title="force-evict in-memory kernel; durable snapshot kept">Hibernate</button>
+      <button id="reconnect" title="reconnect to the same durable session id">Reconnect</button>
+      <button id="resetSession" title="drop kernel + clear snapshot">Reset</button>
+      <button id="runE2e" title="run the deployed UI-to-kernel acceptance check">Run E2E</button>
+    </div>
+    <div class="e2e out" id="e2eOut" data-status="idle"><span class="log">E2E idle</span></div>
+    <div id="cells"></div>
+  </main>
+
+  <aside>
+    <h3>Session</h3>
+    <label>Kernel endpoint (wss)</label>
+    <input id="cfgEndpoint" value="wss://engram-kernel.umg-bhalla88.workers.dev" />
+    <label>API key (only for engram-cloud; blank for engram-kernel)</label>
+    <input id="cfgApiKey" placeholder="md_… (leave blank for v093)" />
+    <label>Session id (reconnect to restore state)</label>
+    <div class="row">
+      <input id="cfgSession" />
+      <button id="newSession" style="flex:0 0 auto">new</button>
+    </div>
+    <p class="hint">State survives reload — same session id resumes the hibernated heap.</p>
+
+    <h3>Config</h3>
+    <label>Clock</label>
+    <select id="cfgClock"><option value="seeded">seeded (deterministic)</option><option value="real">real</option></select>
+    <label>RNG seed</label>
+    <input id="cfgSeed" value="42" />
+    <label>Stdlib modules (comma, or "true" = default set)</label>
+    <input id="cfgModules" value="true" />
+    <label>Fetch allowlist (comma hosts, "true"=all, "false"=none)</label>
+    <input id="cfgFetch" value="true" />
+    <button id="applyConfig" style="margin-top:10px;width:100%">Apply config (fresh session)</button>
+    <p class="hint">Config is set on session create; apply makes a new session id so it takes effect on a fresh heap.</p>
+  </aside>
+</div>
+
+<script type="module" src="/src/main.ts"></script>
+</body>
+</html>

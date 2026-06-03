@@ -1,11 +1,14 @@
 {
   // engram-ui — the product face: a browser notebook/REPL over the codemode kernel.
-  // A single Worker that serves the SPA. Authored in TypeScript (src/worker.ts); esbuild
-  // inlines src/index.html via the .html text loader and emits the runtime artifact at
-  // dist/worker.mjs (see `npm run build`). The page talks WebSocket directly to the live
-  // engram-kernel (wss://engram-kernel...workers.dev/ws).
+  // Now a Vite + TypeScript SPA (entry index.html → src/main.ts). `npm run build`
+  // emits the static bundle to dist/, served via Cloudflare Workers Assets (no worker
+  // entry needed). The page talks WebSocket directly to the live engram-kernel
+  // (wss://engram-kernel...workers.dev/ws).
   "name": "engram-ui",
-  "main": "dist/worker.mjs",
   "compatibility_date": "2025-05-01",
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "single-page-application"
+  },
   "observability": { "enabled": true }
 }
