@@ -18,6 +18,30 @@
 // The engine ABI (C exports) is documented in engine/src/lib.rs.
 
 import { transformCell } from "./repl-transform.js";
+import tsBlankSpace from "ts-blank-space";
+
+// stripTypes: erase TS type syntax to whitespace (length-preserving, no codegen) so the
+// downstream depth-0 declaration tokenizer in repl-transform.ts still sees the same offsets.
+// Pure host-side source fn — adds NO entropy (determinism + engine-hash unchanged). The optional
+// onError callback fires once per UN-ERASABLE TS construct (enum / namespace / parameter
+// properties); we collect their SyntaxKind numbers and throw so evalCode can reject the cell with
+// a typed TypeScriptError (socket stays alive). On a valid-JS or plain-TS cell this is a near
+// no-op (type annotations -> spaces, which the tokenizer already skips as trivia).
+function stripTypes(src: string): string {
+  const errKinds: number[] = [];
+  const out = tsBlankSpace(src, (node) => {
+    errKinds.push((node as { kind: number }).kind);
+  });
+  if (errKinds.length) {
+    const e = new Error(
+      "un-erasable TypeScript construct(s) (SyntaxKind " + errKinds.join(",") +
+        "); enum / namespace / parameter-properties are not supported"
+    );
+    (e as Error & { name: string }).name = "TypeScriptError";
+    throw e;
+  }
+  return out;
+}
 
 // ---- engine C-ABI export surface (the precompiled rquickjs engine.wasm) ----
 interface EngineExports {
@@ -63,6 +87,7 @@ type HostResult =
 
 interface KernelConfig {
   rngSeed?: number;
+  typescript?: boolean;
   fetch?: boolean | string[];
   modules?: boolean | string[];
   cellBudgetTicks?: number;
@@ -282,6 +307,7 @@ class GlueKernel {
   config: KernelConfig;
   clockSeed: number;
   rngSeed: number;
+  tsEnabled: boolean;
   lastTimings: RestoreTimings;
   _fetchAllow: boolean | string[];
   _lastImage: Uint8Array | null;
@@ -295,6 +321,7 @@ class GlueKernel {
     this.config = {};
     this.clockSeed = 0;
     this.rngSeed = 42;
+    this.tsEnabled = true; // default ON; resolved from config at create/restore
     this.lastTimings = {};
     this._fetchAllow = true; // resolved from config at create/restore
     // W4: the previous committed image, retained host-side (NOT in the VM heap), so the next
@@ -333,6 +360,9 @@ class GlueKernel {
     this.rngSeed = ((cfg.rngSeed ?? 0) >>> 0) || 42;
     // clock seed: seeded sessions start at 0 tick (engine adds the 1.7e12 epoch).
     this.clockSeed = 0;
+    // TypeScript strip: default TRUE (stripping valid JS is a safe near no-op); {typescript:false}
+    // disables. Persisted via configJson across cold restore (same path as clock/rngSeed).
+    this.tsEnabled = cfg.typescript !== false;
     // fetch allowlist: true=all, false=none, [hosts]=hostnames.
     this._fetchAllow = cfg.fetch === undefined ? true : cfg.fetch;
     return cfg;
@@ -519,14 +549,31 @@ class GlueKernel {
   // (host.fetch -> DO-side fetch). Returns the rich JSON result STRING and NEVER throws across
   // the boundary (so the eval mutex is always released).
   async evalCode(src: string): Promise<string> {
+    // TS-STRIP (runs BEFORE transformCell): erase TS type syntax to whitespace. Length-preserving,
+    // so the depth-0 declaration tokenizer in transformCell sees identical offsets. On an
+    // un-erasable construct (enum / namespace / parameter-properties) reject the cell with a typed
+    // TypeScriptError mirroring the eval error envelope — socket alive, mutex released, next eval
+    // works — do NOT crash. Disabled when config {typescript:false}.
+    let tsOut: string;
+    try {
+      tsOut = this.tsEnabled ? stripTypes(src) : src;
+    } catch (e) {
+      const err = e as { name?: string; message?: string };
+      return JSON.stringify({
+        ok: false,
+        valueType: "error",
+        logs: [],
+        error: { name: err.name || "TypeScriptError", message: String(err.message || e), stack: "" },
+      });
+    }
     try {
       const ex = this._ex();
       // REPL-persistence transform: rewrite top-level let/const/function/class declarations into
       // global assignments so they persist across cells (Node-REPL semantics), preserving the
       // completion value. Pure deterministic pre-eval source rewrite; falls back to the ORIGINAL
       // source on any ambiguity (never corrupts the cell). See src/repl-transform.ts.
-      let transformed = src;
-      try { transformed = transformCell(src); } catch { transformed = src; }
+      let transformed = tsOut;
+      try { transformed = transformCell(tsOut); } catch { transformed = tsOut; }
       const srcBytes = TEXT_ENC.encode(transformed);
       this._writeScratch(srcBytes);
       // per-cell guards: interrupt-tick budget + per-cell buffer-growth cap (pages). The budget
