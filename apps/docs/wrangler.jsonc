@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "engram-docs",
+  "compatibility_date": "2025-05-01",
+  // Static-only worker: Starlight builds to ./dist, served by Workers Assets.
+  // No `main` worker entry — pure static asset delivery with clean-URL / SPA fallback.
+  "assets": {
+    "directory": "./dist",
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "404-page"
+  },
+  "observability": { "enabled": true }
+}

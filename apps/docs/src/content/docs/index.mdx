@@ -1,0 +1,52 @@
+---
+title: Engram
+description: A durable, hibernating, multi-tenant JavaScript / TypeScript REPL kernel on Cloudflare. The live interpreter heap is snapshotted to durable storage, so a session sleeps when idle and wakes with full live state — no replay, no re-fired side effects.
+template: splash
+hero:
+  tagline: A durable, hibernating, multi-tenant JavaScript / TypeScript REPL kernel on Cloudflare. The live interpreter heap is snapshotted to durable storage — so a session sleeps when idle and wakes with full live state. No replay. No re-fired side effects.
+  image:
+    file: ../../assets/mark.svg
+  actions:
+    - text: What is Engram
+      link: /overview/what-is-engram/
+      icon: right-arrow
+      variant: primary
+    - text: Live notebook demo
+      link: https://engram-ui.umg-bhalla88.workers.dev
+      icon: external
+      variant: secondary
+    - text: GitHub
+      link: https://github.com/umgbhalla/montydyn
+      icon: github
+      variant: minimal
+---
+
+import { Card, CardGrid } from "@astrojs/starlight/components";
+
+## A Jupyter kernel for the edge
+
+Engram runs untrusted / agent-authored JavaScript in a sandboxed [QuickJS](https://github.com/quickjs-ng/quickjs)
+interpreter compiled to WASM, hosted inside a Cloudflare Durable Object. A session keeps a **live
+interpreter namespace** — variables, closures, pending promises, injected stdlib — that survives
+idle eviction and cold restart **with no replay and no re-fired side effects**, because the entire
+interpreter heap is snapshotted to durable storage and blitted back on wake.
+
+<CardGrid stagger>
+  <Card title="The core bet" icon="rocket">
+    V8 isolates can't hibernate a live heap. **WASM linear memory is a plain `ArrayBuffer`** you
+    can dump and restore. That single property is the whole product.
+    [Read why →](/overview/core-bet/)
+  </Card>
+  <Card title="Durable hibernation" icon="seti:db">
+    Proven across **real 20-minute full evictions, 7/7 cycles, zero state loss**. Cold wake ~1.5s
+    worst case — platform-bound, not our restore. [Durability →](/durability/hibernation/)
+  </Card>
+  <Card title="Use it now" icon="laptop">
+    A typed SDK, a Node-like remote CLI REPL, a browser notebook, and TypeScript cells.
+    [Quick start →](/using/quick-start/)
+  </Card>
+  <Card title="Multi-tenant" icon="puzzle">
+    SupervisorDO with sharded routing, per-session kernel facets with isolated SQLite, per-tenant
+    auth + metering. [Architecture →](/how-it-works/architecture/)
+  </Card>
+</CardGrid>
