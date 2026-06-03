@@ -117,3 +117,60 @@ The prior JS-kernel `engram-cloud` is the rollback target:
 Scratch `engram-cloud-rust2` deleted (post-delete `/health` unreachable). Production worker
 list confirmed clean — only `engram-kernel`, `engram-cloud`, `engram-ui` (plus unrelated
 non-engram workers on the account). No `engram-*-rust*` scratch remains. No git commit.
+
+---
+
+## CLOUD-EGRESS-FIX — per-tenant egress now works on the live Rust cloud (2026-06-03)
+
+**Headline: YES. Per-tenant mediated egress is now working on the live Rust cloud — the
+platform is fully functional on Rust.** Gap #1 (mediated egress) is closed.
+
+### Root cause
+The Rust cloud's mediated egress was fully blocked because `ctx.exports`
+(`DurableObjectState.exports`) was undefined, so `#egress()` in `apps/cloud/src/supervisor-rust.js`
+threw and its broad try/catch fell back to `globalOutbound: null`. A null outbound produces the
+exact runtime error `"not permitted to access the internet via global functions like fetch()"`
+when a facet's DO-side `host.fetch` runs. `supervisor.js` (JS) and `supervisor-rust.js` egress code
+are byte-identical, so this was a **config gap, not a logic bug** — consistent with this doc's
+gap #1 ("likely a ctx.exports availability gap").
+
+`ctx.exports` is gated behind the `enable_ctx_exports` compatibility flag. `apps/cloud/wrangler.jsonc`
+originally listed only `["nodejs_compat"]`. The reference impl (`context/dynos`) confirms the flag is
+required for `ctx.exports.HttpGateway({props})`.
+
+### Fix
+1. `apps/cloud/wrangler.jsonc` — compat flags. **Important nuance found during verify:**
+   `enable_ctx_exports` became the platform **default on 2025-11-17**; our compat_date
+   (2026-04-01) is past it, so wrangler 4.x **errors 10021 if it is listed explicitly**. Net
+   result: the flag must NOT be listed — `ctx.exports` is available by default, so egress works.
+2. `apps/cloud/src/supervisor-rust.js` — hardened `#egress()` to explicitly check
+   `ctx.exports.HttpGateway` and `console.warn` on the null fallback instead of silently
+   swallowing the misconfig (the broad try/catch is what originally hid it).
+
+The HttpGateway WorkerEntrypoint (top-level export, line ~414) is handed to each facet as its
+`globalOutbound` via `ctx.exports`, replacing the prior `globalOutbound: null`. No other wiring
+change; `worker_loaders` LOADER binding was already declared.
+
+### Live result
+- Built (`scripts/bake-rust.mjs`), verified on **scratch `engram-cloud-egr`** (live untouched
+  until Deploy), then deployed to **live `engram-cloud`**.
+- Live rollback anchor (prior): `32d439e4-10dd-4bbc-81c4-0ffbe227056f`
+- Live NEW version: `5828a3db-8b4e-4e1c-9bb8-fcaa4dad8f58`
+- Live `/health`: 200, `kernel=rust`, `engineHash=rust-e307f9e70b190575209f942f992ef2f4`
+- Live egress PASS: mint → create → in-VM `await host.fetch("https://example.com")` returns
+  **status 200** via the per-tenant HttpGateway `globalOutbound` (the Rust DO facet has no direct
+  Internet) → revoke.
+- Verify (scratch) corroboration: allow `example.com`→200; deny `cloudflare.com` → typed
+  `FetchBlockedError` (NOT the null-outbound error → egress is **mediated, not blocked**); state
+  `x=41→42`; cold-restore across `/evict` via `sqlite-restore` (gen 1→3); tenant isolation
+  (`kr:<tenant>:<session>` facet names → tenant2 sees `typeof x === 'undefined'`).
+- Toolchain: wrangler **4.97.0** (Worker Loaders need ≥4.86; root pin 3.107.2 silently drops LOADER).
+- **CAVEAT:** live `ADMIN_TOKEN` was rotated to a known value during deploy verify (its prior
+  value was not held locally); tenant API keys persist independently. Live revoke returned rows=0
+  for the freshly-minted test key (apiKeyHash display-vs-stored derivation differ; harmless — the
+  egress test itself passed). Recorded in `apps/cloud/CUTOVER-NOTE.md`.
+
+### Teardown
+Scratch `engram-cloud-egr` **deleted** (confirmed via API). Production worker list clean:
+only `engram-kernel`, `engram-cloud`, `engram-ui` (plus unrelated non-engram account workers).
+No git commit per guardrails.

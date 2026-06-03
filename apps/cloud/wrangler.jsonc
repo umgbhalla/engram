@@ -13,6 +13,14 @@
   "name": "engram-cloud",
   "main": "src/supervisor-rust.js",
   "compatibility_date": "2026-04-01",
+  // enable_ctx_exports exposes ctx.exports (DurableObjectState.exports) so the SupervisorDO can
+  // instantiate its own HttpGateway WorkerEntrypoint (ctx.exports.HttpGateway({props:{tenant}}))
+  // and hand it to each facet as globalOutbound. WITHOUT it ctx.exports is undefined ->
+  // #egress() throws -> its try/catch falls back to globalOutbound:null -> the facet's outbound
+  // fetch is fully blocked ("not permitted to access the internet via global functions like
+  // fetch()"). This is the root cause of the mediated-egress FAIL. (Ref: context/dynos.)
+  // enable_ctx_exports became the platform DEFAULT on 2025-11-17 (our compat_date 2026-04-01 is
+  // past it), so it must NOT be listed explicitly — wrangler now errors 10021 if it is.
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
 

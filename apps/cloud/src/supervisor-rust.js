@@ -187,11 +187,25 @@ export class SupervisorDO extends DurableObject {
   }
 
   // Per-tenant egress gateway WorkerEntrypoint instance handed to the facet as globalOutbound.
+  // REQUIRES the `enable_ctx_exports` compat flag (see wrangler.jsonc) — without it ctx.exports is
+  // undefined and this falls back to null (fully-blocked egress), the root cause of the prior
+  // mediated-egress FAIL. We surface a console.warn on the fallback so a misconfig is loud, not
+  // silently degraded to "internet blocked".
   #egress(tenant) {
     try {
-      return this.ctx.exports.HttpGateway({ props: { tenant: String(tenant) } });
-    } catch (_) {
-      return null; // older runtime: fully-blocked egress (safe default)
+      const exports = this.ctx && this.ctx.exports;
+      if (!exports || typeof exports.HttpGateway !== "function") {
+        console.warn(
+          "[engram-cloud] ctx.exports.HttpGateway unavailable — mediated egress DISABLED " +
+            "(facet outbound fully blocked). Ensure compat flag `enable_ctx_exports` is set and " +
+            "HttpGateway is a top-level export of supervisor-rust.js.",
+        );
+        return null;
+      }
+      return exports.HttpGateway({ props: { tenant: String(tenant) } });
+    } catch (e) {
+      console.warn("[engram-cloud] #egress() failed; egress blocked:", String((e && e.message) || e));
+      return null; // safe default: fully-blocked egress
     }
   }
 
