@@ -11,6 +11,9 @@ experiments/**            linguist-generated
 **/obs-*.mjs              linguist-generated
 **/bench/**               linguist-generated
 
+# Mermaid sources are authored product docs (NOT generated); the rendered .svg is generated.
+docs/diagrams/*.mmd       -linguist-generated linguist-detectable
+
 # Generated diagrams + required binary delivery artifacts.
 docs/diagrams/*.svg       linguist-generated
 *.wasm                    binary linguist-vendored

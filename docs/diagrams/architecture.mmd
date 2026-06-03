@@ -1,0 +1,56 @@
+%%{init: {"theme":"base","themeVariables":{"background":"#0d1117","primaryColor":"#161b22","primaryTextColor":"#e6edf3","primaryBorderColor":"#3d444d","lineColor":"#9198a1","secondaryColor":"#1f6feb33","tertiaryColor":"#161b22","fontFamily":"Inter, system-ui, sans-serif","fontSize":"14px"}, "flowchart":{"curve":"basis","nodeSpacing":55,"rankSpacing":60,"htmlLabels":true}}}%%
+flowchart TB
+    Client["Client<br/><span style='color:#9198a1'>SDK / CLI / UI</span>"]
+
+    subgraph DO["engram-kernel — Rust DurableObject (workers-rs)"]
+        direction TB
+        Shell["Rust DO<br/><span style='color:#9198a1'>eval mutex · guards · determinism · checkpoint commit-order</span>"]
+
+        subgraph VM["rquickjs VM"]
+            direction TB
+            Engine["rquickjs engine.wasm<br/><span style='color:#9198a1'>QuickJS-ng → wasm32-wasip1</span>"]
+            Mem["Linear memory<br/><span style='color:#9198a1'>live heap = the engram (ArrayBuffer)</span>"]
+            Boot["in-VM JS bootstrap<br/><span style='color:#9198a1'>~30-50 lines · host Proxy + Date trap</span>"]
+            Engine --- Mem
+            Engine --- Boot
+        end
+
+        Snap["Snapshot pipeline<br/><span style='color:#9198a1'>W5+W4+E6 delta stack:<br/>used-heap admission + scrub ·<br/>256B byte-delta · E6 oplog crash-tail + engine-migration</span>"]
+        Shell -->|"eval / restore"| VM
+        VM -->|"dump linear memory"| Snap
+    end
+
+    subgraph Durable["Durable store"]
+        direction TB
+        SQLite[("DO SQLite<br/><span style='color:#9198a1'>chunked rows + manifest · primary store</span>")]
+        R2[("R2: engram-snapshots<br/><span style='color:#9198a1'>overflow only > 2 MB gz</span>")]
+    end
+
+    subgraph Boundary["I/O host boundary"]
+        direction TB
+        Fetch["host.fetch<br/><span style='color:#9198a1'>allowlisted DO-side egress</span>"]
+        Tools["host tools / kv<br/><span style='color:#9198a1'>__hostCall</span>"]
+        Clock["seeded clock / RNG / crypto<br/><span style='color:#9198a1'>determinism externalized</span>"]
+    end
+
+    AE[("Analytics Engine<br/><span style='color:#9198a1'>engram_kernel dataset · per-op metrics</span>")]
+
+    Client <-->|"WebSocket / HTTP"| Shell
+
+    Snap -->|"write / restore chunks"| SQLite
+    Snap -->|"spill / fetch big image"| R2
+
+    VM <-->|"host imports cross boundary"| Boundary
+    Fetch -->|"fetch()"| Net["External network"]
+
+    Shell -.->|"writeDataPoint per op"| AE
+
+    classDef accent fill:#1f6feb33,stroke:#4493f8,stroke-width:2px,color:#e6edf3;
+    classDef store fill:#13261a,stroke:#3fb950,stroke-width:1.5px,color:#e6edf3;
+    classDef obs fill:#2d2114,stroke:#d29922,stroke-width:1.5px,color:#e6edf3;
+    classDef plain fill:#161b22,stroke:#3d444d,color:#e6edf3;
+
+    class Shell,Engine,Mem accent;
+    class SQLite,R2 store;
+    class AE obs;
+    class Client,Boot,Snap,Fetch,Tools,Clock,Net plain;

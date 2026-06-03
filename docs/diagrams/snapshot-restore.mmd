@@ -1,0 +1,70 @@
+%%{init: {"theme":"base","themeVariables":{"background":"#0d1117","primaryColor":"#161b22","primaryTextColor":"#e6edf3","primaryBorderColor":"#3d444d","lineColor":"#9198a1","secondaryColor":"#1f6feb33","tertiaryColor":"#161b22","fontFamily":"Inter, system-ui, sans-serif","fontSize":"14px","actorBkg":"#161b22","actorBorder":"#4493f8","actorTextColor":"#e6edf3","actorLineColor":"#3d444d","signalColor":"#9198a1","signalTextColor":"#e6edf3","labelBoxBkgColor":"#161b22","labelBoxBorderColor":"#3d444d","labelTextColor":"#e6edf3","loopTextColor":"#e6edf3","noteBkgColor":"#1f6feb33","noteTextColor":"#e6edf3","noteBorderColor":"#4493f8","activationBkgColor":"#1f6feb33","activationBorderColor":"#4493f8","sequenceNumberColor":"#0d1117"}}}%%
+sequenceDiagram
+    autonumber
+    actor Client as Client (WS / SDK)
+    participant DO as Rust DurableObject (workers-rs)
+    participant WASM as rquickjs engine.wasm
+    participant Delta as W5+W4+E6 delta stack
+    participant SQL as DO SQLite (chunks + manifest)
+    participant R2 as R2 engram-snapshots
+
+    Note over Client,R2: LIVE SESSION — eval + per-cell snapshot
+
+    Client->>DO: eval(cell)
+    activate DO
+    DO->>WASM: run cell on live linear memory
+    activate WASM
+    WASM-->>DO: result (effects fire ONCE)
+    deactivate WASM
+    Note right of WASM: heap mutated in place — (WASM linear memory is monotonic)
+
+    DO->>Delta: used-heap admission + arena scrub
+    activate Delta
+    Note right of Delta: admit on QuickJS used heap (not raw buffer), scrub freed pages
+    DO->>WASM: dump memory.buffer (+ globals + tables)
+    WASM-->>DO: raw heap image
+    Delta->>Delta: 256B byte-delta vs prior image
+    Delta->>Delta: E6 oplog crash-tail + engine-hash
+    Delta-->>DO: changed chunks only
+    deactivate Delta
+
+    alt image gz <= 2 MB
+        DO->>SQL: write changed ~64KB chunks + manifest (used_heap, kv_json)
+        SQL-->>DO: committed (crash-atomic)
+    else image gz > 2 MB
+        DO->>R2: put full image
+        DO->>SQL: write manifest pointer (r2)
+    end
+    DO-->>Client: {ok, value preview}
+    deactivate DO
+
+    Note over Client,R2: IDLE — DO evicted, in-memory kernel GONE
+
+    rect rgb(31,111,235)
+    Note over DO,WASM: generation N -> N+1 — no source replay
+    end
+
+    Client->>DO: ping / eval (cold wake)
+    activate DO
+    DO->>SQL: read manifest (used_heap, engine-hash, kv_json)
+    SQL-->>DO: manifest
+    Note right of DO: RESTORE guard admits on — recorded used_heap, not raw bytes
+
+    alt manifest -> sqlite
+        DO->>SQL: read chunks
+        SQL-->>DO: chunk rows
+    else manifest -> r2
+        DO->>R2: get image
+        R2-->>DO: image bytes
+    end
+
+    DO->>Delta: reconstruct full image (apply deltas + E6 tail)
+    Delta-->>DO: coherent raw heap image
+    DO->>WASM: new instance + Tier-0 natives at fixed bases
+    activate WASM
+    DO->>WASM: blit memory.buffer (+ globals + tables)
+    Note right of WASM: live state restored, — NO replay, NO re-fired effects
+    WASM-->>DO: ready (sqlite-restore / r2-restore)
+    deactivate WASM
+    DO-->>Client: resumed (gen N+1, state intact)
+    deactivate DO

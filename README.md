@@ -21,7 +21,7 @@ V8 isolates **cannot** hibernate a live kernel — there is no heap-snapshot API
 
 No journaling, no source replay. We literally persist the heap. That single property is the whole product.
 
-<p align="center"><img src="docs/diagrams/architecture.svg" alt="Engram architecture — client → Rust DO shell → JS glue → QuickJS WASM → SQLite/R2, hibernate and resume" width="640"></p>
+<p align="center"><img src="docs/diagrams/architecture.svg" alt="Engram architecture — client → Rust DurableObject (workers-rs) → rquickjs engine.wasm → DO SQLite / R2 via the W5+W4+E6 delta stack, hibernate and resume" width="640"></p>
 
 ---
 
@@ -122,16 +122,18 @@ docs/                                 ── feasibility, ADRs, per-version + re
 
 ## How it works (deeper)
 
-<p align="center"><img src="docs/diagrams/snapshot-restore.svg" alt="Snapshot/restore round-trip between JS glue, QuickJS WASM, and SQLite/R2" width="460"></p>
+<p align="center"><img src="docs/diagrams/snapshot-restore.svg" alt="Snapshot/restore round-trip between the Rust DurableObject, rquickjs engine.wasm, the W5+W4+E6 delta stack, and DO SQLite / R2" width="460"></p>
 
 <p align="center">
-  <img src="docs/diagrams/session-states.svg" alt="Session state machine: created → warm → hibernated → restoring/replaying" width="420">
+  <img src="docs/diagrams/session-states.svg" alt="Session state machine: cold → creating → live (eval/checkpoint) → hibernating → cold-restore (no replay)" width="420">
   &nbsp;&nbsp;
   <img src="docs/diagrams/multi-tenant.svg" alt="Multi-tenant: sessionId → supervisor shard → kernel facets" width="420">
 </p>
 
+> Diagrams are now [Mermaid](https://mermaid.js.org/) — source is the sibling `.mmd` in `docs/diagrams/`; render with `npx @mermaid-js/mermaid-cli -i docs/diagrams/<key>.mmd -o docs/diagrams/<key>.svg -b "#0d1117"`.
+
 ### Snapshot / restore
-1. After a cell evals, glue reads `memory.buffer`, mutable globals, and entropy counters.
+1. After a cell evals, the Rust DurableObject reads `memory.buffer`, mutable globals, and entropy counters from the rquickjs `engine.wasm` instance.
 2. Guard admits on **used heap** (`getMemoryUsage().memoryUsedSize`), not the monotonic buffer size — so a spike-then-free session can still checkpoint.
 3. Image gzipped → SQLite (chunked 64KB rows + manifest) when `<2MB gz`, else R2 overflow. Checkpoint replace is crash-atomic via workerd write-coalescing (raw `BEGIN/COMMIT` is forbidden on DO SQLite).
 4. On wake: new WASM instance, Tier-0 natives re-instantiated at fixed bases, heap bytes blitted back, globals restored. Execution continues mid-namespace.

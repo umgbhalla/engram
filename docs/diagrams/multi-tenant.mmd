@@ -1,0 +1,57 @@
+%%{init: {"theme":"base","themeVariables":{"background":"#0d1117","primaryColor":"#161b22","primaryTextColor":"#e6edf3","primaryBorderColor":"#3d444d","lineColor":"#9198a1","secondaryColor":"#1f6feb33","tertiaryColor":"#161b22","fontFamily":"Inter, system-ui, sans-serif","fontSize":"14px"}, "flowchart":{"curve":"basis","nodeSpacing":55,"rankSpacing":60,"htmlLabels":true}}}%%
+flowchart TB
+    client["Tenant client<br/>(SDK / CLI / UI)<br/>WS + HTTP"]:::accent
+
+    subgraph cloud["engram-cloud  -  multi-tenant supervisor (Worker + DO)"]
+        direction TB
+
+        subgraph sup["SupervisorDO  (64-shard, sharded by session id)"]
+            direction TB
+            route["Routing<br/>session id to facet"]
+            auth["Per-tenant API-key auth"]
+            alarms["Alarms<br/>(idle / TTL / keep-warm)<br/>facets cannot set alarms"]:::durable
+            loaders["worker_loaders<br/>load kernel as wasm module"]
+            wsproxy["WS-hibernation PROXY<br/>supervisor holds socket,<br/>RPCs each frame to facet"]
+            meter["AE metering<br/>per-op data points  +  /usage"]
+        end
+
+        subgraph facets["Per-session KernelFacets  (DO Facets, failure-isolated)"]
+            direction LR
+            kf1["KernelFacet  session A<br/>Rust DurableObject (workers-rs)<br/>eval / snapshot / guards / determinism"]:::accent
+            kf2["KernelFacet  session B<br/>Rust DurableObject (workers-rs)"]:::accent
+        end
+
+        eng1["rquickjs engine.wasm<br/>(QuickJS-ng to wasm32-wasip1)<br/>+ ~40-line in-VM JS bootstrap<br/>(host Proxy + Date trap)"]
+        eng2["rquickjs engine.wasm"]
+
+        sql1[("KernelFacet SQLite  A<br/>own + isolated<br/>W5+W4+E6 delta stack")]:::durable
+        sql2[("KernelFacet SQLite  B<br/>own + isolated")]:::durable
+    end
+
+    aebus[("Analytics Engine<br/>engram_kernel dataset")]:::durable
+    r2[("R2  engram-snapshots<br/>large-image overflow")]:::durable
+
+    client -->|connect / eval| route
+    route --> auth
+    auth -->|valid key| wsproxy
+    auth -. reject .-> client
+    loaders -->|"{wasm} module"| kf1
+    loaders -->|"{wasm} module"| kf2
+    wsproxy -->|RPC per frame| kf1
+    wsproxy -->|RPC per frame| kf2
+    route --> kf1
+    route --> kf2
+
+    kf1 --> eng1
+    kf2 --> eng2
+    kf1 -->|per-cell sync snapshot| sql1
+    kf2 -->|per-cell sync snapshot| sql2
+    sql1 -. ">2MB gz overflow" .-> r2
+    sql2 -. overflow .-> r2
+
+    meter --> aebus
+    kf1 -.->|usage events| meter
+    kf2 -.->|usage events| meter
+
+    classDef accent fill:#1f6feb33,stroke:#4493f8,stroke-width:1.5px,color:#e6edf3;
+    classDef durable fill:#161b22,stroke:#3d444d,stroke-width:1.5px,color:#9198a1,stroke-dasharray:4 3;

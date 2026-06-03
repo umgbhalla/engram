@@ -1,0 +1,86 @@
+%%{init: {"theme":"base","themeVariables":{"background":"#0d1117","primaryColor":"#161b22","primaryTextColor":"#e6edf3","primaryBorderColor":"#3d444d","lineColor":"#9198a1","secondaryColor":"#1f6feb33","tertiaryColor":"#161b22","fontFamily":"Inter, system-ui, sans-serif","fontSize":"14px"}}}%%
+stateDiagram-v2
+    direction TB
+
+    [*] --> Cold
+
+    Cold: Cold
+    note right of Cold
+        No isolate, no WASM instance.
+        DurableObject identity + SQLite persist.
+        engine.wasm not yet instantiated.
+    end note
+
+    Cold --> Creating: create(config)
+
+    Creating: Creating
+    note right of Creating
+        Rust DurableObject (workers-rs) instantiates
+        rquickjs engine.wasm (QuickJS-ng, wasm32-wasip1).
+        In-VM JS bootstrap (host Proxy + Date trap, ~40 lines).
+        config persisted: clock / rngSeed / capture / cellBudget / fetch / tools.
+    end note
+
+    Creating --> Live: instance ready
+
+    state Live {
+        direction TB
+        [*] --> Idle_NS
+        Idle_NS: Live namespace (heap in linear memory)
+        Idle_NS --> Evaluating: eval(cell)
+        Evaluating --> Checkpoint: cell ok
+        Checkpoint --> Idle_NS: snapshot committed
+
+        Evaluating: Evaluating cell
+        note right of Evaluating
+            Rust DO drives eval; effects fire once.
+            TICK-BUDGET TRIPWIRE: interrupt callback
+            decrements per invocation -> typed
+            TimeoutError on runaway loop (socket alive).
+            Mid-cell used-heap tripwire guards alloc bombs.
+        end note
+
+        Checkpoint: Checkpoint (W5+W4+E6 delta stack)
+        note left of Checkpoint
+            SIZE-ADMISSION guard on QuickJS used-heap
+            (memoryUsedSize), not monotonic buffer.
+            W5 used-heap admission + arena scrub.
+            W4 256B byte-delta vs prior image.
+            E6 oplog crash-tail + engine-migration journal.
+            SQLite-first; R2 (engram-snapshots) overflow only.
+        end note
+    }
+
+    Live --> Hibernating: idle evict (WS closed)
+
+    Hibernating: Hibernating
+    note right of Hibernating
+        DO evicted: in-memory namespace + WASM
+        instance gone. Snapshot durable in SQLite
+        (manifest: used_heap, kv_json) / R2 if large.
+        No alarms in-flight (facet constraint).
+    end note
+
+    Hibernating --> ColdRestore: next request (wake)
+
+    ColdRestore: ColdRestore
+    note left of ColdRestore
+        New rquickjs instance; pre-size memory.
+        Tier-0 native extensions re-instantiated at
+        fixed bases, THEN blit WASM linear memory back.
+        RESTORE guard admits on recorded used_heap.
+        NO REPLAY: live state resumes verbatim.
+        kv state + config re-hydrated; generation bumps.
+    end note
+
+    ColdRestore --> Live: state resumed
+
+    Live --> [*]: session deleted
+
+    classDef accent fill:#1f6feb33,stroke:#4493f8,stroke-width:2px,color:#e6edf3;
+    classDef durable fill:#10331f,stroke:#3fb950,stroke-width:2px,color:#e6edf3;
+    classDef guard fill:#3a1d1d,stroke:#f85149,stroke-width:2px,color:#e6edf3;
+
+    class Creating,ColdRestore accent
+    class Hibernating durable
+    class Checkpoint,Evaluating guard
