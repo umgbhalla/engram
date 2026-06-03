@@ -12,7 +12,8 @@
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
-    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
   a { color: var(--accent); }
   header { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
     background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
@@ -20,8 +21,10 @@
   header .sub { color: var(--muted); font-size: 12px; }
   .grow { flex: 1; }
   .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px;
-    border-radius: 999px; font-size: 12px; font-family: var(--mono); border: 1px solid var(--border); }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+    border-radius: 999px; font-size: 12px; font-family: var(--mono); border: 1px solid var(--border);
+    font-variant-numeric: tabular-nums; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted);
+    transition-property: background, box-shadow; transition-duration: .2s; }
   .dot.warm { background: var(--green); box-shadow: 0 0 8px var(--green); }
   .dot.cold { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
   .dot.off { background: var(--red); }
@@ -29,9 +32,11 @@
   @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } aside { display: none; } }
   main { overflow-y: auto; padding: 16px; }
   aside { background: var(--panel); border-left: 1px solid var(--border); overflow-y: auto; padding: 14px; }
-  .cell { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-    margin-bottom: 14px; overflow: hidden; }
-  .cell.running { border-color: var(--accent); }
+  .cell { background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    margin-bottom: 14px; overflow: hidden;
+    box-shadow: 0 1px 2px rgba(0,0,0,.3), 0 4px 12px rgba(0,0,0,.18);
+    transition-property: border-color, box-shadow; transition-duration: .18s; }
+  .cell.running { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent), 0 6px 18px rgba(110,168,254,.18); }
   .cell-head { display: flex; align-items: center; gap: 8px; padding: 6px 10px;
     background: var(--panel2); border-bottom: 1px solid var(--border); font-family: var(--mono); font-size: 11px; color: var(--muted); }
   .cell-head .num { color: var(--accent); }
@@ -45,30 +50,38 @@
   .out .err { color: var(--red); }
   .out .final { color: var(--amber); }
   .meta { font-family: var(--mono); font-size: 10px; color: var(--muted); padding: 4px 10px;
-    border-top: 1px dashed var(--border); }
+    border-top: 1px dashed var(--border); font-variant-numeric: tabular-nums; }
   button { background: var(--panel2); color: var(--fg); border: 1px solid var(--border);
-    border-radius: 7px; padding: 5px 11px; cursor: pointer; font-size: 12px; }
+    border-radius: 8px; padding: 6px 11px; min-height: 32px; cursor: pointer; font-size: 12px;
+    transition-property: border-color, background, scale; transition-duration: .15s;
+    transition-timing-function: cubic-bezier(0.2, 0, 0, 1); }
   button:hover { border-color: var(--accent); }
+  button:active { scale: 0.96; }
   button.primary { background: var(--accent); color: #06121f; border-color: var(--accent); font-weight: 600; }
-  button:disabled { opacity: .5; cursor: default; }
+  button:disabled { opacity: .5; cursor: default; scale: 1; }
+  /* small cell-head controls: keep a ≥40px hit area without bloating the visual */
+  .cell-head button { padding: 2px 7px; min-height: 24px; position: relative; }
+  .cell-head button::after { content: ""; position: absolute; inset: -9px -4px; }
   label { display: block; font-size: 11px; color: var(--muted); margin: 10px 0 3px; text-transform: uppercase; letter-spacing: .5px; }
   input, textarea.cfg, select { width: 100%; background: var(--panel2); color: var(--fg);
-    border: 1px solid var(--border); border-radius: 7px; padding: 6px 8px; font-family: var(--mono); font-size: 12px; }
+    border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px; font-family: var(--mono); font-size: 12px;
+    transition-property: border-color; transition-duration: .15s; }
+  input:focus, textarea:focus, select:focus { border-color: var(--accent); outline: none; }
   textarea.cfg { resize: vertical; }
   .row { display: flex; gap: 8px; align-items: center; }
   .row > * { flex: 1; }
-  h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); margin: 18px 0 6px; border-top: 1px solid var(--border); padding-top: 14px; }
+  h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); margin: 18px 0 6px; border-top: 1px solid var(--border); padding-top: 14px; text-wrap: balance; }
   h3:first-child { border-top: 0; padding-top: 0; }
-  .hint { color: var(--muted); font-size: 11px; }
+  .hint { color: var(--muted); font-size: 11px; text-wrap: pretty; }
   .toolbar { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
-  .e2e { margin-bottom: 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); padding: 10px; }
+  .e2e { margin-bottom: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); padding: 12px; }
   code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; font-family: var(--mono); }
 </style>
 </head>
 <body>
 <header>
   <h1>Engram</h1>
-  <span class="sub">durable hibernating notebook · codemode kernel</span>
+  <span class="sub">durable hibernating notebook · rquickjs-Rust kernel</span>
   <div class="grow"></div>
   <span class="pill" id="statePill"><span class="dot off" id="stateDot"></span><span id="stateTxt">disconnected</span></span>
   <span class="pill" id="genPill" title="kernel generation / committed cell">gen –</span>
@@ -91,7 +104,7 @@
   <aside>
     <h3>Session</h3>
     <label>Kernel endpoint (wss)</label>
-    <input id="cfgEndpoint" value="wss://engram-bench-w4.umg-bhalla88.workers.dev" />
+    <input id="cfgEndpoint" value="wss://engram-kernel.umg-bhalla88.workers.dev" />
     <label>API key (only for engram-cloud; blank for engram-kernel)</label>
     <input id="cfgApiKey" placeholder="md_… (leave blank for v093)" />
     <label>Session id (reconnect to restore state)</label>
@@ -112,18 +125,6 @@
     <input id="cfgFetch" value="true" />
     <button id="applyConfig" style="margin-top:10px;width:100%">Apply config (fresh session)</button>
     <p class="hint">Config is set on session create; apply makes a new session id so it takes effect on a fresh heap.</p>
-
-    <h3>RLM · needle-in-context</h3>
-    <label>Context (the haystack)</label>
-    <textarea class="cfg" id="rlmCtx" rows="5">The quarterly report is dull. Buried on line 9999 the secret access code is ZEBRA-7741. Everything else is filler text about synergy and roadmaps.</textarea>
-    <label>Query</label>
-    <input id="rlmQuery" value="What is the secret access code?" />
-    <div class="row" style="margin-top:8px">
-      <button id="runRlm">run rlm()</button>
-      <button id="runLambda">lambdaRLM()</button>
-    </div>
-    <p class="hint">A regex-grounded client subLM finds the needle across chunks → host.final → FINAL.</p>
-    <div class="out" id="rlmOut"></div>
   </aside>
 </div>
 
@@ -138,7 +139,7 @@
 // ---------------------------------------------------------------------------
 
 const $ = (id) => document.getElementById(id);
-const DEFAULT_ENDPOINT = "wss://engram-bench-w4.umg-bhalla88.workers.dev";
+const DEFAULT_ENDPOINT = "wss://engram-kernel.umg-bhalla88.workers.dev";
 const qs = new URLSearchParams(location.search);
 const LS = {
   get k(){ return localStorage.getItem("md_session"); },
@@ -203,8 +204,6 @@ class Kernel {
   gen() { return this.send({ t: "gen" }); }
   evict() { return this.send({ t: "evict" }); }
   reset() { return this.send({ t: "reset" }); }
-  setContext(name, blob) { return this.send({ t: "setContext", name, blob: String(blob) }); }
-  final() { return this.send({ t: "final" }); }
   close() { if (this.ws) try { this.ws.close(); } catch (_) {} this.ws = null; }
 }
 
@@ -306,99 +305,6 @@ function renderResult(out, r) {
 }
 function esc(s) { return String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
 
-// ---- RLM: cooperative subLM loop over a pasted context ---------------------
-const SUBLM_SHIM = `
-  (() => {
-    globalThis.__subLM_answers = globalThis.__subLM_answers || {};
-    globalThis.__subLM_queue = [];
-    const PENDING = "__SUBLM_PENDING__";
-    const keyOf = (p,o) => { try { return JSON.stringify([p,o||null]); } catch(_) { return String(p); } };
-    globalThis.host = new Proxy(globalThis.host, { get(t,name){
-      if (name === 'subLM') return (prompt,opts) => {
-        const k = keyOf(String(prompt),opts);
-        if (Object.prototype.hasOwnProperty.call(globalThis.__subLM_answers,k)) return Promise.resolve(globalThis.__subLM_answers[k]);
-        globalThis.__subLM_queue.push({ id:k, prompt:String(prompt), opts:opts||null }); throw PENDING; };
-      return t[name];
-    }});
-    globalThis.__subLM_run = (codeStr) => { globalThis.__subLM_queue = [];
-      try { return eval(codeStr); } catch(e){ if (e===PENDING || (e&&e.message===PENDING)) return {__pending:true}; throw e; } };
-    globalThis.__subLM_pending = () => globalThis.__subLM_queue.slice();
-    globalThis.__subLM_fulfill = (a) => { Object.assign(globalThis.__subLM_answers,a); return Object.keys(a).length; };
-    return 'subLM-shim-ready';
-  })()`;
-
-function rootModel(query, contextName) {
-  return `
-    (async () => {
-      const name = ${JSON.stringify(contextName)}, q = ${JSON.stringify(query)};
-      const total = host.ctx.len(name);
-      const chunks = host.ctx.chunk(4000, name);
-      const parts = [];
-      for (const c of chunks) {
-        const text = host.ctx.get(c.i, 4000, name);
-        parts.push(await host.subLM("Query: " + q + "\\n\\nChunk " + c.i + ":\\n" + text, { chunk: c.i }));
-      }
-      const answer = await host.subLM("Query: " + q + "\\n\\nReduce these partials into ONE answer:\\n" + parts.join("\\n---\\n"), { reduce: true });
-      host.final(answer);
-      return { totalChars: total, nChunks: chunks.length };
-    })()`;
-}
-
-// Client-side leaf oracle: a regex-grounded "model" that extracts the answer from a chunk.
-// (No external LLM needed for the needle demo; it grounds on what's literally in the slice.)
-function clientSubLM(query, { prompt }) {
-  // reduce step: pick the first non-"not found" partial
-  if (/Reduce these partials/.test(prompt)) {
-    const lines = prompt.split("\n").filter(l => l && !/^Query:|^Reduce|^---/.test(l));
-    const hit = lines.find(l => !/not found|no code|nothing/i.test(l) && /[A-Z]{2,}-?\d|code|answer/i.test(l));
-    return hit ? hit.trim() : (lines[0] || "not found").trim();
-  }
-  // chunk step: look for a code-like token (the needle), else report not found
-  const m = prompt.match(/\b([A-Z]{3,}-\d{3,}|[A-Z0-9]{4,}-[A-Z0-9]{2,})\b/);
-  if (m) return "Found: the code is " + m[1];
-  return "not found in this chunk";
-}
-
-async function runRlm(useLambda) {
-  const out = $("rlmOut"); out.innerHTML = "<span class='log'>setting context…</span>";
-  const query = $("rlmQuery").value;
-  const ctx = $("rlmCtx").value;
-  try {
-    await kernel.setContext("context", ctx);
-    await kernel.eval(SUBLM_SHIM);
-    await kernel.eval(`globalThis.__subLM_answers={}; globalThis.__subLM_queue=[]; 0`);
-    let subLMCalls = 0, log = [];
-    const code = useLambda
-      ? `(async () => { const r = await globalThis.lambda.lambdaRLM(${JSON.stringify(query)}, { ctx:"context", maxDepth:2, costBudget:16 }); host.final(r.answer); return r; })()`
-      : rootModel(query, "context");
-    if (useLambda) {
-      const has = await kernel.eval("typeof globalThis.lambda === 'object' && typeof globalThis.lambda.lambdaRLM === 'function'");
-      if (!(has.value === true || has.value === "true")) {
-        out.innerHTML = "<span class='err'>lambdaRLM needs the in-VM `lambda` module — Apply config with modules=true (default), fresh session.</span>";
-        return;
-      }
-    }
-    out.innerHTML = "<span class='log'>running RLM loop…</span>";
-    for (let pump = 0; pump < 400; pump++) {
-      await kernel.eval(`globalThis.__subLM_run(${JSON.stringify(code)})`, 120000);
-      const pending = await kernel.eval(`JSON.stringify(globalThis.__subLM_pending())`);
-      let reqs = [];
-      try { reqs = typeof pending.value === "string" ? JSON.parse(pending.value) : (Array.isArray(pending.value) ? pending.value : []); } catch (_) {}
-      if (!reqs.length) break;
-      const answers = {};
-      for (const req of reqs) { subLMCalls++; answers[req.id] = clientSubLM(query, req); }
-      await kernel.eval(`globalThis.__subLM_fulfill(${JSON.stringify(answers)})`);
-    }
-    const fin = await kernel.final();
-    const f = fin.final && fin.final.kind ? fin.final : null;
-    out.innerHTML =
-      `<div class="log">subLM calls: ${subLMCalls}</div>` +
-      (f ? `<div class="final">★ FINAL [${f.kind}]: ${esc(String(f.value))}</div>`
-         : `<div class="err">no FINAL recorded</div>`);
-    refreshState();
-  } catch (e) { out.innerHTML = `<span class='err'>${esc(String(e.message||e))}</span>`; }
-}
-
 // ---- deployed system E2E -----------------------------------------------------
 function e2eLine(cls, s) { return '<div class="' + cls + '">' + esc(s) + '</div>'; }
 function pass(name, detail = "") { return e2eLine("val", "PASS " + name + (detail ? " :: " + detail : "")); }
@@ -481,12 +387,9 @@ $("applyConfig").onclick = async () => {
   kernel.close(); kernel.setConfig(buildConfig()); await kernel.open();
   await kernel.eval("1"); refreshState();
 };
-$("runRlm").onclick = () => runRlm(false);
-$("runLambda").onclick = () => runRlm(true);
-
 // boot — URL params win, then persisted connection, then the deployed candidate default.
 // Examples:
-//   /?endpoint=wss://engram-bench-w4.umg-bhalla88.workers.dev&e2e=1
+//   /?endpoint=wss://engram-kernel.umg-bhalla88.workers.dev&e2e=1
 //   /?endpoint=wss://engram-kernel.umg-bhalla88.workers.dev
 const epFromQuery = queryEndpoint();
 if (epFromQuery) $("cfgEndpoint").value = epFromQuery;
