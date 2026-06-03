@@ -1,3 +1,6 @@
 
 **/.wrangler-dry/
 **/Cargo.lock
+
+engine/vendor/rquickjs/target/
+engine/vendor/**/*.o

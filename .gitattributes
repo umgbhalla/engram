@@ -23,3 +23,6 @@ docs/diagrams/*.svg       linguist-generated
 
 # generated stdlib bundle
 **/stdlib.bundle.txt    linguist-generated
+
+# vendored rquickjs (patched: interrupt-counter 10000->64 for the buffer-growth tripwire)
+apps/kernel/engine/vendor/**    linguist-vendored

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rquickjs = { path = "/Users/umang/hub/zonko/montydyn/experiments/_src/rquickjs", default-features = false, features = ["std", "bindgen"] }
+rquickjs = { path = "vendor/rquickjs", default-features = false, features = ["std", "bindgen"] }
 
 [lib]
 crate-type = ["cdylib"]
