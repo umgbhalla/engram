@@ -26,3 +26,6 @@ docs/diagrams/*.svg       linguist-generated
 
 # vendored rquickjs (patched: interrupt-counter 10000->64 for the buffer-growth tripwire)
 apps/kernel/engine/vendor/**    linguist-vendored
+
+# SDK dist is generated from src/index.ts
+packages/sdk/dist/**    linguist-generated
