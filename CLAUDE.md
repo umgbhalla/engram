@@ -51,7 +51,12 @@ so a session sleeps when idle and wakes with full live state, no replay.
 | `TODO.md` | task board |
 
 **Code map (monorepo — bun workspaces `apps/*` + `packages/*`):**
-`apps/kernel/` = **current kernel** → `engram-kernel` (`src/lib.rs` Rust DO, `src/glue.js` JS glue,
+`apps/kernel-rust/` = **CONVERGENCE kernel (decision B, cutover-ready)** → rquickjs-Rust; glue.js brain
+replaced by Rust (engine/src/lib.rs + lib.rs), ~400-line WASI shim; W5/W4/E6 durability + Tier-0; gate-proven
+(`docs/RUST-FINAL-GATE.md`); deploy = cutover (owner-gated). `apps/kernel/` (JS) stays the live rollback.
+`packages/sdk/` = **@engram/sdk v2** (dev-friendly: typed, auto-reconnect, durable sugar, examples).
+`experiments/` = **frozen proof archive** (JS→Rust journey: expeditions, bake-off, adversarial, gates).
+`apps/kernel/` = current LIVE kernel → `engram-kernel` (`src/lib.rs` Rust DO, `src/glue.js` JS glue,
 `entry.mjs` CompiledWasm wrapper, `wrangler.jsonc`, `stdlib-src/`, `scripts/`).
 `apps/cloud/` = multi-tenant supervisor → `engram-cloud` (`src/supervisor.js`, `vendor/`).
 `apps/ui/` = notebook SPA → `engram-ui`. `packages/sdk/` = `@engram/sdk`, `packages/cli/` = `@engram/cli`.

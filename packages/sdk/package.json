@@ -1,24 +1,26 @@
 {
   "name": "@engram/sdk",
-  "version": "0.9.2",
-  "description": "Configurable codemode / RLM infrastructure over the durable hibernating Engram QuickJS-WASM kernel on Cloudflare.",
-  "keywords": ["engram", "codemode", "rlm", "quickjs", "cloudflare", "durable-object", "repl", "sandbox"],
-  "repository": { "type": "git", "url": "git+https://github.com/umgbhalla/montydyn.git", "directory": "packages/sdk"},
-  "sideEffects": false,
-  "engines": { "node": ">=18" },
+  "version": "2.0.0-rc.0",
+  "description": "Clean, ergonomic TypeScript client for the durable Engram kernel — durable JS REPL sessions over WebSocket (kernel) or HTTP (cloud), with typed results and errors.",
   "type": "module",
-  "main": "index.mjs",
-  "module": "index.mjs",
-  "types": "index.d.ts",
+  "main": "./dist/index.mjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": { "types": "./index.d.ts", "import": "./index.mjs" }
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs"
+    }
   },
-  "files": ["index.mjs", "index.d.ts", "README.md"],
-  "peerDependencies": {
-    "ws": "^8.18.0"
+  "files": ["dist", "src", "README.md"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --format=esm --platform=neutral --target=es2022 --external:node:* --outfile=dist/index.mjs && tsc src/index.ts --declaration --emitDeclarationOnly --outDir dist --target es2022 --moduleResolution bundler --module esnext --lib es2022,dom --skipLibCheck",
+    "smoke": "node sdk-smoke.mjs"
   },
-  "peerDependenciesMeta": {
-    "ws": { "optional": true }
-  },
-  "license": "MIT"
+  "keywords": ["engram", "durable-object", "cloudflare", "repl", "quickjs", "sdk"],
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.21.0"
+  }
 }

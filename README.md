@@ -45,7 +45,8 @@ No journaling, no source replay. We literally persist the heap. That single prop
 | Surface | URL / artifact | Source dir | What |
 |---|---|---|---|
 | Notebook UI | `engram-ui.umg-bhalla88.workers.dev` | `apps/ui/` | zero-dep browser REPL + RLM demo; defaults to engram-kernel |
-| Kernel | `engram-kernel.umg-bhalla88.workers.dev` | `apps/kernel/` | codemode + RLM + hibernation + native backstop + journal |
+| Kernel (live, JS) | `engram-kernel.umg-bhalla88.workers.dev` | `apps/kernel/` | codemode + RLM + hibernation + native backstop + journal |
+| Kernel (Rust, cutover-ready) | — (deploy replaces engram-kernel) | `apps/kernel-rust/` | rquickjs-Rust kernel; glue.js brain → Rust; W5/W4/E6 durability; gate-proven (`docs/RUST-FINAL-GATE.md`) |
 | Cloud (multi-tenant) | `engram-cloud` | `apps/cloud/` | sharded supervisor, per-tenant auth, `/eval`, `/usage` |
 | SDK / CLI | `@engram/sdk`, `engram` | `packages/{sdk,cli}` | **not yet npm-published** (owner-gated) |
 
@@ -95,20 +96,24 @@ node packages/cli/engram.mjs rlm  --context big.txt --q "find the needle"
 
 ```
 README.md / CLAUDE.md (≡ AGENTS.md)   ── source of truth + full context trail
-apps/kernel/                          ── CURRENT kernel (engram-kernel)
-  src/lib.rs        Rust DO shell: SQLite manifest/chunks, ctx store, cell journal
-  src/glue.js       JS glue: eval, snapshot/restore, guards, host boundary, RLM
-  entry.mjs         CompiledWasm wrapper
-  stdlib-src/       lambda-RLM combinators + esbuilt stdlib bundles
-  bench/ scripts/   cold-start harness, deploy/build scripts
-apps/cloud/                           ── multi-tenant SaaS (engram-cloud)
-  src/supervisor.js SupervisorDO + HttpGateway + auth + AE metering + sharding
-  vendor/           vendored quickjs dist + Tier-0 extension .wasm
+apps/kernel/                          ── LIVE kernel (engram-kernel) — JS-glue path, the rollback
+  src/lib.rs        Rust DO shell · src/glue.js  JS brain (eval/snapshot/guards/host/RLM)
+apps/kernel-rust/                     ── CONVERGENCE kernel (cutover-ready, gate-proven) — rquickjs-Rust
+  src/lib.rs        Rust DO shell · engine/src/lib.rs  Rust engine (eval/snapshot/guards/W4 delta)
+  src/kernel-glue.mjs  ~400 lines WASI/DO plumbing only (no business logic)
+apps/cloud/                           ── multi-tenant SaaS (engram-cloud) — bakes the JS kernel
 apps/ui/                              ── notebook SPA (engram-ui)
-packages/sdk/  packages/cli/          ── @engram/sdk, engram CLI
+packages/sdk/                         ── @engram/sdk v2 — dev-friendly: typed, auto-reconnect, examples
+packages/cli/                         ── engram CLI
+tests/{kernel-rust,sdk,kernel,ui}/    ── gate/smoke harnesses (out of app/lib code)
+experiments/                          ── FROZEN proof archive: the JS→Rust journey, every gate/bake-off
 context/                              ── external repos (shallow submodules; see include.md)
-docs/                                 ── feasibility, ADRs, per-version + experiment results
+docs/                                 ── feasibility, ADRs, per-version + research/convergence results
 ```
+
+> **Two kernels coexist:** `apps/kernel` (JS) is what's live; `apps/kernel-rust` (Rust, decision B,
+> `docs/RUST-KERNEL-PLAN.md`) is gate-proven and replaces it on cutover (owner-gated). `experiments/`
+> is the frozen record of how we got here — not built/deployed.
 
 > **Experiments + the v1-facet spike were deleted** once their findings shipped (multi-tenant landed in `apps/cloud`). The proofs live as write-ups in `docs/results/exp-*.md` + `v1-facet-spike.md`; recover the code from git history if ever needed.
 

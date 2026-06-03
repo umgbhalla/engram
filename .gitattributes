@@ -20,3 +20,6 @@ docs/diagrams/*.svg       linguist-generated
 
 # Required binary delivery artifacts (already binary, but be explicit).
 *.wasm                    binary linguist-vendored
+
+# generated stdlib bundle
+**/stdlib.bundle.txt    linguist-generated

@@ -1,0 +1,14 @@
+{
+  "name": "engram-rust1b",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:engine": "node scripts/build-engine.mjs && node scripts/engine-hash.mjs",
+    "deploy": "wrangler deploy",
+    "dry-run": "wrangler deploy --dry-run --outdir=.wrangler-dry"
+  },
+  "//": "ws is a devDependency (live-test client only). worker-build 0.8.3 merges a top-level `dependencies` block into the wasm-bindgen snippet package.json and mis-parses it (see apps/kernel/package.json + docs/results/v0.md) — so NEVER put a `dependencies` key here.",
+  "devDependencies": {
+    "ws": "^8.21.0"
+  }
+}

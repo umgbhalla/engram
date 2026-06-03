@@ -1,118 +1,275 @@
 # @engram/sdk
 
-Configurable **codemode / RLM infrastructure** over the durable, hibernating Engram
-QuickJS-WASM kernel on Cloudflare. Embeds Engram as a code-execution backend for Code Mode
-and Recursive Language Models (RLM).
+A clean, ergonomic TypeScript client for the durable **Engram** kernel — a stateful JavaScript
+REPL on Cloudflare whose live namespace (variables, closures, pending promises) **survives idle
+eviction and cold restart**. No replay, no re-firing side effects.
 
-## Why Engram
+One entry point — `Engram.connect()` — gives you a tiny, well-typed session that:
 
-- `eval` = a durable REPL cell; `execute(code, fns)` = the Cloudflare **Code Mode** contract.
-- The `host.<name>()` boundary = Code Mode's `fns` / rlms' marshaled sub-calls.
-- A genuinely **huge context lives HOST-SIDE** behind `host.ctx.*` handle tools — it never enters
-  the 18 MB QuickJS snapshot envelope; only the slices the model pulls cross into the VM.
-- **Durable hibernation between cells/turns** is the differentiator no other RLM backend has:
-  the context handle + namespace survive evict/cold-restore at ~0 idle cost.
-- **v0.9.1:** the host-side context store is **chunked across DO SQLite rows** (~64 KB each + a
-  manifest count), so a **multi-MB context now survives cold restore** (v0.9 lost contexts
-  > ~1 MB to `SQLITE_TOOBIG`). The recorded RLM `final` is also persisted, so `trajectory()`
-  shows the answer after a reconnect. Single-slice cap raised 256 KB → **1 MB**.
-- **v0.9.2:** two additions.
-  - **Lambda-RLM typed combinators** — `session.lambdaRLM(query, {ctx, split, reduce, maxDepth,
-    costBudget})` runs the lambda-*calculus* RLM (typed `SPLIT`/`MAP`/`REDUCE` + a bounded
-    recursion driver) instead of free-form RLM code. Recursion is bounded by `maxDepth` and total
-    leaf-oracle (`host.subLM`) calls are hard-capped at `costBudget`, so it **provably terminates**
-    and an over-decomposing query is bounded, not blown up. The combinators also live in-VM as
-    `globalThis.lambda.{SPLIT,MAP,REDUCE,lambdaRLM}` (default stdlib module `lambda`).
-  - **Agent code-mode adapter** — `createAgent({endpoint, id, config, tools})` gives an AI agent a
-    **durable per-agent session**: `agent.turn(code) -> {result, logs, toolCalls}`; registered tools
-    are the agent's `host.<name>` surface (mapped to `host_call`); multi-turn state lives in the
-    snapshot and **hibernates between turns** (`agent.hibernate()`), restoring on the next turn.
+- evals code against a **persisted namespace** (`x=1` in one cell, `x` in the next returns `1`);
+- **survives hibernation** (the QuickJS heap is snapshotted to the Durable Object's SQLite and
+  blitted back on wake);
+- **throws typed errors** (`TimeoutError`, `MemoryLimitError`, …) so a runaway cell is a catchable
+  exception, never a crash;
+- auto-detects **kernel (WebSocket)** vs **cloud (HTTP + API key)** from the same call;
+- auto-reconnects with backoff and re-applies config on reconnect.
 
-## Install
+> **API status (honest):** this documents `@engram/sdk` **v2.0.0-rc** as implemented in
+> `src/index.ts`. The core REPL + durability + typed-error surface is **proven live** on the
+> deployed `engram-kernel` (24/24 functional, adversarial-hardened). The higher-level RLM /
+> codemode / agent flows from the v0.9.x SDK are **not** in the v2 core yet — see
+> [Roadmap](#roadmap-not-in-v2-core-yet). Signatures below match the v2 source exactly.
 
-```
-npm i @engram/sdk ws
+---
+
+## 60-second quickstart
+
+```bash
+npm i @engram/sdk
+# Node only — provide a WebSocket implementation:
+npm i ws
 ```
 
-## Quick start
+```ts
+import { Engram } from "@engram/sdk";
 
-```js
-import { connect, EngramExecutor } from "@engram/sdk";
-import WebSocket from "ws"; // Node; browsers use the native WebSocket
+// In Node, pass a WebSocket impl. Browsers use the native one automatically.
+const WebSocket = (await import("ws")).default;
 
-const s = await connect({
-  endpoint: "wss://engram-kernel.<acct>.workers.dev",
-  id: "my-session",
-  config: { clock: "seeded", modules: true, fetch: ["api.example.com"] },
+// 1. Connect (creates the session, or reattaches to the hibernated heap if it exists)
+const s = await Engram.connect({
+  url: "wss://engram-kernel.<acct>.workers.dev",
+  session: "my-session",
+  config: { clock: "seeded" },
   WebSocket,
 });
 
-// 1. REPL / rlms executor
-await s.eval("globalThis.x = 41; x + 1");        // -> { ok, value, valuePreview, logs, error? }
+// 2. Eval against the live namespace
+const r = await s.eval("globalThis.x = 41; x + 1");   // r.value === 42
 
-// 2. Code Mode drop-in
-const ex = new EngramExecutor({ endpoint, id, config, WebSocket });
-const { result, logs } = await ex.execute(
-  "(() => { const n = host.adder(40, 2); return { n }; })()",
-  { adder: (a, b) => a + b },                    // fns injected as host.<name>
-);
+// 3. Durable key/value sugar
+await s.set("note", "hi");
+console.log(await s.get("note"));                      // "hi"
 
-// 3. Context-as-variable — stored HOST-SIDE, read via host.ctx.* in the sandbox
-await s.setContext("context", bigBlob);          // chunked into DO SQLite (survives hibernation)
-//   In-sandbox: host.ctx.{ len(), slice(a,b), grep(re,opts), chunk(size), get(i,size), names() }
+// 4. Prove state survives a full eviction + cold restore
+await s.eval("globalThis.count = 7");
+await s.hibernateThenResume();                         // evict, then cold-restore from snapshot
+console.log((await s.eval("count")).value);            // 7  — survived, NO replay
 
-// 4. The leaf-oracle / sub-LM boundary — the CLIENT supplies the model backend
-s.onSubLM(async ({ prompt, opts }) => myModel.complete(prompt, opts));
-
-// 5. Depth-1 RLM loop, end-to-end
-const r = await s.rlm("summarize the doc", { contextName: "context" });
-//   -> { answer, kind: "FINAL"|"FINAL_VAR"|"EXHAUSTED", steps, subLMCalls, history }
-
-// 6. Lifecycle / durability
-await s.hibernate();                              // force-evict; ~0 idle cost
-await s.resume();                                 // wake-with-state, no replay
-const { cells, final } = await s.trajectory();    // recorded cells + sub-calls + final answer
+s.close();
 ```
 
-## In-sandbox host tools (the `host.<name>()` boundary)
+That `7` is the whole thesis: `count` was never re-initialized. The heap came back from durable
+storage.
 
-| Tool | Purpose |
+---
+
+## Concepts (read once)
+
+- **Session** = one durable kernel instance keyed by `session` id. `connect()` is idempotent:
+  same id → reattach the existing heap; new id → fresh kernel.
+- **eval cell** = one execution against the persisted namespace. The cell's last expression is
+  its value; `await` is allowed. Globals/closures/promises persist between cells.
+- **hibernation** = sleep when idle, wake with full live state. State survives at ~0 idle cost.
+- **typed errors** = a failed cell throws an `EngramError` subclass by default. The Durable
+  Object is never killed; the socket stays alive; the next eval works.
+- **determinism** = `clock:"seeded"` makes `Date.now`/`Math.random` deterministic, so a session
+  is byte-identical across restore. Use `clock:"real"` to opt out.
+
+---
+
+## API reference
+
+### `Engram.connect(options) → Promise<EngramSession>`
+
+Open (or reattach) a durable session. Auto-detects transport: an `apiKey` **and** an
+`http(s)://` url selects the multi-tenant **cloud** (HTTP); otherwise it opens a **WebSocket** to
+the bare kernel.
+
+```ts
+const s = await Engram.connect({ url, session: "s1", config: { clock: "seeded" }, WebSocket });
+```
+
+#### `ConnectOptions`
+
+| option | type | default | meaning |
+|---|---|---|---|
+| `url` | `string` | — (required) | `ws(s)://` kernel, or `http(s)://` cloud. Trailing slashes fine. |
+| `session` | `string` | `"default"` | Durable session id. Same id reattaches the same heap. |
+| `apiKey` | `string` | — | Cloud API key (`x-api-key`). Presence + an `http(s)` url → cloud HTTP path. |
+| `config` | `EngramConfig` | `{}` | In-VM kernel config, applied once at connect, re-applied on reconnect. |
+| `throwOnError` | `boolean` | `true` | Throw a typed `EngramError` on a failed cell. `false` → plain result. |
+| `autoReconnect` | `boolean` | `true` | Reconnect with exponential backoff on transport drop. |
+| `timeoutMs` | `number` | `60000` | Per-request timeout. |
+| `WebSocket` | `ctor` | native | WebSocket impl; Node: `(await import('ws')).default`. |
+| `onConsole` | `(line) => void` | — | Callback for every captured `console.*` line, all cells. |
+
+#### `EngramConfig`
+
+| field | type | meaning |
+|---|---|---|
+| `clock` | `"seeded" \| "real"` | seeded = deterministic `Date`/`Math` (byte-identical snapshots). |
+| `rngSeed` | `number` | seed for the deterministic RNG with `clock:"seeded"`. |
+| `cellBudgetTicks` | `number` | per-cell instruction budget (interrupt invocations). Raise for heavy loops. |
+| `fetch` | `boolean \| string[]` | egress: `false`=block all, `true`=all, `[hosts]`=allowed hostnames. |
+| `modules` | `boolean \| string[]` | in-VM stdlib bundle: `true`=defaults, `[names]`=subset. |
+| `capture` | `boolean` | capture `console.*` per cell (default true). |
+| `[k]` | `unknown` | any other kernel-recognised config key. |
+
+### `session.eval(code, [opts]) → Promise<EvalResult<T>>`
+
+Run one cell against the persisted namespace. `await` is allowed; the last expression is the
+value. Throws a typed `EngramError` on failure unless `throwOnError:false`.
+
+```ts
+const r = await s.eval("[1,2,3].map(x => x*2)");
+// r.ok=true, r.value=[2,4,6] (parsed from the preview), r.valueType="array",
+// r.valuePreview="[ 2, 4, 6 ]", r.console=[], r.cell=N, r.checkpoint={...}
+```
+
+`opts`: `{ throwOnError?, timeoutMs? }` — per-call overrides.
+
+`EvalResult<T>`:
+
+| field | type | meaning |
+|---|---|---|
+| `ok` | `boolean` | `true` if the cell completed without throwing. |
+| `value` | `T` | the completion value. Objects/arrays are **parsed back** from the kernel preview. |
+| `valuePreview` | `string?` | util.inspect-style preview (always present for non-primitives). |
+| `valueType` | `string?` | `"number"`/`"string"`/`"object"`/`"array"`/`"error"`/… |
+| `console` | `ConsoleLine[]` | `{ level, text }` lines captured during the cell. |
+| `error` | `{ name, message, stack? }?` | present when `ok===false`. |
+| `checkpoint` | `Checkpoint?` | the durable snapshot committed after this cell. |
+| `cell` | `number?` | monotonic cell index. |
+
+`Checkpoint`: `{ ok, cell?, store?: "sqlite"|"r2", sizeGz?, sizeRaw?, usedHeap? }`.
+
+### Durable key/value sugar
+
+Ergonomic helpers over the persisted namespace (stored under a `globalThis.__kv` map, so they
+survive hibernation like any other global).
+
+| method | meaning |
 |---|---|
-| `host.ctx.len([name])` | length of the host-side context (chars) |
-| `host.ctx.slice(a,b,[name])` | substring (capped at 1 MB / call) |
-| `host.ctx.grep(re,[opts],[name])` | `[{i, match, line}]`; opts `{flags, max}` |
-| `host.ctx.chunk(size,[name])` | `[{i,start,end,len}]` chunk **descriptors** (not bytes) |
-| `host.ctx.get(i,size,[name])` | the i-th `size`-char chunk's text |
-| `host.ctx.names()` | stored context names |
-| `host.subLM(prompt,opts)` | async sub-LM call → the client's model backend |
-| `host.final(value)` / `host.finalVar(name)` | record the RLM answer |
-| `host.kv.*`, `host.fetch`, `host.echo/add/now` | v0.8 host tools (unchanged) |
+| `session.set(key, value)` | store a JSON-serialisable value under `key`. |
+| `session.get<T>(key)` | read it back; `undefined` if absent. |
 
-## Sub-LM orchestration (honest)
+```ts
+await s.set("user", { id: 7, name: "ada" });
+const u = await s.get<{ id: number; name: string }>("user"); // { id: 7, name: "ada" }
+```
 
-`rlm()` is **SDK-orchestrated**: the kernel is remote, so it never calls back to your machine.
-The SDK installs a cooperative `host.subLM` shim that **queues** prompts; the SDK drains the queue
-through your `onSubLM` model backend client-side, feeds the completions back into the VM, and
-re-runs the cell until `host.final` fires. Deterministic prompt order is required (the RLM
-scaffold computes prompts from the context handle + prior answers, which is deterministic).
+### Lifecycle / durability
 
-For a **co-located** embedding (SDK and kernel in the same trust boundary, with a publicly
-reachable `config.subLMEndpoint`), `host.subLM` also works as a direct async `fetch` to that
-endpoint — the SDK stands up a local bridge automatically when you call `execute`/`rlm` with a
-reachable endpoint.
+| method | returns | meaning |
+|---|---|---|
+| `session.status()` | `Promise<{ generation?, inMemory?, … }>` | liveness + generation probe. |
+| `session.evict()` | `Promise<void>` | force-evict the in-memory kernel; snapshot kept. |
+| `session.hibernateThenResume()` | `Promise<{ restoreSource?, generation? }>` | evict, then touch to force a **cold restore** from the snapshot; returns the restore source (`"sqlite-restore"`/`"r2-restore"`). |
+| `session.reset()` | `Promise<void>` | clear the namespace, drop the snapshot, fresh epoch. |
+| `session.close()` | `void` | close the transport (the durable session persists server-side). |
 
-## Adapters
+```ts
+const { restoreSource, generation } = await s.hibernateThenResume();
+// restoreSource === "sqlite-restore", generation bumped => genuinely reconstructed
+```
 
-- `EngramExecutor` — Cloudflare Code Mode executor: `execute(code, fns) -> {result, error?, logs}`.
-  Usable with `createCodeTool({ executor: new EngramExecutor(...) })`.
-- `EngramEnv` — rlms-style environment adapter: `run(code)`, `setContextVar(name, value)`,
-  `installDeps(modules)`.
+---
 
-## Caveats
+## Typed-error table
 
-- JS, not Python — not drop-in for the existing rlms / RLM-Qwen3-8B Python corpus.
-- Hibernation is **between cells/turns**, not mid-flight during a sub-LM call.
-- An async-IIFE whose completion value is an object previews as `{}` (a kernel unwrap limitation);
-  prefer a synchronous return or `host.final` for rich results.
-- Single oversized boundary copies are capped (`host.ctx.slice` 1 MB) to avoid a recoverable
-  WS-1006 from one huge native allocation. The host-side store itself is unbounded by this cap.
+By default `eval` **throws** a typed `EngramError` subclass on a failed cell. All are exported,
+so you can `instanceof`-match them. **The cell is always recoverable: the socket stays alive and
+the next eval works** — this is the kernel's hardening guarantee.
+
+```ts
+import { TimeoutError, MemoryLimitError, FetchBlockedError, SizeAdmissionError } from "@engram/sdk";
+try {
+  await s.eval("while (true) {}");
+} catch (e) {
+  if (e instanceof TimeoutError) { /* … */ }
+}
+```
+
+| class | `name` | When it throws | Recoverable? |
+|---|---|---|---|
+| `TimeoutError` | `"TimeoutError"` | Cell exceeds the instruction/tick budget (e.g. `while(true){}`). | ✅ next eval works |
+| `MemoryLimitError` | `"MemoryLimitError"` | Cell grows WASM linear memory past the per-cell/absolute cap (alloc bomb / fast array growth — the buffer-growth tripwire catches even native bombs). | ✅ socket alive |
+| `FetchBlockedError` | `"FetchBlockedError"` | `host.fetch(url)` to a host not on `config.fetch`. | ✅ |
+| `SizeAdmissionError` | `"SizeAdmissionError"` | The heap is too large to snapshot (over the ~18 MB dump ceiling). | ✅ clean reject; `reset()` recovers |
+| `EngramError` (base) | kernel name or `"EngramError"` | Any other failed cell (ordinary `TypeError`/`ReferenceError`/…) or a transport fault. | ✅ (cell) / thrown (transport) |
+
+Every `EngramError` carries `.kernelStack` (the kernel stack, when present) and `.result` (the
+full `EvalResult` that produced it, for inspection).
+
+**Transport faults** (`"request timed out"`, `"connection closed before reply"`,
+`"malformed kernel reply"`, `"No WebSocket available…"`) are also `EngramError`, thrown
+regardless of `throwOnError`. With `autoReconnect:true` (default) a dropped socket is reconnected
+(exponential backoff, ≤2s) and the request retried once before surfacing.
+
+Pass `throwOnError:false` (in `connect` or per `eval`) to get `{ ok:false, error }` back instead
+of an exception.
+
+---
+
+## kernel vs cloud usage
+
+The same SDK, the same `EngramSession` surface. Only the `url` + `apiKey` change; `connect`
+auto-detects the transport.
+
+| | `engram-kernel` (direct) | `engram-cloud` (multi-tenant SaaS) |
+|---|---|---|
+| `url` | `wss://engram-kernel.<acct>.workers.dev` | `https://engram-cloud.<acct>.workers.dev` |
+| transport | WebSocket (`/ws?id=`) | HTTP REST (`/configure`,`/eval`,`/status`,`/evict`) — or WS `/connect` if you pass a `ws(s)` url **with** a key |
+| auth | none (front it yourself) | **per-tenant API key** (`apiKey`, sent as `x-api-key`) |
+| isolation | one DO per `session` | per-session **facet** with its own SQLite, failure-isolated |
+| metering | — | AE metering + `GET /usage` per tenant |
+| `reset()` | true reset | maps to `evict` (HTTP has no first-class reset; snapshot kept) |
+| use when | trusted single-tenant, lowest latency | many tenants, billing, hard isolation |
+
+```ts
+// Direct kernel (WebSocket)
+const k = await Engram.connect({ url: "wss://engram-kernel…", session: "s1", WebSocket });
+
+// Cloud (HTTP + API key) — same surface
+const c = await Engram.connect({ url: "https://engram-cloud…", apiKey: "ek_live_…", session: "s1" });
+```
+
+Both honor the same `config`, the same typed errors, and the same durability semantics. On the
+HTTP cloud path, `eval` source is sent as a query param and the rich error/console fields are
+normalized identically.
+
+---
+
+## Gotchas (honest)
+
+- **Objects/arrays come back parsed.** The kernel sends rich values as a JSON preview string;
+  the SDK parses them into `value` for you, with the human form on `valuePreview`. A preview that
+  can't round-trip (e.g. an async-IIFE whose completion is an object previews as `{}`) is a known
+  kernel limitation — prefer a synchronous return, a top-level `await` expression, or `set`/`get`.
+- **Hibernation is *between* cells**, not mid-cell.
+- **Snapshot envelope ≈ 18 MB.** Keep big data out of the heap. A buffer-growth bomb makes that
+  session's later checkpoints `SizeAdmissionError` (WASM memory is monotonic) until `reset()` —
+  the DO is never killed.
+- **`reset()` over the cloud HTTP path maps to `evict`** (snapshot kept), not a true wipe.
+
+---
+
+## Roadmap (not in v2 core yet)
+
+The v0.9.x SDK (`packages/sdk`, `@engram/sdk@0.9.x`) carries higher-level flows the v2 core does
+not yet expose: `execute(code, fns)` (Code Mode), host-side big context (`setContext` +
+`host.ctx.*`), the depth-1 `rlm()` loop, the provably-terminating `lambdaRLM()`, and the durable
+`createAgent()` code-mode adapter. The v2 plan (`docs/RUST-KERNEL-PLAN.md`) folds these onto the
+Rust kernel; they will return as v2 layers on top of this clean core. Until then, use
+`@engram/sdk@0.9.x` for those, or build them on `eval` (the host boundary is identical).
+
+## Why Engram
+
+See [`WHY-ENGRAM.md`](./WHY-ENGRAM.md) — the one-page dev pitch.
+
+## Runnable examples
+
+See [`examples/`](./examples/): `hello-eval`, `durable-counter`, `rlm-needle`, `agent-codemode`,
+`streaming-console`, `error-handling`. Each is a self-contained `.mjs` — set `ENGRAM_ENDPOINT`
+and run with `node`.
