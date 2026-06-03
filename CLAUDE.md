@@ -51,21 +51,18 @@ so a session sleeps when idle and wakes with full live state, no replay.
 | `TODO.md` | task board |
 
 **Code map (monorepo — bun workspaces `apps/*` + `packages/*`):**
-`apps/kernel-rust/` = **CONVERGENCE kernel (decision B, cutover-ready)** → rquickjs-Rust; glue.js brain
-replaced by Rust (engine/src/lib.rs + lib.rs), ~400-line WASI shim; W5/W4/E6 durability + Tier-0; gate-proven
-(`docs/RUST-FINAL-GATE.md`); deploy = cutover (owner-gated). `apps/kernel/` (JS) stays the live rollback.
-`packages/sdk/` = **@engram/sdk v2** (dev-friendly: typed, auto-reconnect, durable sugar, examples).
-`experiments/` = **frozen proof archive** (JS→Rust journey: expeditions, bake-off, adversarial, gates).
-`apps/kernel/` = current LIVE kernel → `engram-kernel` (`src/lib.rs` Rust DO, `src/glue.js` JS glue,
-`entry.mjs` CompiledWasm wrapper, `wrangler.jsonc`, `stdlib-src/`, `scripts/`).
-`apps/cloud/` = multi-tenant supervisor → `engram-cloud` (`src/supervisor.js`, `vendor/`).
-`apps/ui/` = notebook SPA → `engram-ui`. `packages/sdk/` = `@engram/sdk`, `packages/cli/` = `@engram/cli`.
-`tests/{kernel,ui}/` = smoke/obs/bench harnesses (out of app/lib code).
-`scripts/deploy.ts` = deploy driver; root `package.json` has `deploy:{kernel,cloud,ui,all}`.
-Experiments + v1-facet spike **deleted** (findings: `docs/results/exp-*.md`, `v1-facet-spike.md`; code in git history).
-Older kernels `v0`→`v0.8` + version-named dirs were **pruned/renamed** — recover from git history or
-`v0.N-milestone` tags. `context/` = external repos (shallow submodules; `context/include.md` indexes them).
-Provenance below references old `v0.9.3/`/`v1.2/`/`ui/` paths = now `apps/kernel`/`apps/cloud`/`apps/ui`.
+`apps/kernel/` = **THE kernel** → `engram-kernel` — **rquickjs-Rust** (decision B, cut over + live).
+The hand-written JS brain is gone; eval/snapshot/guards/determinism/W5+W4+E6-durability/Tier-0 all in
+Rust (`engine/src/lib.rs` + `src/lib.rs`), ~400-line `src/kernel-glue.mjs` WASI/DO plumbing only.
+`apps/cloud/` = multi-tenant supervisor → `engram-cloud` — **Rust facets** (`src/supervisor-rust.js`,
+per-session Rust kernel via `{wasm}` Worker-Loader modules; `bake-rust.mjs` bakes from `apps/kernel`).
+`apps/ui/` = notebook SPA → `engram-ui`. `packages/sdk/` = **@engram/sdk v2** (strict TS, typed,
+auto-reconnect, durable sugar, examples). `packages/cli/` = `engram` CLI.
+`tests/{kernel-rust,sdk,...}/` = gate/smoke harnesses. `experiments/` = **frozen proof archive**
+(the JS→Rust journey: expeditions, bake-off, adversarial, gates — not built/deployed).
+Convergence docs: `RUST-KERNEL-PLAN.md` → `RUST-FINAL-GATE.md` → `PLATFORM-ON-RUST.md`. JS rollback in
+CF version history (kernel 85c12806 · cloud c06a77a1). `context/` = external ref submodules.
+Older `v0.x`/version dirs pruned (git history + `v0.N-milestone` tags).
 
 **Workflow history** (background multi-agent runs, for provenance):
 `wkfcx55zi` feasibility research · `wnf82p8o5` EXP-6/7/8/9/4b · `ws0na8tg4` V0 build ·

@@ -576,3 +576,6 @@ export const Engram = {
 };
 
 export default Engram;
+
+/** Convenience: bare {@link Engram.connect}. */
+export const connect = Engram.connect;
