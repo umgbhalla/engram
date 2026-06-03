@@ -1,11 +1,11 @@
 // TRACK B — bake the RUST kernel into the supervisor as Worker-Loader facet modules.
 //
-// THE CONVERGENCE: the live engram-kernel is now Rust (apps/kernel-rust: a Rust DO compiled
+// THE CONVERGENCE: the live engram-kernel is now Rust (apps/kernel: a Rust DO compiled
 // to wasm32-unknown-unknown via wasm-bindgen/worker-build = build/index.js + build/index_bg.wasm,
 // PLUS the rquickjs engine.wasm = src/engine.wasm). The JS-kernel cloud baked glue.js + a JS
 // facet DO class. Here we instead deliver the Rust DO class into the facet.
 //
-// KEY FEASIBILITY FACTS (verified against apps/kernel-rust/build/index.js):
+// KEY FEASIBILITY FACTS (verified against apps/kernel/build/index.js):
 //   - index.js (the wasm-bindgen glue) is plain JS and EXPORTS `KernelDO` (the DO class) and a
 //     default WorkerEntrypoint. It can be a Worker-Loader {js} module.
 //   - It instantiates BOTH wasm via `new WebAssembly.Instance(Module, imports)` — i.e. from a
@@ -28,7 +28,7 @@ import { dirname, join } from "node:path";
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
 const src = join(root, "src");
-const kernelRust = join(root, "..", "..", "apps", "kernel-rust");
+const kernelRust = join(root, "..", "..", "apps", "kernel");
 
 // The Rust DO wasm-bindgen glue + its bg-wasm (worker-build output).
 const indexJs = readFileSync(join(kernelRust, "build", "index.js"), "utf8");
@@ -45,7 +45,7 @@ const stdlibBundleTxt = readFileSync(join(src, "stdlib.bundle.txt"), "utf8");
 let stdlibMeta;
 try {
   stdlibMeta = readFileSync(join(kernelRust, "src", "stdlib-meta.js"), "utf8");
-  // kernel-rust ships stdlib-meta.js as an ESM exporting STDLIB_META; make it set the global.
+  // kernel ships stdlib-meta.js as an ESM exporting STDLIB_META; make it set the global.
   const m = stdlibMeta.match(/STDLIB_META\s*=\s*([\s\S]*?);?\s*export/);
   if (m) stdlibMeta = `globalThis.__STDLIB_META = ${m[1]};\n`;
 } catch (_) {

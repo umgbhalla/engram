@@ -1,19 +1,14 @@
 {
-  "name": "@engram/kernel-app",
+  "name": "engram-rust1b",
   "private": true,
   "type": "module",
-  "//": "quickjs-wasi is a devDependency, NOT a dependency: worker-build 0.8.3 merges `dependencies` into the wasm-bindgen snippet package.json and then mis-parses it. esbuild resolves it from node_modules regardless. See docs/results/v0.md. v0.6: esbuild + the curated in-VM stdlib libs are ALSO devDependencies — they are bundled into src/stdlib.bundle.js at build time and shipped as a wrangler Text module; they are never imported by the worker itself.",
+  "scripts": {
+    "build:engine": "node scripts/build-engine.mjs && node scripts/engine-hash.mjs",
+    "deploy": "wrangler deploy",
+    "dry-run": "wrangler deploy --dry-run --outdir=.wrangler-dry"
+  },
+  "//": "ws is a devDependency (live-test client only). worker-build 0.8.3 merges a top-level `dependencies` block into the wasm-bindgen snippet package.json and mis-parses it (see apps/kernel/package.json + docs/results/v0.md) — so NEVER put a `dependencies` key here.",
   "devDependencies": {
-    "@engram/sdk": "workspace:*",
-    "binaryen": "^129.0.0",
-    "quickjs-wasi": "3.0.0",
-    "ws": "^8.18.0",
-    "esbuild": "^0.24.0",
-    "lodash-es": "^4.17.21",
-    "dayjs": "^1.11.13",
-    "nanoid": "^5.0.9",
-    "uuid": "^11.0.5",
-    "zod": "^3.24.1",
-    "mathjs": "^12.4.3"
+    "ws": "^8.21.0"
   }
 }

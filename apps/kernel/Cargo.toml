@@ -1,5 +1,5 @@
 [package]
-name = "montydyn-v05"
+name = "engram-rust"
 version = "0.1.0"
 edition = "2021"
 
@@ -9,8 +9,7 @@ crate-type = ["cdylib"]
 [dependencies]
 worker = { version = "0.8" }
 worker-macros = { version = "0.8" }
-# Pin to 0.2.121: worker-build 0.8.3 expects this exact wasm-bindgen; 0.2.122's
-# snippet package.json format breaks its parser (`invalid type: map, expected a string`).
+# Pin to 0.2.121: worker-build 0.8.3 expects this exact wasm-bindgen.
 wasm-bindgen = "=0.2.121"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
