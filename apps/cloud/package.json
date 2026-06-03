@@ -4,22 +4,26 @@
   "type": "module",
   "scripts": {
     "build:stdlib": "node scripts/build-stdlib.mjs",
-    "bake": "node scripts/build-stdlib.mjs && node scripts/bake-modules.mjs",
-    "deploy": "npm run bake && wrangler deploy"
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p scripts/tsconfig.json",
+    "build": "node scripts/build.mjs",
+    "deploy": "wrangler deploy"
   },
   "comments": {
     "vendor-provenance": "quickjs-wasi@3.0.0 + binaryen are pinned to DOCUMENT/VERIFY the vendored bytes under vendor/ (see vendor/PROVENANCE.json + docs/provenance.md). They are NOT used to derive: cloud ships RAW quickjs.wasm and deriving via wasm-opt -Oz would byte-change the engine and invalidate every live snapshot (EngineHashMismatchError). binaryen pinned to match apps/kernel."
   },
   "devDependencies": {
-    "quickjs-wasi": "3.0.0",
+    "@cloudflare/workers-types": "^4.20260603.1",
+    "@types/node": "^25.9.1",
     "binaryen": "129.0.0",
+    "dayjs": "^1.11.13",
     "esbuild": "^0.24.0",
     "lodash-es": "^4.17.21",
-    "dayjs": "^1.11.13",
-    "nanoid": "^5.0.9",
-    "uuid": "^11.0.5",
-    "zod": "^3.24.1",
     "mathjs": "^12.4.3",
-    "ws": "^8.18.0"
+    "nanoid": "^5.0.9",
+    "quickjs-wasi": "3.0.0",
+    "typescript": "^6.0.3",
+    "uuid": "^11.0.5",
+    "ws": "^8.18.0",
+    "zod": "^3.24.1"
   }
 }

@@ -8,11 +8,15 @@
   "observability": { "enabled": true },
 
   // Build pipeline:
-  //   1. build the rquickjs ENGINE (wasm32-wasip1) + copy to src/engine.wasm.
-  //   2. SHA-256 the engine wasm into src/engine-hash.js.
-  //   3. worker-build --release — compile the Rust DO shell.
+  //   1. tsc --noEmit — typecheck the authored TS (kernel-glue / repl-transform / entry / stdlib-meta).
+  //   2. esbuild — bundle src/kernel-glue.ts -> src/kernel-glue.mjs (repl-transform inlined) and
+  //      entry.ts -> entry.mjs (engine.wasm / stdlib.bundle.txt / engine-hash.js / shim external),
+  //      preserving the exact module exports worker-build + lib.rs #[wasm_bindgen(module=...)] expect.
+  //   3. build the rquickjs ENGINE (wasm32-wasip1) + copy to src/engine.wasm.
+  //   4. SHA-256 the engine wasm into src/engine-hash.js (AFTER esbuild, which keeps it external).
+  //   5. worker-build --release — compile the Rust DO shell (reads src/kernel-glue.mjs).
   "build": {
-    "command": "node scripts/build-engine.mjs && node scripts/engine-hash.mjs && worker-build --release"
+    "command": "bun x tsc -p tsconfig.json && node scripts/build-ts.mjs && node scripts/build-engine.mjs && node scripts/engine-hash.mjs && worker-build --release"
   },
 
   // engine.wasm bundled as CompiledWasm => importable as a precompiled WebAssembly.Module

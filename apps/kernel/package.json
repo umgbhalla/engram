@@ -9,6 +9,7 @@
   },
   "//": "ws is a devDependency (live-test client only). worker-build 0.8.3 merges a top-level `dependencies` block into the wasm-bindgen snippet package.json and mis-parses it (see apps/kernel/package.json + docs/results/v0.md) — so NEVER put a `dependencies` key here.",
   "devDependencies": {
+    "@cloudflare/workers-types": "^4",
     "ws": "^8.21.0"
   }
 }

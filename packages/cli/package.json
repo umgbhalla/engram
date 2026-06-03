@@ -1,13 +1,25 @@
 {
   "name": "@engram/cli",
   "version": "0.9.0",
-  "description": "CLI for the durable Engram codemode/RLM kernel: configurable REPL + depth-1 RLM loop.",
+  "description": "CLI for the durable Engram codemode/RLM kernel: configurable durable REPL.",
   "type": "module",
-  "bin": { "engram": "engram.mjs" },
-  "files": ["engram.mjs", "README.md"],
+  "bin": {
+    "engram": "bin/engram.mjs"
+  },
+  "files": ["bin", "src", "README.md"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && esbuild src/engram.ts --bundle --platform=node --format=esm --target=node18 --packages=external --outfile=bin/engram.mjs"
+  },
   "dependencies": {
     "@engram/sdk": "workspace:*",
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/ws": "^8.18.1",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.7.2"
   },
   "license": "MIT"
 }

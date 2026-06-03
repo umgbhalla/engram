@@ -7,3 +7,7 @@ engine/vendor/**/*.o
 
 src/engine-hash.js
 src/engine.wasm
+
+# esbuild outputs (generated from the authored TS by scripts/build-ts.mjs)
+entry.mjs
+src/kernel-glue.mjs

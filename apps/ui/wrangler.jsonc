@@ -1,12 +1,11 @@
 {
   // engram-ui — the product face: a browser notebook/REPL over the codemode kernel.
-  // A single Worker that serves the SPA (HTML embedded as a Text module). The page talks
-  // WebSocket directly to the live engram-kernel (wss://engram-kernel...workers.dev/ws).
+  // A single Worker that serves the SPA. Authored in TypeScript (src/worker.ts); esbuild
+  // inlines src/index.html via the .html text loader and emits the runtime artifact at
+  // dist/worker.mjs (see `npm run build`). The page talks WebSocket directly to the live
+  // engram-kernel (wss://engram-kernel...workers.dev/ws).
   "name": "engram-ui",
-  "main": "src/worker.js",
+  "main": "dist/worker.mjs",
   "compatibility_date": "2025-05-01",
-  "observability": { "enabled": true },
-  "rules": [
-    { "type": "Text", "globs": ["src/index.html"], "fallthrough": true }
-  ]
+  "observability": { "enabled": true }
 }

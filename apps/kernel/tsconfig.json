@@ -1,0 +1,31 @@
+{
+  // Strict TS config for the authored kernel JS (kernel-glue, repl-transform, entry,
+  // stdlib-meta, scripts). The Rust engine (engine/) + lib.rs are NOT TypeScript.
+  // tsc is used for TYPECHECK ONLY (noEmit); esbuild emits the runtime .mjs.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022"],
+    "strict": true,
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "allowJs": true,
+    "checkJs": false,
+    // engine.wasm / stdlib.bundle.txt are wrangler asset imports; their TS shape comes from the
+    // sidecar src/engine.d.wasm.ts + src/stdlib.bundle.d.txt.ts declarations.
+    "allowArbitraryExtensions": true,
+    "types": ["@cloudflare/workers-types"],
+    // workerd/WASI globals + the wrangler-special module imports (engine.wasm CompiledWasm,
+    // stdlib.bundle.txt Text) are typed via src/kernel.d.ts ambient declarations.
+    "verbatimModuleSyntax": false
+  },
+  "include": ["src/**/*.ts", "entry.ts", "scripts/**/*.mjs", "src/kernel.d.ts"],
+  "exclude": ["node_modules", "build", "target", "engine", "**/*.mjs.bak"]
+}
