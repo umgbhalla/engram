@@ -243,6 +243,37 @@ literally persist the heap.
 - **`context/`**: external repos as shallow submodules for reference (read-only, not built).
   Index in `context/include.md`. Init: `git submodule update --init --depth 1`.
 
+## Testing the interactive REPL CLI (`sp` / Supaterm panes)
+
+The `engram` REPL (`packages/cli`) is an **interactive TTY** program — pipe-mode
+(`echo … | engram repl`) and `--exec` exercise the protocol but NOT the terminal
+behaviour (multi-line continuation prompt, history, Ctrl-C/Ctrl-D keys, the resume
+hint on exit, colorized output). Those only fire in a real pty. Drive them with the
+`sp` CLI (Supaterm pane controller — `which sp`, available inside Supaterm panes;
+socket via `$SUPATERM_SOCKET_PATH`, current pane `$SUPATERM_SURFACE_ID`):
+
+- **Find a sibling TTY pane**: `sp ls` (or `sp ls --json` for pane UUIDs). The other
+  pane in your tab is a live shell with a real TTY. Note its UUID.
+- **Build the bin first**: `cd packages/cli && npx tsc --noEmit && npx esbuild
+  src/engram.ts --bundle --platform=node --format=esm --target=node18
+  --packages=external --outfile=bin/engram.mjs`. Spawning the repl directly via
+  `sp tab new -- node …repl` self-exits (the spawned pane's stdin isn't a TTY →
+  pipe-mode → empty stdin → exit) — instead **send the launch command into an
+  existing shell pane** so it inherits that pane's TTY.
+- **Launch + drive**: `sp pane send --newline <PANE_UUID> 'node …/bin/engram.mjs
+  repl --session demo-live'`, then send cells the same way. Send raw control bytes
+  with stdin form: `printf '\x03' | sp pane send <PANE_UUID> -` = Ctrl-C, `\x04` =
+  Ctrl-D.
+- **Assert on output**: `sp pane capture <PANE_UUID> | tail -N` returns the pane's
+  rendered text — grep it for the value, the `... ` continuation prompt, the
+  `· Nms` latency tag, the `bye. … resume with:` block, etc.
+- **Determinism caveat**: this is a LIVE remote session against `engram-kernel` —
+  state persists across launches (use a throwaway `--session <uuid>` per run, or
+  `.reset`). The kernel clock is frozen in-turn; don't assert on wall-time.
+
+This pattern (send-into-real-pane + `capture` to assert) is the only way to verify
+the terminal UX; reach for it whenever testing anything interactive, not just the REPL.
+
 ## Key facts (do not re-derive)
 
 - Worker Loader: `load()` fresh isolate / `get(id,cb)` best-effort warm cache keyed
