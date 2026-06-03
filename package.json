@@ -9,12 +9,13 @@
     "deploy:w4": "wrangler deploy -c experiments/kernel-w4/wrangler.jsonc",
     "deploy:kernel": "wrangler deploy -c apps/kernel/wrangler.jsonc",
     "deploy:cloud": "wrangler deploy -c apps/cloud/wrangler.jsonc",
-    "deploy:ui": "wrangler deploy -c apps/ui/wrangler.jsonc",
+    "deploy:ui": "bun run --filter @engram/ui-app build && wrangler deploy -c apps/ui/wrangler.jsonc",
     "deploy:all": "bun scripts/deploy.ts",
     "test:w4": "node experiments/kernel-w4/test-client.mjs wss://engram-bench-w4.umg-bhalla88.workers.dev sim",
     "verify:w4": "BASE=wss://engram-bench-w4.umg-bhalla88.workers.dev node experiments/kernel-w4/verify-w4.mjs && BASE=wss://engram-bench-w4.umg-bhalla88.workers.dev node experiments/kernel-w4/verify-w5.mjs && BASE=wss://engram-bench-w4.umg-bhalla88.workers.dev node experiments/adv-w4/attack-size-regression.mjs",
     "e2e:ui": "node scripts/e2e-ui.mjs",
-    "build:sdk": "echo 'no build step for @engram/sdk (ships index.mjs as-is)'",
-    "build:cli": "echo 'no build step for @engram/cli (ships engram.mjs as-is)'"
+    "build:sdk": "bun run --filter @engram/sdk build",
+    "build:cli": "bun run --filter @engram/cli build",
+    "build:ui": "bun run --filter @engram/ui-app build"
   }
 }
