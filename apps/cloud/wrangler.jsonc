@@ -6,8 +6,12 @@
   //   configurable in-VM stdlib (lodash/dayjs/nanoid/uuid/zod, mathjs opt-in) + the 5 Tier-0
   //   native extensions (crypto.subtle/getRandomValues/randomUUID, TextEncoder/Decoder, URL,
   //   structuredClone, Headers) delivered via {text}/{js}/{wasm} loader modules.
+  // CUTOVER (2026-06-03): apps/cloud is now the RUST-facet cloud. main = supervisor-rust.js,
+  // build = bake-rust.mjs (delivers apps/kernel-rust Rust DO + engine.wasm into the facet via
+  // the {wasm} Worker-Loader module type). Proven in experiments/cloud-rust, verified on scratch
+  // engram-cloud-rust2. Rollback anchor (prior JS-kernel cloud) version: c06a77a1-d035-4153-a8b7-8bafe8953b3b.
   "name": "engram-cloud",
-  "main": "src/supervisor.js",
+  "main": "src/supervisor-rust.js",
   "compatibility_date": "2026-04-01",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
@@ -15,7 +19,7 @@
   "build": {
     // Build the esbuilt stdlib bundle + bake the module set (glue+facet+wasm+dist+stdlib+ext)
     // into src/modules.gen.js before wrangler bundles the supervisor.
-    "command": "node scripts/build-stdlib.mjs && node scripts/bake-modules.mjs"
+    "command": "node scripts/bake-rust.mjs"
   },
 
   "durable_objects": {

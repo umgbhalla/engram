@@ -11,3 +11,7 @@ node_modules/
 
 # Deliberately vendored binaries — all cloud vendored bytes live here, tracked on purpose.
 !vendor/**
+
+# generated baked Rust-kernel modules
+src/modules.rust.gen.js
+src/modules.gen.js
