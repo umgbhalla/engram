@@ -43,9 +43,14 @@
 // ambiguity: `async function`, `function*`, `export`, unterminated string/regex, unbalanced
 // braces, or an unparseable declarator. Never corrupts the cell.
 //
-// HOISTING CAVEAT (accepted): rewriting `function f(){}` to an assignment removes the var-hoist,
-// so calling `f()` on a line ABOVE the declaration within the SAME cell no longer works (rare;
-// safer). Cross-cell calls are unaffected.
+// FUNCTION HOISTING (fixed): a depth-0 `function NAME(…){…}` is HOISTED — its
+// `globalThis.NAME = function NAME(…){…};` assignment is emitted at the TOP of the transformed
+// cell (in source order across all depth-0 function declarations), and the original declaration
+// is removed in place. So calling `f()` on a line ABOVE its declaration in the SAME cell works
+// (matching JS function-hoisting), AND the binding persists globally across cells. `let`/`const`/
+// `class` are still rewritten in place (no hoisting, matching their TDZ semantics). The cell's
+// completion value is preserved: a removed function-decl statement has an empty completion, so
+// dropping it never changes the last value-producing statement's result.
 
 const __KW = new Set(["let", "const", "function", "class"]);
 function __isIdentStart(c) { return /[A-Za-z_$]/.test(c); }
@@ -62,7 +67,9 @@ function transformCell(src) {
   }
   if (!edits) return src;
   if (!edits.length) return src;
-  edits.sort((a, b) => b.at - a.at);
+  // Apply right-to-left by offset; the hoist prefix (at 0, marked) is applied LAST so it lands
+  // strictly at the front even when a function declaration also starts at offset 0.
+  edits.sort((a, b) => (b.at - a.at) || ((a.prefix ? 1 : 0) - (b.prefix ? 1 : 0)));
   let out = src;
   for (const e of edits) out = out.slice(0, e.at) + e.replacement + out.slice(e.at + e.consume);
   return out;
@@ -76,6 +83,7 @@ function __planEdits(src) {
   let prev = "start";
   let pendingAsyncOrExport = false;
   const edits = [];
+  const hoists = []; // depth-0 function declarations, in source order
 
   function skipTrivia() {
     while (i < n) {
@@ -131,6 +139,11 @@ function __planEdits(src) {
         if (!edit) return null;
         if (edit.edit) edits.push(edit.edit);
         if (edit.edits) for (const e of edit.edits) edits.push(e);
+        if (edit.hoist) {
+          // remove the declaration in place (empty statement), hoist it to the top.
+          edits.push({ at: edit.hoist.at, consume: edit.hoist.consume, replacement: ";" });
+          hoists.push(edit.hoist);
+        }
         atStmtStart = true; prev = "stmt"; pendingAsyncOrExport = false; continue;
       }
 
@@ -145,6 +158,15 @@ function __planEdits(src) {
   }
 
   if (depth !== 0) return null;
+  if (hoists.length) {
+    // Emit `globalThis.NAME = function NAME(…){…};` for every depth-0 function declaration,
+    // in source order, at the TOP of the cell (offset 0) — so an earlier call site sees them
+    // (function-hoisting). The named function EXPRESSION keeps NAME visible inside for recursion.
+    const prefix = hoists
+      .map((h) => `globalThis[${JSON.stringify(h.name)}] = ${h.declText};`)
+      .join("");
+    edits.push({ at: 0, consume: 0, replacement: prefix, prefix: true });
+  }
   return edits;
 }
 
@@ -171,6 +193,13 @@ function __handleDeclaration(src, kw, kwStart, getI, setI) {
     if (!skipToBlockEnd()) return null;
     const bodyEnd = i;
     setI(i);
+    if (kw === "function") {
+      // HOIST: caller emits `globalThis.NAME = function NAME(…){…};` at the top of the cell
+      // (in source order) and removes the original declaration here (replaced by an empty
+      // statement to preserve statement boundaries / completion).
+      return { hoist: { name, declText: src.slice(kwStart, bodyEnd), at: kwStart, consume: bodyEnd - kwStart } };
+    }
+    // class: rewrite in place (no hoisting — TDZ semantics).
     return {
       edits: [
         { at: kwStart, consume: 0, replacement: `globalThis[${JSON.stringify(name)}] = ` },

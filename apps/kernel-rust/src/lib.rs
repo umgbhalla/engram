@@ -20,7 +20,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use worker::{
-    durable_object, event, wasm_bindgen, wasm_bindgen_futures, DurableObject, Env, Request,
+    durable_object, event, wasm_bindgen, wasm_bindgen_futures, DurableObject, Env, Method, Request,
     Response, Result, State, WebSocket, WebSocketIncomingMessage, WebSocketPair,
     WebSocketRequestResponsePair,
 };
@@ -166,6 +166,27 @@ impl DurableObject for KernelDO {
                 self.state.set_websocket_auto_response(&rp);
             }
             return Response::from_websocket(pair.client);
+        }
+        // FACET RPC seam: a POST /frame with a JSON {t:...} body runs one protocol frame and
+        // returns the reply JSON. This is the proxy-model entry the supervisor uses when the
+        // kernel runs as a DO FACET (a facet-held client WebSocket does not work, so the
+        // supervisor holds the socket and RPCs each frame in via stub.fetch). Same dispatch as
+        // websocket_message -> handle(). Harmless to the standalone WS path.
+        let mut req = req;
+        if req.method() == Method::Post && req.path().ends_with("/frame") {
+            {
+                {
+                    let body = req.text().await.unwrap_or_else(|_| "{}".into());
+                    let reply = match serde_json::from_str::<serde_json::Value>(&body) {
+                        Ok(msg) => self
+                            .handle(msg)
+                            .await
+                            .unwrap_or_else(|e| json!({"ok": false, "error": format!("{e}")})),
+                        Err(_) => json!({"ok": false, "error": "bad json"}),
+                    };
+                    return Response::from_json(&reply);
+                }
+            }
         }
         Response::ok("engram-rust kernel: connect a websocket; {t:create|eval|reset|gen|ping|evict}\n")
     }
