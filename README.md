@@ -1,6 +1,10 @@
 # Engram
 
-**A durable, hibernating, multi-tenant JavaScript REPL kernel on Cloudflare.**
+**A durable, hibernating, multi-tenant JavaScript / TypeScript REPL kernel on Cloudflare.**
+
+> **▶ Live demo:** **<https://engram-ui.umg-bhalla88.workers.dev>** — a browser notebook on the live kernel.
+> Or in a terminal: `engram repl` (every line evaluates on the remote durable kernel; type TypeScript directly).
+> Kernel WS endpoint: `wss://engram-kernel.umg-bhalla88.workers.dev`.
 
 Engram runs untrusted / agent-authored JavaScript in a sandboxed [QuickJS](https://github.com/quickjs-ng/quickjs) interpreter compiled to WASM, hosted inside a Cloudflare Durable Object. A session keeps a **live interpreter namespace** — variables, closures, pending promises, injected stdlib — that **survives idle eviction and cold restart with no replay and no re-fired side effects**, because the entire interpreter heap is snapshotted to durable storage and blitted back on wake.
 
