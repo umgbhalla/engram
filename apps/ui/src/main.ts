@@ -1,7 +1,11 @@
-// Engram notebook app — cells, config builder, state indicator, deployed E2E runner.
+// Engram notebook app — seed story cells, config builder, live state indicator,
+// collapsible panels, and the deployed UI→kernel E2E runner. The WS protocol
+// (kernel.ts) and run/eval/config/E2E wiring are unchanged; this is the UI shell.
 import "./styles.css";
 import { Kernel } from "./kernel";
 import type { EngramConfig, KernelReply, KernelState } from "./kernel";
+import { SEED_CELLS } from "./seed";
+import type { SeedCell } from "./seed";
 
 const DEFAULT_ENDPOINT = "wss://engram-kernel.umg-bhalla88.workers.dev";
 
@@ -17,24 +21,12 @@ const $sel = (id: string): HTMLSelectElement => el<HTMLSelectElement>(id);
 const qs = new URLSearchParams(location.search);
 
 const LS = {
-  get k(): string | null {
-    return localStorage.getItem("md_session");
-  },
-  set k(v: string) {
-    localStorage.setItem("md_session", v);
-  },
-  get ep(): string | null {
-    return localStorage.getItem("md_endpoint");
-  },
-  set ep(v: string) {
-    localStorage.setItem("md_endpoint", v);
-  },
-  get key(): string {
-    return localStorage.getItem("md_apikey") || "";
-  },
-  set key(v: string) {
-    localStorage.setItem("md_apikey", v || "");
-  },
+  get k(): string | null { return localStorage.getItem("md_session"); },
+  set k(v: string) { localStorage.setItem("md_session", v); },
+  get ep(): string | null { return localStorage.getItem("md_endpoint"); },
+  set ep(v: string) { localStorage.setItem("md_endpoint", v); },
+  get key(): string { return localStorage.getItem("md_apikey") || ""; },
+  set key(v: string) { localStorage.setItem("md_apikey", v || ""); },
 };
 
 function randId(): string {
@@ -47,6 +39,13 @@ function esc(s: unknown): string {
   return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c] ?? c);
 }
 
+// --- icons (inline, restrained) ---------------------------------------------
+const ICON = {
+  run: `<svg class="glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M7 5l11 7-11 7V5Z"/></svg><span class="spinner"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 3a9 9 0 1 0 9 9" /></svg></span>`,
+  del: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg>`,
+  warn: `<svg viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg>`,
+};
+
 // --- kernel -----------------------------------------------------------------
 const kernel = new Kernel(() => ({
   endpoint: $in("cfgEndpoint").value,
@@ -55,18 +54,22 @@ const kernel = new Kernel(() => ({
 }));
 
 // --- state indicator --------------------------------------------------------
+function setSessionPill(): void {
+  el("sessionPill").textContent = "session " + ($in("cfgSession").value || "–");
+}
 async function refreshState(): Promise<void> {
   try {
     const g = await kernel.gen();
     const warm = !!g.inMemory;
     el("stateDot").className = "dot " + (warm ? "warm" : "cold");
-    el("stateTxt").textContent = warm ? "warm (in-memory)" : "cold (snapshot)";
-    el("genPill").textContent = `gen ${g.generation} · cell ${g.committedCell}`;
+    el("stateTxt").textContent = warm ? "warm" : "cold";
+    el("genPill").textContent = `gen ${g.generation ?? "–"} · cell ${g.committedCell ?? 0}`;
   } catch {
     el("stateDot").className = "dot off";
     el("stateTxt").textContent = "disconnected";
     el("genPill").textContent = "gen –";
   }
+  setSessionPill();
 }
 kernel.onState = (s: KernelState): void => {
   if (s === "disconnected") {
@@ -74,7 +77,7 @@ kernel.onState = (s: KernelState): void => {
     el("stateTxt").textContent = "disconnected";
   }
   if (s === "connecting") {
-    el("stateDot").className = "dot";
+    el("stateDot").className = "dot pending";
     el("stateTxt").textContent = "connecting…";
   }
 };
@@ -82,24 +85,17 @@ kernel.onState = (s: KernelState): void => {
 // --- config -----------------------------------------------------------------
 function buildConfig(): EngramConfig {
   const modulesRaw = $in("cfgModules").value.trim();
-  let modules: boolean | string[] = true;
-  if (modulesRaw && modulesRaw !== "true") {
-    modules =
-      modulesRaw === "false"
-        ? false
-        : modulesRaw
-            .split(",")
-            .map((s) => s.trim())
-            .filter(Boolean);
-  }
+  let modules: boolean | string[] = false;
+  if (modulesRaw === "true") modules = true;
+  else if (modulesRaw && modulesRaw !== "false")
+    modules = modulesRaw.split(",").map((s) => s.trim()).filter(Boolean);
+
   const fetchRaw = $in("cfgFetch").value.trim();
-  let fetch: boolean | string[] = true;
-  if (fetchRaw === "false") fetch = false;
-  else if (fetchRaw && fetchRaw !== "true")
-    fetch = fetchRaw
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
+  let fetch: boolean | string[] = false;
+  if (fetchRaw === "true") fetch = true;
+  else if (fetchRaw && fetchRaw !== "false")
+    fetch = fetchRaw.split(",").map((s) => s.trim()).filter(Boolean);
+
   return {
     clock: $sel("cfgClock").value === "real" ? "real" : "seeded",
     rngSeed: Number($in("cfgSeed").value) || 0,
@@ -112,80 +108,138 @@ function buildConfig(): EngramConfig {
 interface CellEl extends HTMLDivElement {
   _run: () => Promise<void>;
   _ta: HTMLTextAreaElement;
+  _kind: "story" | "advanced";
 }
 
 let cellSeq = 0;
-function addCell(src = ""): CellEl {
+function addCell(seed?: SeedCell): CellEl {
   const id = ++cellSeq;
+  const kind = seed?.kind ?? "story";
+  const title = seed?.title ?? `Cell ${id}`;
   const div = document.createElement("div") as CellEl;
-  div.className = "cell";
+  div.className = "cell kind-" + kind;
+  div._kind = kind;
+
+  const noteHtml = seed?.note
+    ? `<div class="cell-note">${ICON.warn}<span>${esc(seed.note)}</span></div>`
+    : "";
+
   div.innerHTML = `
-    <div class="cell-head"><span class="num">[${id}]</span><span class="grow"></span>
-      <button data-run>▶ run (⇧⏎)</button><button data-del>✕</button></div>
-    <textarea spellcheck="false" placeholder="// JS — runs against the durable namespace"></textarea>
-    <div class="out" hidden></div><div class="meta" hidden></div>`;
+    <div class="cell-head">
+      <span class="cell-status" aria-hidden="true"></span>
+      <span class="cell-title">${esc(title)}</span>
+      ${kind === "advanced" ? '<span class="cell-tag">example</span>' : ""}
+      <span class="cell-grow"></span>
+      <div class="cell-actions">
+        <button class="icon-btn run" data-run title="Run cell (⇧⏎)" aria-label="Run cell">${ICON.run}</button>
+        <button class="icon-btn del" data-del title="Delete cell" aria-label="Delete cell">${ICON.del}</button>
+      </div>
+    </div>
+    ${noteHtml}
+    <textarea spellcheck="false" placeholder="// TypeScript — runs against the durable namespace (⇧⏎ to run)"></textarea>
+    <div class="out"></div>
+    <div class="meta" hidden></div>`;
+
   const ta = div.querySelector("textarea") as HTMLTextAreaElement;
-  ta.value = src;
+  ta.value = seed?.code ?? "";
   const out = div.querySelector(".out") as HTMLDivElement;
   const meta = div.querySelector(".meta") as HTMLDivElement;
+
+  const autosize = (): void => {
+    ta.style.height = "auto";
+    ta.style.height = Math.max(52, ta.scrollHeight) + "px";
+  };
+  ta.addEventListener("input", autosize);
   ta.addEventListener("keydown", (e: KeyboardEvent) => {
-    if (e.key === "Enter" && e.shiftKey) {
+    if (e.key === "Enter" && (e.shiftKey || e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       void run();
     }
   });
   (div.querySelector("[data-run]") as HTMLButtonElement).onclick = () => void run();
-  (div.querySelector("[data-del]") as HTMLButtonElement).onclick = () => div.remove();
+  (div.querySelector("[data-del]") as HTMLButtonElement).onclick = () => {
+    div.style.opacity = "0";
+    div.style.transform = "translateY(-4px)";
+    setTimeout(() => div.remove(), 140);
+  };
+
   async function run(): Promise<void> {
+    div.classList.remove("state-ok", "state-error");
     div.classList.add("running");
-    out.hidden = false;
-    out.innerHTML = "<span class='log'>running…</span>";
+    out.innerHTML = `<span class="running-line"><span class="spin-inline"></span>evaluating…</span>`;
     const t0 = performance.now();
     try {
       const r = await kernel.eval(ta.value);
       renderResult(out, r);
-      const ms = Math.round(performance.now() - t0);
-      meta.hidden = false;
-      const restored = r.inMemoryBefore === false;
-      meta.innerHTML =
-        `cell ${r.cell} · gen ${r.generation} · ${ms}ms` +
-        (restored
-          ? ` · <span style="color:var(--amber)">cold-restored (${r.restoreSource || "snapshot"})</span>`
-          : ` · warm`) +
-        (r.checkpoint && r.checkpoint.sizeGz
-          ? ` · snap ${(r.checkpoint.sizeGz / 1024).toFixed(1)}KB gz`
-          : "");
+      div.classList.add(r.ok === false ? "state-error" : "state-ok");
+      renderMeta(meta, r, Math.round(performance.now() - t0));
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      out.innerHTML = `<span class='err'>${esc(msg)}</span>`;
+      out.innerHTML = `<div class="err"><span class="lead">✖ </span>${esc(msg)}</div>`;
+      div.classList.add("state-error");
+      meta.hidden = true;
     } finally {
       div.classList.remove("running");
       void refreshState();
     }
   }
+
   div._run = run;
   div._ta = ta;
   el("cells").appendChild(div);
+  requestAnimationFrame(autosize);
   return div;
 }
 
 function renderResult(out: HTMLElement, r: KernelReply): void {
   let html = "";
   for (const l of r.logs || []) {
-    const txt = typeof l === "string" ? l : `${l.level}: ${l.text}`;
-    html += `<div class="log">› ${esc(txt)}</div>`;
+    const txt = typeof l === "string" ? l : l.text ?? l.msg ?? "";
+    html += `<div class="log"><span class="lead">› </span>${esc(txt)}</div>`;
   }
-  if (!r.ok && r.error) {
-    html += `<div class="err">✖ ${esc(r.error.name || "Error")}: ${esc(r.error.message || "")}</div>`;
+  if (r.ok === false && r.error) {
+    html += `<div class="err"><span class="lead">✖ </span>${esc(r.error.name || "Error")}: ${esc(r.error.message || "")}</div>`;
+    if (r.error.stack) html += `<div class="err-stack">${esc(r.error.stack)}</div>`;
   } else {
     const v = r.valuePreview != null ? r.valuePreview : r.value;
-    if (v !== null && v !== undefined && v !== "")
-      html += `<div class="val">⇒ ${esc(typeof v === "string" ? v : JSON.stringify(v))}</div>`;
-    else html += `<div class="log">⇒ <i>undefined</i></div>`;
+    if (v !== null && v !== undefined && v !== "") {
+      const text = typeof v === "string" ? v : JSON.stringify(v);
+      html += `<div class="val"><span class="lead">⇒ </span>${esc(text)}</div>`;
+    } else if (!(r.logs && r.logs.length)) {
+      html += `<div class="log"><span class="lead">⇒ </span><i>undefined</i></div>`;
+    }
   }
   if (r.final && r.final.kind)
-    html += `<div class="final">★ FINAL [${r.final.kind}]: ${esc(String(r.final.value))}</div>`;
-  out.innerHTML = html || "<span class='log'>(no output)</span>";
+    html += `<div class="final">★ FINAL [${esc(r.final.kind)}]: ${esc(String(r.final.value))}</div>`;
+  out.innerHTML = html;
+}
+
+function renderMeta(meta: HTMLElement, r: KernelReply, ms: number): void {
+  const restored = r.inMemoryBefore === false;
+  const chips: string[] = [];
+  chips.push(`<span class="chip">cell ${r.cell ?? 0}</span>`);
+  chips.push(`<span class="chip">gen ${r.generation ?? "–"}</span>`);
+  chips.push(`<span class="chip">${ms}ms</span>`);
+  chips.push(
+    restored
+      ? `<span class="chip cold">cold · ${esc(r.restoreSource || "snapshot")}</span>`
+      : `<span class="chip warm">warm</span>`,
+  );
+  if (r.checkpoint && r.checkpoint.sizeGz)
+    chips.push(`<span class="chip">snap ${(r.checkpoint.sizeGz / 1024).toFixed(1)}KB gz</span>`);
+  meta.innerHTML = chips.join("");
+  meta.hidden = false;
+}
+
+// --- collapsible panels -----------------------------------------------------
+function wirePanel(headId: string, bodyId: string): void {
+  const head = el<HTMLButtonElement>(headId);
+  const body = el(bodyId);
+  head.addEventListener("click", () => {
+    const open = head.getAttribute("aria-expanded") === "true";
+    head.setAttribute("aria-expanded", String(!open));
+    body.hidden = open;
+  });
 }
 
 // --- deployed system E2E ----------------------------------------------------
@@ -209,8 +263,11 @@ interface E2eResult {
 
 async function runDeployedE2e(): Promise<E2eResult> {
   const out = el("e2eOut");
+  const badge = el("e2eBadge");
   out.dataset.status = "running";
-  out.innerHTML = e2eLine("log", "running deployed UI -> kernel E2E...");
+  badge.dataset.status = "running";
+  badge.textContent = "running";
+  out.innerHTML = e2eLine("log", "running deployed UI → kernel E2E…");
   const oldSession = $in("cfgSession").value;
   const testSession = "ui-e2e-" + Date.now().toString(36);
   const lines: string[] = [];
@@ -221,79 +278,60 @@ async function runDeployedE2e(): Promise<E2eResult> {
     kernel.close();
     kernel.setConfig({ clock: "seeded", rngSeed: 777, modules: true, fetch: true, cellBudgetTicks: 200000 });
 
-    // Normal TypeScript/JS declarations persist (no globalThis prefix needed) —
-    // the kernel strips types host-side, the REPL transform persists top-level decls.
     const setup = await kernel.eval("let x: number = 42; const inc = (): number => ++x; x");
     const setupOk = setup.ok !== false && setup.value === 42;
-    lines.push(
-      setupOk
-        ? pass("typescript eval writes durable state", "value=" + setup.value)
-        : fail("typescript eval writes durable state", JSON.stringify(setup)),
-    );
+    lines.push(setupOk
+      ? pass("typescript eval writes durable state", "value=" + setup.value)
+      : fail("typescript eval writes durable state", JSON.stringify(setup)));
 
     await kernel.evict();
     const cold = await kernel.gen();
     const coldOk = cold.ok !== false && cold.inMemory === false;
-    lines.push(
-      coldOk
-        ? pass("hibernate drops in-memory kernel", "inMemory=" + cold.inMemory)
-        : fail("hibernate drops in-memory kernel", JSON.stringify(cold)),
-    );
+    lines.push(coldOk
+      ? pass("hibernate drops in-memory kernel", "inMemory=" + cold.inMemory)
+      : fail("hibernate drops in-memory kernel", JSON.stringify(cold)));
 
     const restored = await kernel.eval("x");
     const restoredOk = restored.ok !== false && restored.value === 42 && /restore/.test(restored.restoreSource || "");
-    lines.push(
-      restoredOk
-        ? pass("cold restore keeps heap state", "value=" + restored.value + " source=" + restored.restoreSource)
-        : fail("cold restore keeps heap state", JSON.stringify(restored)),
-    );
+    lines.push(restoredOk
+      ? pass("cold restore keeps heap state", "value=" + restored.value + " source=" + restored.restoreSource)
+      : fail("cold restore keeps heap state", JSON.stringify(restored)));
 
     const closure = await kernel.eval("inc()");
     const closureOk = closure.ok !== false && closure.value === 43;
-    lines.push(
-      closureOk
-        ? pass("closure survives restore", "value=" + closure.value)
-        : fail("closure survives restore", JSON.stringify(closure)),
-    );
+    lines.push(closureOk
+      ? pass("closure survives restore", "value=" + closure.value)
+      : fail("closure survives restore", JSON.stringify(closure)));
 
-    // TypeScript continuity: generics + annotations erased, state continues (x===43).
     const ts = await kernel.eval("const greet = <T,>(v: T): string => `hi ${v}`; greet(x)");
     const tsOk = ts.ok !== false && ts.value === "hi 43";
-    lines.push(
-      tsOk
-        ? pass("typescript generics + annotations", "value=" + JSON.stringify(ts.value))
-        : fail("typescript generics + annotations", JSON.stringify(ts).slice(0, 400)),
-    );
+    lines.push(tsOk
+      ? pass("typescript generics + annotations", "value=" + JSON.stringify(ts.value))
+      : fail("typescript generics + annotations", JSON.stringify(ts).slice(0, 400)));
 
     const enumRej = await kernel.eval("enum Color { Red }");
     const enumRejOk = enumRej.ok === false && enumRej.error?.name === "TypeScriptError";
-    lines.push(
-      enumRejOk
-        ? pass("un-erasable TS rejected cleanly", enumRej.error?.name || "")
-        : fail("un-erasable TS rejected cleanly", JSON.stringify(enumRej).slice(0, 400)),
-    );
+    lines.push(enumRejOk
+      ? pass("un-erasable TS rejected cleanly", enumRej.error?.name || "")
+      : fail("un-erasable TS rejected cleanly", JSON.stringify(enumRej).slice(0, 400)));
 
-    // Session stays alive after the rejection — next eval still works.
     const recover = await kernel.eval("x + 1");
     const recoverOk = recover.ok !== false && recover.value === 44;
-    lines.push(
-      recoverOk
-        ? pass("session recovers after TS error", "value=" + recover.value)
-        : fail("session recovers after TS error", JSON.stringify(recover)),
-    );
+    lines.push(recoverOk
+      ? pass("session recovers after TS error", "value=" + recover.value)
+      : fail("session recovers after TS error", JSON.stringify(recover)));
 
     const ok = lines.every((s) => !s.includes(">FAIL "));
     out.dataset.status = ok ? "pass" : "fail";
-    out.innerHTML = lines.join("") + e2eLine(ok ? "final" : "err", ok ? "E2E PASS" : "E2E FAIL");
-    return {
-      ok,
-      session: testSession,
-      endpoint: $in("cfgEndpoint").value,
-      details: lines.map((l) => l.replace(/<[^>]+>/g, "")),
-    };
+    badge.dataset.status = ok ? "pass" : "fail";
+    badge.textContent = ok ? "pass" : "fail";
+    out.innerHTML = lines.join("") + e2eLine(ok ? "final" : "err", ok ? "✓ E2E PASS — 7/7" : "✗ E2E FAIL");
+    return { ok, session: testSession, endpoint: $in("cfgEndpoint").value, details: lines.map((l) => l.replace(/<[^>]+>/g, "")) };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     out.dataset.status = "fail";
+    badge.dataset.status = "fail";
+    badge.textContent = "fail";
     out.innerHTML = lines.join("") + fail("E2E exception", msg);
     return { ok: false, session: testSession, endpoint: $in("cfgEndpoint").value, error: msg };
   } finally {
@@ -313,10 +351,19 @@ const persistConn = (): void => {
   LS.key = $in("cfgApiKey").value.trim();
 };
 
-el<HTMLButtonElement>("addCell").onclick = () => addCell();
+wirePanel("connHead", "connBody");
+wirePanel("cfgHead", "cfgBody");
+wirePanel("e2eHead", "e2eBody");
+
+el<HTMLButtonElement>("addCell").onclick = () => {
+  const c = addCell();
+  c._ta.focus();
+};
 el<HTMLButtonElement>("runAll").onclick = async () => {
   for (const child of Array.from(el("cells").children)) {
-    await (child as CellEl)._run();
+    const cell = child as CellEl;
+    if (cell._kind === "advanced") continue; // advanced examples need config; skip in Run all
+    await cell._run();
   }
 };
 el<HTMLButtonElement>("newSession").onclick = () => {
@@ -354,18 +401,17 @@ el<HTMLButtonElement>("applyConfig").onclick = async () => {
 
 // boot — URL params win, then persisted connection, then the deployed default.
 const epFromQuery = queryEndpoint();
-if (epFromQuery) $in("cfgEndpoint").value = epFromQuery;
-else $in("cfgEndpoint").value = LS.ep || DEFAULT_ENDPOINT;
+$in("cfgEndpoint").value = epFromQuery || LS.ep || DEFAULT_ENDPOINT;
 if (qs.get("apiKey")) $in("cfgApiKey").value = qs.get("apiKey") as string;
 else if (LS.key) $in("cfgApiKey").value = LS.key;
 if (qs.get("session")) $in("cfgSession").value = qs.get("session") as string;
 
 ensureSession();
+setSessionPill();
 kernel.setConfig(buildConfig());
-addCell(
-  '// durable across reload: increment a counter that lives in the heap\nglobalThis.n = (globalThis.n||0) + 1;\nconsole.log("ran", n, "times");\nn',
-);
-addCell("// closures survive hibernation too\nglobalThis.inc = globalThis.inc || (()=>++globalThis.n);\ninc()");
+
+for (const seed of SEED_CELLS) addCell(seed);
+
 kernel.open().then(refreshState, refreshState);
 
 declare global {
@@ -374,5 +420,8 @@ declare global {
   }
 }
 window.__ENGRAM_E2E__ = runDeployedE2e;
-if (qs.get("e2e") === "1") setTimeout(() => void runDeployedE2e(), 250);
+if (qs.get("e2e") === "1") {
+  el<HTMLButtonElement>("e2eHead").click();
+  setTimeout(() => void runDeployedE2e(), 250);
+}
 setInterval(() => void refreshState(), 15000);

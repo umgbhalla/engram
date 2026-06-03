@@ -3,56 +3,126 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Engram — durable notebook</title>
+<title>Engram — durable hibernating REPL</title>
+<meta name="description" content="A durable, hibernating, stateful TypeScript REPL on Cloudflare. The live interpreter heap is snapshotted, so a session sleeps when idle and wakes with full live state — no replay." />
 </head>
 <body>
-<header>
-  <h1>Engram</h1>
-  <span class="sub">durable hibernating notebook · rquickjs-Rust kernel</span>
-  <div class="grow"></div>
-  <span class="pill" id="statePill"><span class="dot off" id="stateDot"></span><span id="stateTxt">disconnected</span></span>
-  <span class="pill" id="genPill" title="kernel generation / committed cell">gen –</span>
-</header>
-
-<div class="layout">
-  <main>
-    <div class="toolbar">
-      <button class="primary" id="addCell">+ Cell</button>
-      <button id="runAll">Run all</button>
-      <button id="hibernate" title="force-evict in-memory kernel; durable snapshot kept">Hibernate</button>
-      <button id="reconnect" title="reconnect to the same durable session id">Reconnect</button>
-      <button id="resetSession" title="drop kernel + clear snapshot">Reset</button>
-      <button id="runE2e" title="run the deployed UI-to-kernel acceptance check">Run E2E</button>
+<div class="app">
+  <!-- ===== Header / hero ===== -->
+  <header class="hero">
+    <div class="hero-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3a4 4 0 0 1 4 4 4 4 0 0 1-1 7 4 4 0 0 1-7 0 4 4 0 0 1-1-7 4 4 0 0 1 4-4Z"/>
+            <path d="M12 7v9M9 11h6"/>
+          </svg>
+        </span>
+        <div class="brand-text">
+          <h1>Engram</h1>
+          <p class="tagline">A durable, hibernating TypeScript REPL — the live heap is snapshotted, so a session sleeps when idle and wakes with full state. No replay.</p>
+        </div>
+      </div>
+      <div class="hero-status">
+        <span class="pill pill-state" id="statePill" title="kernel connection / warmth">
+          <span class="dot off" id="stateDot"></span>
+          <span id="stateTxt">disconnected</span>
+        </span>
+        <span class="pill pill-gen" id="genPill" title="kernel generation · committed cell">gen –</span>
+        <span class="pill pill-session" id="sessionPill" title="durable session id">session –</span>
+      </div>
     </div>
-    <div class="e2e out" id="e2eOut" data-status="idle"><span class="log">E2E idle</span></div>
-    <div id="cells"></div>
-  </main>
+  </header>
 
-  <aside>
-    <h3>Session</h3>
-    <label>Kernel endpoint (wss)</label>
-    <input id="cfgEndpoint" value="wss://engram-kernel.umg-bhalla88.workers.dev" />
-    <label>API key (only for engram-cloud; blank for engram-kernel)</label>
-    <input id="cfgApiKey" placeholder="md_… (leave blank for v093)" />
-    <label>Session id (reconnect to restore state)</label>
-    <div class="row">
-      <input id="cfgSession" />
-      <button id="newSession" style="flex:0 0 auto">new</button>
-    </div>
-    <p class="hint">State survives reload — same session id resumes the hibernated heap.</p>
+  <div class="layout">
+    <!-- ===== Notebook ===== -->
+    <main class="notebook">
+      <div class="toolbar" role="toolbar" aria-label="Notebook actions">
+        <button class="btn btn-primary" id="addCell">
+          <svg viewBox="0 0 24 24" class="ico"><path d="M12 5v14M5 12h14"/></svg>
+          New cell
+        </button>
+        <button class="btn" id="runAll" title="Run every story cell top to bottom">
+          <svg viewBox="0 0 24 24" class="ico"><path d="M5 4v16M9 5l11 7-11 7V5Z"/></svg>
+          Run all
+        </button>
+        <span class="tool-sep" aria-hidden="true"></span>
+        <button class="btn" id="hibernate" title="Force-evict the in-memory kernel; the durable snapshot is kept">
+          <svg viewBox="0 0 24 24" class="ico"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+          Hibernate
+        </button>
+        <button class="btn" id="reconnect" title="Reconnect to the same durable session id">
+          <svg viewBox="0 0 24 24" class="ico"><path d="M21 12a9 9 0 1 1-3-6.7M21 3v5h-5"/></svg>
+          Reconnect
+        </button>
+        <button class="btn btn-danger" id="resetSession" title="Drop the kernel and clear its snapshot">
+          <svg viewBox="0 0 24 24" class="ico"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg>
+          Reset
+        </button>
+      </div>
 
-    <h3>Config</h3>
-    <label>Clock</label>
-    <select id="cfgClock"><option value="seeded">seeded (deterministic)</option><option value="real">real</option></select>
-    <label>RNG seed</label>
-    <input id="cfgSeed" value="42" />
-    <label>Stdlib modules (comma, or "true" = default set)</label>
-    <input id="cfgModules" value="true" />
-    <label>Fetch allowlist (comma hosts, "true"=all, "false"=none)</label>
-    <input id="cfgFetch" value="true" />
-    <button id="applyConfig" style="margin-top:10px;width:100%">Apply config (fresh session)</button>
-    <p class="hint">Config is set on session create; apply makes a new session id so it takes effect on a fresh heap.</p>
-  </aside>
+      <div id="cells" class="cells"></div>
+    </main>
+
+    <!-- ===== Inspector / config ===== -->
+    <aside class="inspector">
+      <section class="panel">
+        <button class="panel-head" id="connHead" aria-expanded="true" aria-controls="connBody">
+          <span class="panel-title">Connection</span>
+          <svg viewBox="0 0 24 24" class="chev"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+        <div class="panel-body" id="connBody">
+          <label for="cfgEndpoint">Kernel endpoint</label>
+          <input id="cfgEndpoint" spellcheck="false" value="wss://engram-kernel.umg-bhalla88.workers.dev" />
+          <label for="cfgApiKey">API key <span class="muted">(engram-cloud only)</span></label>
+          <input id="cfgApiKey" spellcheck="false" placeholder="md_…  (blank for engram-kernel)" />
+          <label for="cfgSession">Session id</label>
+          <div class="field-row">
+            <input id="cfgSession" spellcheck="false" />
+            <button class="btn btn-ghost" id="newSession" title="Start a fresh session id">New</button>
+          </div>
+          <p class="hint">State survives reload — the same session id resumes the hibernated heap.</p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <button class="panel-head" id="cfgHead" aria-expanded="true" aria-controls="cfgBody">
+          <span class="panel-title">Runtime config</span>
+          <svg viewBox="0 0 24 24" class="chev"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+        <div class="panel-body" id="cfgBody">
+          <label for="cfgClock">Clock</label>
+          <select id="cfgClock">
+            <option value="seeded">seeded — deterministic</option>
+            <option value="real">real wall-clock</option>
+          </select>
+          <label for="cfgSeed">RNG seed</label>
+          <input id="cfgSeed" inputmode="numeric" value="42" />
+          <label for="cfgModules">Stdlib modules</label>
+          <input id="cfgModules" spellcheck="false" value="false" />
+          <p class="hint">Comma list (e.g. <code>dayjs,nanoid</code>), <code>true</code> for the default set, or <code>false</code>.</p>
+          <label for="cfgFetch">Fetch allowlist</label>
+          <input id="cfgFetch" spellcheck="false" value="false" />
+          <p class="hint">Comma hosts, <code>true</code> = all, <code>false</code> = block.</p>
+          <button class="btn btn-primary btn-block" id="applyConfig">Apply on a fresh session</button>
+          <p class="hint">Config binds at session create — applying spins up a fresh heap so it takes effect.</p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <button class="panel-head" id="e2eHead" aria-expanded="false" aria-controls="e2eBody">
+          <span class="panel-title">Diagnostics</span>
+          <span class="badge" id="e2eBadge" data-status="idle">idle</span>
+          <svg viewBox="0 0 24 24" class="chev"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+        <div class="panel-body" id="e2eBody" hidden>
+          <p class="hint">End-to-end check against the live kernel: typed eval, hibernate, cold-restore, closure survival, TypeScript erasure.</p>
+          <button class="btn btn-block" id="runE2e">Run E2E acceptance</button>
+          <div class="e2e-out" id="e2eOut" data-status="idle"><span class="log">No run yet.</span></div>
+        </div>
+      </section>
+    </aside>
+  </div>
 </div>
 
 <script type="module" src="/src/main.ts"></script>
