@@ -1,6 +1,6 @@
 // streaming-console — capture console.* output from a cell.
 //
-//   ENGRAM_ENDPOINT=wss://engram-kernel.<acct>.workers.dev node streaming-console.mjs
+//   ENGRAM_ENDPOINT=wss://engram-kernel.<acct>.workers.dev node streaming-console.ts
 //
 // Two ways to read console output:
 //   (1) the `onConsole` callback at connect — fires for EVERY captured line, across all cells;

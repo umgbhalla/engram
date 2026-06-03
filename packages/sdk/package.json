@@ -1,7 +1,7 @@
 {
   "name": "@engram/sdk",
   "version": "2.0.0-rc.0",
-  "description": "Clean, ergonomic TypeScript client for the durable Engram kernel — durable JS REPL sessions over WebSocket (kernel) or HTTP (cloud), with typed results and errors.",
+  "description": "Clean, ergonomic TypeScript client for the durable Engram kernel \u2014 durable JS REPL sessions over WebSocket (kernel) or HTTP (cloud), with typed results and errors.",
   "type": "module",
   "main": "./dist/index.mjs",
   "module": "./dist/index.mjs",
@@ -12,15 +12,31 @@
       "import": "./dist/index.mjs"
     }
   },
-  "files": ["dist", "src", "README.md"],
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
   "sideEffects": false,
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --format=esm --platform=neutral --target=es2022 --external:node:* --outfile=dist/index.mjs && tsc src/index.ts --declaration --emitDeclarationOnly --outDir dist --target es2022 --moduleResolution bundler --module esnext --lib es2022,dom --skipLibCheck",
-    "smoke": "node sdk-smoke.mjs"
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && esbuild src/index.ts --bundle --format=esm --platform=neutral --target=es2022 --external:node:* --outfile=dist/index.mjs && tsc --emitDeclarationOnly --outDir dist",
+    "prepublishOnly": "npm run build"
   },
-  "keywords": ["engram", "durable-object", "cloudflare", "repl", "quickjs", "sdk"],
+  "keywords": [
+    "engram",
+    "durable-object",
+    "cloudflare",
+    "repl",
+    "quickjs",
+    "sdk"
+  ],
   "license": "MIT",
   "dependencies": {
     "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "esbuild": "^0.24.0"
   }
 }

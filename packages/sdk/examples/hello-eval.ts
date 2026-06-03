@@ -1,6 +1,6 @@
 // hello-eval — the simplest thing: connect, eval, see a value.
 //
-//   ENGRAM_ENDPOINT=wss://engram-kernel.<acct>.workers.dev node hello-eval.mjs
+//   ENGRAM_ENDPOINT=wss://engram-kernel.<acct>.workers.dev node hello-eval.ts
 //
 // Expected output:
 //   value: ready

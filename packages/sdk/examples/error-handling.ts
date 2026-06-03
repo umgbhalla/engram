@@ -2,7 +2,7 @@
 // stays alive through ordinary JS errors, infinite loops, alloc bombs, and blocked fetches; the
 // next eval always works. This is the kernel's hardening guarantee.
 //
-//   ENGRAM_ENDPOINT=wss://engram-kernel.<acct>.workers.dev node error-handling.mjs
+//   ENGRAM_ENDPOINT=wss://engram-kernel.<acct>.workers.dev node error-handling.ts
 //
 // By default eval() THROWS a typed EngramError subclass on a failed cell. Pass
 // { throwOnError: false } (at connect or per-eval) to get { ok:false, error } back instead.

@@ -1,6 +1,6 @@
 // durable-counter — prove live state survives a FULL eviction + cold restart.
 //
-//   ENGRAM_ENDPOINT=wss://engram-kernel.<acct>.workers.dev node durable-counter.mjs
+//   ENGRAM_ENDPOINT=wss://engram-kernel.<acct>.workers.dev node durable-counter.ts
 //
 // The counter is never re-initialized after the first cell. hibernateThenResume() throws away
 // the in-memory kernel and forces a cold restore from the snapshot — `count` comes back intact,
