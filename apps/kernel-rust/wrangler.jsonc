@@ -35,8 +35,8 @@
 
   // V0.5 OBSERVABILITY parity: per-op Analytics Engine datapoint
   // (env.AE.writeDataPoint), called via js_sys Reflect on Env (worker crate has no
-  // AE binding). Queryable via the AE SQL API. dataset engram_rustf.
+  // AE binding). Queryable via the AE SQL API. dataset engram_kernel.
   "analytics_engine_datasets": [
-    { "binding": "AE", "dataset": "engram_rustf" }
+    { "binding": "AE", "dataset": "engram_kernel" }
   ]
 }
