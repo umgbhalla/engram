@@ -2,8 +2,8 @@
 //!
 //! ALL kernel logic lives here in Rust — eval, value-preview, guards, determinism,
 //! host-boundary. The host (a thin JS WASI shim) only provides: WASI imports, the
-//! literal `memory.buffer` blit (snapshot substrate), and the implementation of two
-//! host effects (fetch / kv) that the engine cannot do from inside wasip1.
+//! literal `memory.buffer` blit (snapshot substrate), and the implementation of the
+//! one host effect (fetch) that the engine cannot do from inside wasip1.
 //!
 //! ABI (C exports the shim calls):
 //!   scratch_ptr() / result_ptr() / result_len()    — IO buffers (no host marshalling)
@@ -15,7 +15,7 @@
 //!   used_heap() / buffer_bytes()                    — size-admission introspection
 //!   clock_calls() / rng_calls()                     — entropy counters (persist in manifest)
 //!   set_counters(clock, rng)                        — restore entropy counters
-//!   kv_export_ptr()/len() / kv_import(ptr,len)      — host.kv state serialize/restore
+//!   kv_export_ptr()/len() / kv_import(ptr,len)      — inert stubs (host.kv removed)
 //!
 //! eval_begin / eval_resume return an i32 status:
 //!   0 = DONE  (result JSON is in RESULT)
@@ -38,13 +38,11 @@ thread_local! {
     static START_PAGES: Cell<u32> = Cell::new(0);
     static GROW_CAP_PAGES: Cell<u32> = Cell::new(0);
     static GROW_TRIPPED: Cell<bool> = Cell::new(false);
-    // host-call rendezvous: when a host effect (fetch/kv) is invoked from JS, the
+    // host-call rendezvous: when a host effect (fetch) is invoked from JS, the
     // request is parked here and control returns to the shim; the resolved value is
     // injected on resume.
     static HOSTCALL_REQ: RefCell<Option<String>> = RefCell::new(None);
     static HOSTCALL_RES: RefCell<Option<String>> = RefCell::new(None);
-    // kv store (host.kv) — small, persisted across restore via export/import.
-    static KV: RefCell<std::collections::BTreeMap<String, String>> = RefCell::new(std::collections::BTreeMap::new());
 }
 
 // ---- IO buffers -----------------------------------------------------------
@@ -370,7 +368,7 @@ globalThis.__drainLogs = function(){ const l = globalThis.__logs; globalThis.__l
 
 // host Proxy: every host.<name>(...args) becomes a host-effect call dispatched to
 // Rust (__hostCall), which parks the request and returns a Promise resolved by the
-// shim on resume. fetch + kv are the wired effects.
+// shim on resume. fetch is the only wired host effect.
 globalThis.host = new Proxy({}, {
   get(_t, name){
     if (typeof name !== 'string') return undefined;
@@ -615,28 +613,16 @@ pub extern "C" fn scrub_arena(budget_mb: u32) -> i64 {
     used_heap()
 }
 
-// ---- host.kv state export/import (persisted in the snapshot manifest) ------
+// host.kv (RLM-demo) removed. These exports remain as inert stubs so the JS shim's
+// snapshot-meta plumbing keeps a stable ABI without an RLM key/value surface.
 #[no_mangle]
 pub extern "C" fn kv_export_ptr() -> *const u8 {
-    let json = KV.with(|kv| {
-        let mut o = String::from("{");
-        for (i, (k, v)) in kv.borrow().iter().enumerate() {
-            if i > 0 {
-                o.push(',');
-            }
-            o.push_str(&json_str(k));
-            o.push(':');
-            o.push_str(v); // stored value is already raw JSON
-        }
-        o.push('}');
-        o
-    });
-    let b = json.as_bytes();
-    let n = b.len().min(1 << 18);
     unsafe {
         let p = core::ptr::addr_of_mut!(KV_OUT) as *mut u8;
-        core::ptr::copy_nonoverlapping(b.as_ptr(), p, n);
-        KV_OUT_LEN = n;
+        KV_OUT[0] = b'{';
+        KV_OUT[1] = b'}';
+        KV_OUT_LEN = 2;
+        let _ = p;
         core::ptr::addr_of!(KV_OUT) as *const u8
     }
 }
@@ -645,37 +631,8 @@ pub extern "C" fn kv_export_len() -> usize {
     unsafe { KV_OUT_LEN }
 }
 #[no_mangle]
-pub extern "C" fn kv_import(ptr: *const u8, len: usize) {
-    let s = unsafe { std::slice::from_raw_parts(ptr, len) };
-    if let Ok(txt) = std::str::from_utf8(s) {
-        // minimal flat {string:string} parse via rquickjs JSON (reuse the VM).
-        ensure_ctx();
-        CTX.with(|c| {
-            if let Some((_, ctx)) = c.borrow().as_ref() {
-                ctx.with(|ctx| {
-                    let code = format!(
-                        "(function(){{var o=JSON.parse({}); var out=[]; for(var k in o){{out.push(k); out.push(JSON.stringify(o[k]));}} return out.join('\\u0000');}})()",
-                        json_str(txt)
-                    );
-                    if let Ok(v) = ctx.eval::<Value, _>(code.as_str()) {
-                        if let Some(js) = v.as_string() {
-                            if let Ok(flat) = js.to_string() {
-                                let parts: Vec<&str> = flat.split('\u{0}').collect();
-                                KV.with(|kv| {
-                                    let mut m = kv.borrow_mut();
-                                    let mut i = 0;
-                                    while i + 1 < parts.len() {
-                                        m.insert(parts[i].to_string(), parts[i + 1].to_string());
-                                        i += 2;
-                                    }
-                                });
-                            }
-                        }
-                    }
-                });
-            }
-        });
-    }
+pub extern "C" fn kv_import(_ptr: *const u8, _len: usize) {
+    // no-op: host.kv removed.
 }
 
 const STATUS_DONE: i32 = 0;
@@ -968,57 +925,9 @@ fn run(resume: bool) -> i32 {
 
 fn emit_hostcall() -> i32 {
     let req = HOSTCALL_REQ.with(|h| h.borrow().clone().unwrap_or_else(|| "{}".into()));
-    // intercept host.kv locally (no shim round-trip needed): handle get/set/keys/del.
-    if let Some(local) = try_local_kv(&req) {
-        HOSTCALL_RES.with(|h| *h.borrow_mut() = Some(local));
-        HOSTCALL_REQ.with(|h| *h.borrow_mut() = None);
-        return run(true);
-    }
+    // All host effects (fetch) go to the shim; the RLM kv/ctx/subLM/final surface was removed.
     set_hostcall(&req);
     STATUS_HOST_CALL
-}
-
-// host.kv is handled IN the engine (small, persisted). Returns Some(resultPayload) if
-// the call was a kv op; None if it must go to the shim (e.g. fetch).
-fn try_local_kv(req: &str) -> Option<String> {
-    let v: serde_lite::Value = serde_lite::parse(req)?;
-    let name = v.get_str("name")?;
-    let args = v.get_arr("args")?;
-    let op: &str = match name {
-        "kv" => args.get(0).and_then(|x| x.as_str()).unwrap_or(""),
-        // also support host.kvGet / host.kvSet ergonomic names
-        n if n.starts_with("kv") => &n[2..],
-        _ => return None,
-    };
-    let r = match op {
-        "get" | "Get" => {
-            let k = args.get(if name == "kv" { 1 } else { 0 }).and_then(|x| x.as_str()).unwrap_or("");
-            // stored values are raw JSON; return them as-is (no double-encoding).
-            KV.with(|kv| kv.borrow().get(k).cloned())
-                .map(|v| format!("{{\"ok\":true,\"value\":{}}}", v))
-                .unwrap_or_else(|| "{\"ok\":true,\"value\":null}".into())
-        }
-        "set" | "Set" => {
-            let base = if name == "kv" { 1 } else { 0 };
-            let k = args.get(base).and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let val = args.get(base + 1).map(|x| x.raw()).unwrap_or_else(|| "null".into());
-            KV.with(|kv| kv.borrow_mut().insert(k, val));
-            "{\"ok\":true,\"value\":true}".into()
-        }
-        "keys" | "Keys" => {
-            let ks = KV.with(|kv| {
-                kv.borrow().keys().map(|k| json_str(k)).collect::<Vec<_>>().join(",")
-            });
-            format!("{{\"ok\":true,\"value\":[{}]}}", ks)
-        }
-        "del" | "Del" | "delete" => {
-            let k = args.get(if name == "kv" { 1 } else { 0 }).and_then(|x| x.as_str()).unwrap_or("");
-            KV.with(|kv| kv.borrow_mut().remove(k));
-            "{\"ok\":true,\"value\":true}".into()
-        }
-        _ => return None,
-    };
-    Some(r)
 }
 
 // ---- tiny helpers ----------------------------------------------------------

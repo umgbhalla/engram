@@ -181,11 +181,6 @@ class GlueKernel {
     // W4: the previous committed image, retained host-side (NOT in the VM heap), so the next
     // checkpoint can byte-diff against it. Dropped on evict; re-derived on cold wake (base+deltas).
     this._lastImage = null;
-    // V0.9 host-side context store (host.ctx.*) — chunked, persisted across restore.
-    this._ctx = new Map();
-    this._final = null;     // RLM termination sentinel (host.final / host.finalVar)
-    this._subLMCalls = 0;
-    this._subLMEndpoint = null;
   }
 
   _newInstance(rngSeed) {
@@ -273,8 +268,7 @@ class GlueKernel {
     configJson,
     label,
     kvJson,
-    usedHeap,
-    ctxJson
+    usedHeap
   ) {
     this._applyConfig(configJson);
     const t0 = Date.now();
@@ -315,8 +309,6 @@ class GlueKernel {
     if (kvJson && kvJson !== "{}") this._importKv(kvJson);
     // W4: retain the reconstructed image so the next warm checkpoint diffs against it.
     this._lastImage = raw.slice();
-    // V0.9: rehydrate the host-side context store from the meta.
-    this._deserializeContext(ctxJson);
     this.lastTimings = { gunzipMs, instantiateMs: 0, growCount, neededPages: needPages };
     return label || "sqlite-restore";
   }
@@ -324,7 +316,7 @@ class GlueKernel {
   // W4 restore: reconstruct the raw image from a gz'd full base + an ordered chain of gz'd
   // deltas, then blit (same path as restore()). deltaList = [{gz, indicesGz, grain}] applied
   // in order. docs/W4-BYTEDELTA-PLAN.md.
-  async restoreW4(baseGz, deltaList, engineHash, clockCalls, rngCalls, configJson, label, kvJson, usedHeap, ctxJson) {
+  async restoreW4(baseGz, deltaList, engineHash, clockCalls, rngCalls, configJson, label, kvJson, usedHeap) {
     this._applyConfig(configJson);
     const t0 = Date.now();
     const base = await gunzip(baseGz);
@@ -380,7 +372,6 @@ class GlueKernel {
     this._ex().set_counters(BigInt(clockCalls | 0), BigInt(rngCalls | 0));
     if (kvJson && kvJson !== "{}") this._importKv(kvJson);
     this._lastImage = image.slice();
-    this._deserializeContext(ctxJson);
     this.lastTimings = { gunzipMs, instantiateMs: 0, growCount, neededPages: needPages, deltas: deltas.length };
     return label || "sqlite-restore";
   }
@@ -393,7 +384,6 @@ class GlueKernel {
   lastCellHostResults() {
     try { return JSON.stringify(this._cellHostResults || []); } catch { return "[]"; }
   }
-  subLMCalls() { return this._subLMCalls | 0; }
 
   // evalCode: ASYNC. Drives the engine eval_begin/eval_resume loop, servicing host
   // effects (host.fetch -> DO-side fetch). Returns the rich JSON result STRING and
@@ -438,135 +428,14 @@ class GlueKernel {
     }
   }
 
-  // host effects the ENGINE cannot do from wasip1: fetch (allowlisted), the V0.9 codemode/RLM
-  // surface (host.subLM / host.ctx.* / host.final / host.finalVar). host.kv is handled INSIDE
-  // the engine (small + persisted), so it never reaches here.
+  // host effects the ENGINE cannot do from wasip1: fetch (allowlisted). The RLM surface
+  // (host.subLM / host.ctx.* / host.final / host.finalVar) and host.kv were removed.
   async _serviceHostCall(req) {
     const name = req.name;
     const args = req.args || [];
     if (name === "fetch") return this._doFetch(args[0], args[1]);
-    if (name === "subLM") return this._doSubLM(args[0], args[1]);
-    // V0.9 RLM termination sentinels.
-    if (name === "final") { this._final = { kind: "FINAL", value: args[0] === undefined ? null : args[0] }; return { ok: true, value: true }; }
-    if (name === "finalVar") { this._final = { kind: "FINAL_VAR", var: String(args[0]) }; return { ok: true, value: true }; }
-    // V0.9 host-side context handle tools (host.ctx.* dispatched as host.ctx with op as arg0,
-    // OR ergonomic host.ctxLen/ctxSlice/... names). Bytes never cross fully into the VM.
-    if (name === "ctx" || name.startsWith("ctx")) {
-      const op = name === "ctx" ? String(args[0] || "") : name.slice(3).replace(/^([A-Z])/, (m) => m.toLowerCase());
-      const rest = name === "ctx" ? args.slice(1) : args;
-      return { ok: true, value: this._ctxOp(op, rest) };
-    }
-    if (name === "ctxSet" || name === "setCtx") { this._ctxSet(args[0], args[1]); return { ok: true, value: (this._ctxGet(args[0]) || "").length }; }
     // unknown host fn -> typed reject (engine turns this into a rejected VM promise).
     return { ok: false, error: "UnknownHostFn: host." + name };
-  }
-
-  async _doSubLM(prompt, opts) {
-    this._subLMCalls++;
-    const endpoint = this._subLMEndpoint || (this.config && this.config.subLMEndpoint) || "";
-    if (!endpoint) {
-      return { ok: false, error: "host.subLM unavailable: config.subLMEndpoint is not set" };
-    }
-    try {
-      const r = await fetch(endpoint, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ prompt: String(prompt == null ? "" : prompt), opts: opts || {} }),
-      });
-      const body = await r.text();
-      let parsed = null;
-      try { parsed = JSON.parse(body); } catch { parsed = { text: body }; }
-      return { ok: true, value: parsed };
-    } catch (e) {
-      return { ok: false, error: "SubLMError: " + String(e && e.message || e) };
-    }
-  }
-
-  // ---- V0.9 host-side context store (host.ctx.*) — chunked, persisted across restore ----
-  static get DEFAULT_CTX() { return "__default"; }
-  _ctxGet(name) { const v = this._ctx.get(name == null ? "__default" : String(name)); return typeof v === "string" ? v : ""; }
-  _ctxSet(name, blob) { this._ctx.set(name == null ? "__default" : String(name), String(blob == null ? "" : blob)); }
-  _ctxOp(op, args) {
-    const CTX_MAX_SLICE = 256 * 1024, CTX_GREP_MAX = 1000;
-    const s = this._ctxGet(op === "names" ? null : args[args.length - 1] !== undefined && typeof args[args.length - 1] === "string" && /[A-Za-z_]/.test(args[args.length - 1]) ? args[args.length - 1] : null);
-    switch (op) {
-      case "names": return Array.from(this._ctx.keys());
-      case "len": return this._ctxGet(args[0]).length;
-      case "set": this._ctxSet(args[0], args[1]); return (this._ctxGet(args[0]) || "").length;
-      case "slice": {
-        const str = this._ctxGet(args[2]);
-        let start = args[0] == null ? 0 : args[0] | 0;
-        let end = args[1] == null ? str.length : args[1] | 0;
-        if (start < 0) start = Math.max(0, str.length + start);
-        if (end < 0) end = Math.max(0, str.length + end);
-        if (end - start > CTX_MAX_SLICE) end = start + CTX_MAX_SLICE;
-        return str.slice(start, end);
-      }
-      case "chunk": {
-        const str = this._ctxGet(args[1]);
-        const n = Math.max(1, args[0] == null ? 4000 : args[0] | 0);
-        const out = [];
-        for (let start = 0, i = 0; start < str.length; start += n, i++) {
-          const end = Math.min(str.length, start + n);
-          out.push({ i, start, end, len: end - start });
-          if (out.length > 100000) break;
-        }
-        return out;
-      }
-      case "get": {
-        const str = this._ctxGet(args[2]);
-        const n = Math.max(1, args[1] == null ? 4000 : args[1] | 0);
-        const idx = Math.max(0, args[0] | 0);
-        const start = idx * n;
-        return str.slice(start, Math.min(str.length, start + Math.min(n, CTX_MAX_SLICE)));
-      }
-      case "grep": {
-        const str = this._ctxGet(args[2]);
-        const o = args[1] && typeof args[1] === "object" ? args[1] : {};
-        const flags = typeof o.flags === "string" ? o.flags : "i";
-        const max = Number.isFinite(o.max) ? Math.min(o.max | 0, 5000) : CTX_GREP_MAX;
-        let rx;
-        try { rx = new RegExp(String(args[0]), flags.includes("g") ? flags : flags + "g"); }
-        catch (e) { return { error: "bad regexp: " + String(e && e.message || e) }; }
-        const out = []; let m, guard = 0;
-        while ((m = rx.exec(str)) !== null) {
-          if (++guard > 200000) break;
-          const idx = m.index;
-          let ls = str.lastIndexOf("\n", idx); ls = ls < 0 ? 0 : ls + 1;
-          let le = str.indexOf("\n", idx); if (le < 0) le = str.length;
-          let line = str.slice(ls, le); if (line.length > 2048) line = line.slice(0, 2048) + "…";
-          out.push({ i: idx, match: m[0].slice(0, 256), line });
-          if (out.length >= max) break;
-          if (m.index === rx.lastIndex) rx.lastIndex++;
-        }
-        return out;
-      }
-      default: return null;
-    }
-  }
-  _serializeContext() {
-    const store = {};
-    for (const [k, v] of this._ctx) store[k] = v;
-    // RLM sentinel + subLM counter travel alongside the ctx store so they survive cold restore.
-    try { return JSON.stringify({ store, final: this._final, subLMCalls: this._subLMCalls | 0 }); }
-    catch { return "{}"; }
-  }
-  _deserializeContext(json) {
-    this._ctx = new Map();
-    this._final = null;
-    this._subLMCalls = 0;
-    if (!json || json === "{}") return;
-    try {
-      const o = JSON.parse(json);
-      // back-compat: legacy flat {name:blob} or new {store,final,subLMCalls}.
-      const store = o && o.store && typeof o.store === "object" ? o.store : o;
-      for (const k of Object.keys(store)) {
-        if (k === "store" || k === "final" || k === "subLMCalls") continue;
-        this._ctx.set(k, String(store[k]));
-      }
-      if (o && o.final !== undefined) this._final = o.final;
-      if (o && Number.isFinite(o.subLMCalls)) this._subLMCalls = o.subLMCalls | 0;
-    } catch {}
   }
 
   async _doFetch(url, init) {
@@ -670,7 +539,6 @@ class GlueKernel {
       clockCalls: Number(ex.clock_calls()),
       rngCalls: Number(ex.rng_calls()),
       kvJson: this._exportKv(),
-      ctxJson: this._serializeContext(),
     };
   }
 
@@ -762,33 +630,6 @@ class GlueKernel {
     ex.kv_import(ex.scratch_ptr(), bytes.length);
   }
 
-  // V0.9 host-side context store — set a named blob from the host (lib.rs {t:setContext}).
-  // Returns the stored length. Persisted across restore (travels in the snapshot meta).
-  setContext(name, blob) {
-    this._ctxSet(name, blob);
-    return this._ctxGet(name).length;
-  }
-  getContextJson() { return this._serializeContext(); }
-  // V0.9 RLM termination: report the captured final sentinel (host.final / host.finalVar).
-  // For FINAL_VAR, resolve the named global from the VM at report time.
-  finalInfo() {
-    const f = this._final;
-    if (!f) return JSON.stringify({ final: null, subLMCalls: this._subLMCalls | 0 });
-    if (f.kind === "FINAL_VAR") {
-      let value = null;
-      try {
-        const ex = this._ex();
-        const code = "(function(){try{return JSON.stringify(globalThis[" + JSON.stringify(f.var) + "]);}catch(e){return 'null';}})()";
-        const srcBytes = TEXT_ENC.encode(code);
-        this._writeScratch(srcBytes);
-        ex.eval_begin(ex.scratch_ptr(), srcBytes.length, BigInt(100000), 0);
-        const res = JSON.parse(this._readResult());
-        value = res && res.value !== undefined ? res.value : null;
-      } catch {}
-      return JSON.stringify({ kind: "FINAL_VAR", var: f.var, value, subLMCalls: this._subLMCalls | 0 });
-    }
-    return JSON.stringify({ kind: f.kind, value: f.value, subLMCalls: this._subLMCalls | 0 });
-  }
   // stdlib injection: report which modules were injected at create (the esbuilt bundle evaled
   // into the VM). The actual catalog is wired by lib.rs via the STDLIB bundle Text module.
   stdlibInfo() {
@@ -798,10 +639,9 @@ class GlueKernel {
   // the byte-blit image is invalid (a different engine layout), so the DO replays the retained
   // cell oplog into a FRESH instance under the same config — no re-fire of pure cells, host
   // results fed back from the recorded oplog. journal = [{src, hostResults:[...]}].
-  async replayJournal(journal, configJson, kvJson, ctxJson) {
+  async replayJournal(journal, configJson, kvJson) {
     await this.createFresh(configJson);
     if (kvJson && kvJson !== "{}") this._importKv(kvJson);
-    this._deserializeContext(ctxJson || "{}");
     const cells = Array.isArray(journal) ? journal : [];
     let replayed = 0, failed = 0, effectful = 0;
     const errors = [];

@@ -43,7 +43,6 @@ extern "C" {
         label: &str,
         kv_json: &str,
         used_heap: f64,
-        ctx_json: &str,
     ) -> js_sys::Promise;
     #[wasm_bindgen(method, js_name = restoreW4)]
     fn restore_w4(
@@ -57,7 +56,6 @@ extern "C" {
         label: &str,
         kv_json: &str,
         used_heap: f64,
-        ctx_json: &str,
     ) -> js_sys::Promise;
     #[wasm_bindgen(method, js_name = lastRestoreTimings)]
     fn last_restore_timings(this: &GlueKernel) -> String;
@@ -69,21 +67,12 @@ extern "C" {
     fn dump_w4(this: &GlueKernel, force_full: bool) -> js_sys::Promise;
     #[wasm_bindgen(method, js_name = lastCellHostResults)]
     fn last_cell_host_results(this: &GlueKernel) -> String;
-    #[wasm_bindgen(method, js_name = setContext)]
-    fn set_context(this: &GlueKernel, name: &str, blob: &str) -> i32;
-    #[wasm_bindgen(method, js_name = getContextJson)]
-    fn get_context_json(this: &GlueKernel) -> String;
-    #[wasm_bindgen(method, js_name = finalInfo)]
-    fn final_info(this: &GlueKernel) -> String;
-    #[wasm_bindgen(method, js_name = stdlibInfo)]
-    fn stdlib_info(this: &GlueKernel) -> String;
     #[wasm_bindgen(method, js_name = replayJournal)]
     fn replay_journal(
         this: &GlueKernel,
         journal: &JsValue,
         config_json: &str,
         kv_json: &str,
-        ctx_json: &str,
     ) -> js_sys::Promise;
     #[wasm_bindgen(method, js_name = drop)]
     fn drop_kernel(this: &GlueKernel);
@@ -138,7 +127,6 @@ impl DurableObject for KernelDO {
         let _ = sql.exec("ALTER TABLE snap_manifest ADD COLUMN base_seq INTEGER;", None);
         let _ = sql.exec("ALTER TABLE snap_manifest ADD COLUMN delta_seq INTEGER;", None);
         let _ = sql.exec("ALTER TABLE snap_manifest ADD COLUMN snap_mode TEXT;", None);
-        let _ = sql.exec("ALTER TABLE snap_manifest ADD COLUMN ctx_n_chunks INTEGER;", None);
         sql.exec(
             "CREATE TABLE IF NOT EXISTS delta_chunks (
                 seq INTEGER PRIMARY KEY, payload BLOB, indices BLOB, grain INTEGER
@@ -146,12 +134,6 @@ impl DurableObject for KernelDO {
             None,
         )
         .expect("create delta_chunks");
-        // V0.9 host-side context store (host.ctx.*) — chunked across rows (can be multi-MB).
-        sql.exec(
-            "CREATE TABLE IF NOT EXISTS ctx_chunks (seq INTEGER PRIMARY KEY, data BLOB);",
-            None,
-        )
-        .expect("create ctx_chunks");
         // E6 oplog: per-cell {src, hostResults} appended for the crash tail + engine-migration
         // replay. Bounded to the cells since the last full base (cleared on base reset).
         sql.exec(
@@ -351,30 +333,6 @@ impl KernelDO {
                 Ok(json!({"ok": true, "t": "evict", "droppedInMemory": had,
                     "generation": self.generation}))
             }
-            "setContext" => {
-                // V0.9 host-side context store: set a named blob, persist it immediately so it
-                // survives even if no eval/checkpoint follows.
-                let release = JsFuture::from(self.mutex.acquire()).await.map_err(to_err)?;
-                let res = self.set_context_critical(&msg).await;
-                let _ = js_sys::Function::from(release).call0(&JsValue::NULL);
-                res
-            }
-            "final" => {
-                // V0.9 RLM termination report (host.final / host.finalVar captured value).
-                if self.glue.borrow().is_none() {
-                    return Ok(json!({"ok": true, "t": "final", "final": serde_json::Value::Null}));
-                }
-                let info = self.glue.borrow().as_ref().unwrap().final_info();
-                let parsed: serde_json::Value = serde_json::from_str(&info).unwrap_or(json!({}));
-                Ok(json!({"ok": true, "t": "final", "final": parsed}))
-            }
-            "stdlib" => {
-                let _ = self.ensure_glue().await?;
-                let info = self.glue.borrow().as_ref().unwrap().stdlib_info();
-                let parsed: serde_json::Value = serde_json::from_str(&info).unwrap_or(json!({}));
-                Ok(json!({"ok": true, "t": "stdlib", "stdlib": parsed,
-                    "engineHash": get_engine_hash(), "generation": self.generation}))
-            }
             "_forceEngineMismatch" => {
                 // TEST-ONLY (E6 engine-migration): rewrite the committed manifest's engine_hash to
                 // a bogus value + drop the in-memory glue, so the next eval cold-restores via the
@@ -483,32 +441,6 @@ impl KernelDO {
         }))
     }
 
-    async fn set_context_critical(&self, msg: &serde_json::Value) -> Result<serde_json::Value> {
-        let name = msg.get("name").and_then(|v| v.as_str()).unwrap_or("__default");
-        let blob = msg.get("blob").and_then(|v| v.as_str()).unwrap_or("");
-        self.ensure_glue().await?;
-        let len = self.glue.borrow().as_ref().unwrap().set_context(name, blob);
-        // Persist the full context store into ctx_chunks now (survives evict even with no eval).
-        let ctx_json = self.glue.borrow().as_ref().unwrap().get_context_json();
-        let ctx_bytes = ctx_json.into_bytes();
-        let sql = self.state.storage().sql();
-        let txn = || -> Result<i64> {
-            sql.exec("DELETE FROM ctx_chunks;", None)?;
-            let mut seq = 0i64;
-            for chunk in ctx_bytes.chunks(CHUNK_BYTES) {
-                sql.exec("INSERT INTO ctx_chunks(seq,data) VALUES (?,?);",
-                    vec![seq.into(), chunk.to_vec().into()])?;
-                seq += 1;
-            }
-            // bump manifest ctx_n_chunks if a snapshot already exists.
-            sql.exec("UPDATE snap_manifest SET ctx_n_chunks=? WHERE id=1;", vec![seq.into()])?;
-            Ok(seq)
-        };
-        let n = txn()?;
-        Ok(json!({"ok": true, "t": "setContext", "name": name, "len": len, "ctxChunks": n,
-            "generation": self.generation}))
-    }
-
     async fn reset_critical(&self) -> Result<serde_json::Value> {
         let taken = self.glue.borrow_mut().take();
         if let Some(g) = taken {
@@ -524,7 +456,6 @@ impl KernelDO {
         let sql = self.state.storage().sql();
         sql.exec("DELETE FROM snap_chunks;", None).ok();
         sql.exec("DELETE FROM delta_chunks;", None).ok();
-        sql.exec("DELETE FROM ctx_chunks;", None).ok();
         sql.exec("DELETE FROM oplog;", None).ok();
         sql.exec("DELETE FROM snap_manifest;", None).ok();
         if let Ok(bucket) = self.env.bucket("SNAPSHOTS") {
@@ -571,7 +502,6 @@ impl KernelDO {
                 self.read_chunks(m.n_chunks)?
             };
             read_ms = now_ms() - t0;
-            let ctx_json = self.read_ctx_json(m.ctx_n_chunks);
 
             // E6 ENGINE-MIGRATION: if the committed snapshot was written by a DIFFERENT engine
             // build, the byte-blit image is invalid (different layout). Replay the oplog tail into
@@ -583,7 +513,6 @@ impl KernelDO {
                     journal.as_ref(),
                     &cfg_str,
                     &m.kv_json,
-                    &ctx_json,
                 ))
                 .await
                 .map_err(to_err)?;
@@ -602,7 +531,6 @@ impl KernelDO {
                     label,
                     &m.kv_json,
                     m.used_heap as f64,
-                    &ctx_json,
                 ))
                 .await
                 .map_err(to_err)?;
@@ -653,14 +581,12 @@ impl KernelDO {
         let grain = num_field(&dump, "grain").unwrap_or(256.0) as i64;
         let n_changed = num_field(&dump, "nChanged").unwrap_or(0.0) as i64;
         let kv_json = str_field(&dump, "kvJson").unwrap_or_else(|| "{}".to_string());
-        let ctx_json = str_field(&dump, "ctxJson").unwrap_or_else(|| "{}".to_string());
 
         let mut bytes = vec![0u8; gz.length() as usize];
         gz.copy_to(&mut bytes);
 
         // E6 oplog row for this cell (host results captured during eval).
         let host_results = glue.last_cell_host_results();
-        let ctx_bytes = ctx_json.into_bytes();
 
         let is_delta = mode == "delta" && prev.is_some();
 
@@ -679,19 +605,11 @@ impl KernelDO {
             let base_size_gz = pm.size_gz;
             let oplog_seq = delta_seq_new + 1;
             let sql = self.state.storage().sql();
-            let txn = || -> Result<i64> {
+            let txn = || -> Result<()> {
                 sql.exec(
                     "INSERT INTO delta_chunks(seq, payload, indices, grain) VALUES (?,?,?,?);",
                     vec![delta_seq_new.into(), bytes.clone().into(), idx_bytes.clone().into(), grain.into()],
                 )?;
-                // replace ctx store (it can change per cell).
-                sql.exec("DELETE FROM ctx_chunks;", None)?;
-                let mut ctx_seq = 0i64;
-                for chunk in ctx_bytes.chunks(CHUNK_BYTES) {
-                    sql.exec("INSERT INTO ctx_chunks(seq,data) VALUES (?,?);",
-                        vec![ctx_seq.into(), chunk.to_vec().into()])?;
-                    ctx_seq += 1;
-                }
                 // append oplog tail row.
                 sql.exec("INSERT INTO oplog(seq,cell,src,host_results) VALUES (?,?,?,?);",
                     vec![oplog_seq.into(), cell.into(), src.into(), host_results.clone().into()])?;
@@ -699,20 +617,20 @@ impl KernelDO {
                 sql.exec(
                     "INSERT INTO snap_manifest
                         (id,cell,epoch,n_chunks,size_raw,size_gz,engine_hash,clock_calls,rng_calls,
-                         store,r2_key,created_ms,kv_json,used_heap,delta_seq,ctx_n_chunks,snap_mode)
-                     VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
+                         store,r2_key,created_ms,kv_json,used_heap,delta_seq,snap_mode)
+                     VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
                     vec![
                         cell.into(), epoch.into(), base_n_chunks.into(),
                         base_size_raw.into(), base_size_gz.into(), base_engine.clone().into(),
                         clock_calls.into(), rng_calls.into(), base_store.clone().into(),
                         base_r2_key.clone().into(), now_ms().into(), kv_json.clone().into(),
-                        used_heap.into(), (delta_seq_new + 1).into(), ctx_seq.into(),
+                        used_heap.into(), (delta_seq_new + 1).into(),
                         "delta".to_string().into(),
                     ],
                 )?;
                 sql.exec("INSERT INTO meta(k,v) VALUES('committedCell',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v;",
                     vec![cell.to_string().into()])?;
-                Ok(ctx_seq)
+                Ok(())
             };
             txn()?;
             return Ok(json!({
@@ -739,10 +657,9 @@ impl KernelDO {
 
         let sql = self.state.storage().sql();
         let r2_key_for_manifest = new_r2_key.clone();
-        let txn = || -> Result<(i64, i64)> {
+        let txn = || -> Result<i64> {
             sql.exec("DELETE FROM snap_chunks;", None)?;
             sql.exec("DELETE FROM delta_chunks;", None)?;
-            sql.exec("DELETE FROM ctx_chunks;", None)?;
             sql.exec("DELETE FROM oplog;", None)?;
             sql.exec("DELETE FROM snap_manifest;", None)?;
             let n_chunks = if to_r2 {
@@ -756,33 +673,27 @@ impl KernelDO {
                 }
                 seq
             };
-            let mut ctx_seq = 0i64;
-            for chunk in ctx_bytes.chunks(CHUNK_BYTES) {
-                sql.exec("INSERT INTO ctx_chunks(seq,data) VALUES (?,?);",
-                    vec![ctx_seq.into(), chunk.to_vec().into()])?;
-                ctx_seq += 1;
-            }
             // oplog: a full base is a fresh recovery point — seed the tail with THIS cell.
             sql.exec("INSERT INTO oplog(seq,cell,src,host_results) VALUES (0,?,?,?);",
                 vec![cell.into(), src.into(), host_results.clone().into()])?;
             sql.exec(
                 "INSERT INTO snap_manifest
                     (id,cell,epoch,n_chunks,size_raw,size_gz,engine_hash,clock_calls,rng_calls,
-                     store,r2_key,created_ms,kv_json,used_heap,delta_seq,ctx_n_chunks,snap_mode)
-                 VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
+                     store,r2_key,created_ms,kv_json,used_heap,delta_seq,snap_mode)
+                 VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
                 vec![
                     cell.into(), epoch.into(), n_chunks.into(),
                     size_raw.into(), size_gz.into(), get_engine_hash().into(),
                     clock_calls.into(), rng_calls.into(), store.clone().into(),
                     r2_key_for_manifest.clone().into(), now_ms().into(), kv_json.clone().into(),
-                    used_heap.into(), 0i64.into(), ctx_seq.into(), "full".to_string().into(),
+                    used_heap.into(), 0i64.into(), "full".to_string().into(),
                 ],
             )?;
             sql.exec("INSERT INTO meta(k,v) VALUES('committedCell',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v;",
                 vec![cell.to_string().into()])?;
-            Ok((n_chunks, ctx_seq))
+            Ok(n_chunks)
         };
-        let (n_chunks, _ctx_seq) = txn()?;
+        let n_chunks = txn()?;
 
         if let Some(old) = old_r2_key {
             if old != new_r2_key {
@@ -818,15 +729,13 @@ impl KernelDO {
             #[serde(default)]
             delta_seq: Option<i64>,
             #[serde(default)]
-            ctx_n_chunks: Option<i64>,
-            #[serde(default)]
             size_raw: Option<i64>,
             #[serde(default)]
             size_gz: Option<i64>,
         }
         let rows: Vec<Row> = sql
             .exec(
-                "SELECT cell,epoch,n_chunks,engine_hash,clock_calls,rng_calls,store,r2_key,kv_json,used_heap,delta_seq,ctx_n_chunks,size_raw,size_gz
+                "SELECT cell,epoch,n_chunks,engine_hash,clock_calls,rng_calls,store,r2_key,kv_json,used_heap,delta_seq,size_raw,size_gz
                  FROM snap_manifest WHERE id=1 LIMIT 1;",
                 None,
             )
@@ -845,7 +754,6 @@ impl KernelDO {
             kv_json: r.kv_json.unwrap_or_else(|| "{}".into()),
             used_heap: r.used_heap.unwrap_or(0),
             delta_seq: r.delta_seq.unwrap_or(0),
-            ctx_n_chunks: r.ctx_n_chunks.unwrap_or(0),
             size_raw: r.size_raw.unwrap_or(0),
             size_gz: r.size_gz.unwrap_or(0),
         })
@@ -894,29 +802,6 @@ impl KernelDO {
             )));
         }
         Ok(out)
-    }
-
-    // Read the chunked host-side context store back into a single JSON string.
-    fn read_ctx_json(&self, n_chunks: i64) -> String {
-        if n_chunks <= 0 {
-            return "{}".into();
-        }
-        let sql = self.state.storage().sql();
-        let cursor = match sql.exec("SELECT data FROM ctx_chunks ORDER BY seq ASC;", None) {
-            Ok(c) => c,
-            Err(_) => return "{}".into(),
-        };
-        let mut buf: Vec<u8> = Vec::new();
-        for row in cursor.raw() {
-            if let Ok(row) = row {
-                for val in row {
-                    if let worker::SqlStorageValue::Blob(b) = val {
-                        buf.extend_from_slice(&b);
-                    }
-                }
-            }
-        }
-        String::from_utf8(buf).unwrap_or_else(|_| "{}".into())
     }
 
     // E6: read the committed oplog tail (cells since the last full base) as a JS Array of
@@ -1004,7 +889,6 @@ struct Manifest {
     kv_json: String,
     used_heap: i64,
     delta_seq: i64,
-    ctx_n_chunks: i64,
     size_raw: i64,
     size_gz: i64,
 }
