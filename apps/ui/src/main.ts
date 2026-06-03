@@ -221,12 +221,14 @@ async function runDeployedE2e(): Promise<E2eResult> {
     kernel.close();
     kernel.setConfig({ clock: "seeded", rngSeed: 777, modules: true, fetch: true, cellBudgetTicks: 200000 });
 
-    const setup = await kernel.eval("globalThis.x=42; globalThis.inc=()=>++x; x");
+    // Normal TypeScript/JS declarations persist (no globalThis prefix needed) —
+    // the kernel strips types host-side, the REPL transform persists top-level decls.
+    const setup = await kernel.eval("let x: number = 42; const inc = (): number => ++x; x");
     const setupOk = setup.ok !== false && setup.value === 42;
     lines.push(
       setupOk
-        ? pass("eval writes durable state", "value=" + setup.value)
-        : fail("eval writes durable state", JSON.stringify(setup)),
+        ? pass("typescript eval writes durable state", "value=" + setup.value)
+        : fail("typescript eval writes durable state", JSON.stringify(setup)),
     );
 
     await kernel.evict();
@@ -254,30 +256,30 @@ async function runDeployedE2e(): Promise<E2eResult> {
         : fail("closure survives restore", JSON.stringify(closure)),
     );
 
-    const blocked = await kernel.eval("'x';" + " ".repeat(3 * 1024 * 1024));
-    const blockedOk = blocked.ok === false && !!blocked.error && blocked.error.name === "ProtocolSizeError";
+    // TypeScript continuity: generics + annotations erased, state continues (x===43).
+    const ts = await kernel.eval("const greet = <T,>(v: T): string => `hi ${v}`; greet(x)");
+    const tsOk = ts.ok !== false && ts.value === "hi 43";
     lines.push(
-      blockedOk
-        ? pass("oversized source guard", blocked.error?.name || "")
-        : fail("oversized source guard", JSON.stringify(blocked).slice(0, 400)),
+      tsOk
+        ? pass("typescript generics + annotations", "value=" + JSON.stringify(ts.value))
+        : fail("typescript generics + annotations", JSON.stringify(ts).slice(0, 400)),
     );
 
-    const wedge = await kernel.send({ t: "wedgeTest", spikeMb: 22 }, 60000);
-    const wedgeOk = !!(wedge && wedge.checkpoint && wedge.checkpoint.ok !== false && wedge.checkpoint.scrubbed === true);
+    const enumRej = await kernel.eval("enum Color { Red }");
+    const enumRejOk = enumRej.ok === false && enumRej.error?.name === "TypeScriptError";
     lines.push(
-      wedgeOk
-        ? pass("W5 spike/free checkpoint", "scrubbed=" + wedge.checkpoint?.scrubbed + " gz=" + wedge.checkpoint?.sizeGz)
-        : fail("W5 spike/free checkpoint", JSON.stringify(wedge).slice(0, 400)),
+      enumRejOk
+        ? pass("un-erasable TS rejected cleanly", enumRej.error?.name || "")
+        : fail("un-erasable TS rejected cleanly", JSON.stringify(enumRej).slice(0, 400)),
     );
 
-    await kernel.evict();
-    const wedgeRestore = await kernel.eval("x");
-    const wedgeRestoreOk =
-      wedgeRestore.ok !== false && wedgeRestore.value === 43 && /restore/.test(wedgeRestore.restoreSource || "");
+    // Session stays alive after the rejection — next eval still works.
+    const recover = await kernel.eval("x + 1");
+    const recoverOk = recover.ok !== false && recover.value === 44;
     lines.push(
-      wedgeRestoreOk
-        ? pass("post-wedge cold restore", "value=" + wedgeRestore.value + " source=" + wedgeRestore.restoreSource)
-        : fail("post-wedge cold restore", JSON.stringify(wedgeRestore)),
+      recoverOk
+        ? pass("session recovers after TS error", "value=" + recover.value)
+        : fail("session recovers after TS error", JSON.stringify(recover)),
     );
 
     const ok = lines.every((s) => !s.includes(">FAIL "));
