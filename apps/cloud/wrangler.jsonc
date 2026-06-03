@@ -8,7 +8,7 @@
   //   structuredClone, Headers) delivered via {text}/{js}/{wasm} loader modules.
   // CUTOVER (2026-06-03): apps/cloud is now the RUST-facet cloud. Authored source is now
   // TypeScript: src/supervisor.ts (SupervisorDO + HttpGateway + auth + keep-warm + metering +
-  // facet loader). The build pipeline (scripts/build.mjs) runs: tsc --noEmit (strict) ->
+  // facet loader). The build pipeline (scripts/build.ts) runs: tsc --noEmit (strict) ->
   // bake-rust.ts (delivers apps/kernel Rust DO + engine.wasm into the facet via the {wasm}
   // Worker-Loader module type, generating src/modules.rust.gen.js) -> esbuild bundle
   // src/supervisor.ts -> dist/worker.mjs (the entry the runtime loads). Runtime behavior is
@@ -32,7 +32,7 @@
   "build": {
     // tsc-typecheck (strict) -> bake-rust (generate src/modules.rust.gen.js with the Rust DO +
     // engine.wasm + stdlib facet payload) -> esbuild bundle src/supervisor.ts -> dist/worker.mjs.
-    "command": "node scripts/build.mjs"
+    "command": "node scripts/build.ts"
   },
 
   "durable_objects": {

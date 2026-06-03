@@ -16,7 +16,7 @@
   //   4. SHA-256 the engine wasm into src/engine-hash.js (AFTER esbuild, which keeps it external).
   //   5. worker-build --release — compile the Rust DO shell (reads src/kernel-glue.mjs).
   "build": {
-    "command": "bun x tsc -p tsconfig.json && node scripts/build-ts.mjs && node scripts/build-engine.mjs && node scripts/engine-hash.mjs && worker-build --release"
+    "command": "bun x tsc -p tsconfig.json && node scripts/build-ts.ts && node scripts/build-engine.ts && node scripts/engine-hash.ts && worker-build --release"
   },
 
   // engine.wasm bundled as CompiledWasm => importable as a precompiled WebAssembly.Module
