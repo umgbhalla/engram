@@ -89,6 +89,10 @@ pub extern "C" fn scratch_ptr() -> *const u8 {
     core::ptr::addr_of!(SCRATCH) as *const u8
 }
 #[no_mangle]
+pub extern "C" fn scratch_cap() -> usize {
+    1 << 20
+}
+#[no_mangle]
 pub extern "C" fn result_ptr() -> *const u8 {
     core::ptr::addr_of!(RESULT) as *const u8
 }

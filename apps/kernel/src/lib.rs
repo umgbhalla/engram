@@ -89,6 +89,10 @@ extern "C" {
 
 const CHUNK_BYTES: usize = 64 * 1024;
 const SQLITE_HOT_MAX: usize = 2 * 1024 * 1024;
+/// DO SQLite caps a single bound value at ~2MB. Any TEXT/BLOB we bind in a checkpoint txn must
+/// stay below this or the INSERT throws SQLITE_TOOBIG mid-commit (aborting the staged transaction
+/// and risking a torn manifest). The E6 oplog `src` is the only unbounded text we bind; clamp it.
+const SQLITE_MAX_VALUE_BYTES: usize = 1_500_000;
 
 #[durable_object]
 pub struct KernelDO {
@@ -608,6 +612,24 @@ impl KernelDO {
 
         // E6 oplog row for this cell (host results captured during eval).
         let host_results = glue.last_cell_host_results();
+
+        // (b) CHECKPOINT size: clamp every value we will BIND in the staged txn below SQLite's
+        // ~2MB single-value cap, so the INSERT can never throw SQLITE_TOOBIG mid-commit. The oplog
+        // `src` is the only unbounded text; an oversized cell is recorded as a non-replayable marker
+        // (the byte-blit image stays the primary restore path; only engine-migration replay of THIS
+        // cell would no-op). host_results is bounded by the engine HOSTCALL buffer, but clamp it too
+        // as a belt-and-suspenders guard.
+        let src: String = if src.len() > SQLITE_MAX_VALUE_BYTES {
+            format!("/* engram: cell source {}B omitted from oplog (exceeds SQLite value cap) */", src.len())
+        } else {
+            src.to_string()
+        };
+        let src = src.as_str();
+        let host_results = if host_results.len() > SQLITE_MAX_VALUE_BYTES {
+            "[]".to_string()
+        } else {
+            host_results
+        };
 
         let is_delta = mode == "delta" && prev.is_some();
 

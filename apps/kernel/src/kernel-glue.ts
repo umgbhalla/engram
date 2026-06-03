@@ -56,6 +56,7 @@ interface EngineExports {
   used_heap(): number | bigint;
   scrub_arena(budgetMb: number): number | bigint;
   scratch_ptr(): number;
+  scratch_cap(): number;
   result_ptr(): number;
   result_len(): number;
   pending_host_call_ptr(): number;
@@ -277,6 +278,11 @@ const COMPACT_USED_RATIO = 0.4;                     // ...AND used/buffer < 0.4 
 // ---- W4 byte-delta thresholds (docs/W4-BYTEDELTA-PLAN.md, W4-proven) ----
 const DELTA_GRAIN_BYTES = 256;   // W4-proven sweet spot (295KB gz delta vs ~1MB full)
 const DELTA_FALLBACK_PCT = 0.5;  // delta >= 50% of full => store full base instead (dense-mutation fallback)
+// A delta row is stored as a SINGLE SQLite blob per column (payload / indices). DO SQLite caps a
+// single value at ~2MB, so a delta whose payload or indices gz exceeds this must NOT be emitted as
+// a delta (it'd hit SQLITE_TOOBIG on the delta_chunks INSERT). Fall back to a full base, which is
+// chunked (sqlite) or pushed to R2 — both side-step the single-value cap. Conservative ceiling.
+const DELTA_MAX_BLOB_BYTES = 1_400_000;
 
 const MAX_STDLIB_SOURCE_BYTES = 500 * 1024; // V0.7 GUARD 1: combined injected stdlib source cap
 
@@ -575,6 +581,21 @@ class GlueKernel {
       let transformed = tsOut;
       try { transformed = transformCell(tsOut); } catch { transformed = tsOut; }
       const srcBytes = TEXT_ENC.encode(transformed);
+      // (a) PROTOCOL/SOURCE size guard: reject an oversized cell source BEFORE writing it into the
+      // fixed scratch buffer. Typed ProtocolSizeError, socket alive, mutex released, next eval works.
+      const cap = ex.scratch_cap();
+      if (srcBytes.length > cap) {
+        return JSON.stringify({
+          ok: false,
+          valueType: "error",
+          logs: [],
+          error: {
+            name: "ProtocolSizeError",
+            message: "cell source " + srcBytes.length + "B exceeds max " + cap + "B",
+            stack: "",
+          },
+        });
+      }
       this._writeScratch(srcBytes);
       // per-cell guards: interrupt-tick budget + per-cell buffer-growth cap (pages). The budget
       // counts INTERRUPT-HANDLER invocations (QuickJS fires the handler every ~Nk bytecodes), so
@@ -601,12 +622,12 @@ class GlueKernel {
       }
       return this._readResult();
     } catch (e) {
-      const err = e as { message?: string };
+      const err = e as { name?: string; message?: string };
       return JSON.stringify({
         ok: false,
         valueType: "error",
         logs: [],
-        error: { name: "GlueError", message: String((err && err.message) || e), stack: "" },
+        error: { name: (err && err.name) || "GlueError", message: String((err && err.message) || e), stack: "" },
       });
     }
   }
@@ -773,7 +794,8 @@ class GlueKernel {
       const deltaStored = payGz.byteLength + idxGz.byteLength;
       // AUTO-FALLBACK: dense mutation (delta >= FALLBACK_PCT of a full gz image) => store full.
       const fullGz = await gzip(raw);
-      if (deltaStored < fullGz.byteLength * DELTA_FALLBACK_PCT) {
+      const deltaBlobsFit = payGz.byteLength <= DELTA_MAX_BLOB_BYTES && idxGz.byteLength <= DELTA_MAX_BLOB_BYTES;
+      if (deltaBlobsFit && deltaStored < fullGz.byteLength * DELTA_FALLBACK_PCT) {
         this._lastImage = raw.slice();
         return { mode: "delta", gz: payGz, indicesGz: idxGz, nChanged: changed.length, grain,
           imageLen: raw.byteLength, sizeGz: deltaStored, ...common };
@@ -833,8 +855,22 @@ class GlueKernel {
     return JSON.stringify({ replayed, failed, effectfulCells: effectful, errors });
   }
 
+  // _writeScratch: copy `bytes` into the engine's FIXED 1MB SCRATCH buffer. The engine exposes
+  // scratch_cap() = capacity; we bounds-check FIRST so an oversized payload throws a typed
+  // ProtocolSizeError (caller turns it into {ok:false}) instead of a TypedArray.set RangeError
+  // ("offset is out of bounds") that overruns linear memory. Universal backstop for every caller
+  // (eval source, stdlib IIFE, resume payload, kv import).
   _writeScratch(bytes: Uint8Array): void {
     const ex = this._ex();
+    const cap = ex.scratch_cap();
+    if (bytes.length > cap) {
+      const e = new Error(
+        "ProtocolSizeError: payload " + bytes.length + "B exceeds scratch capacity " + cap +
+          "B (max eval/source size)"
+      );
+      (e as Error & { name: string }).name = "ProtocolSizeError";
+      throw e;
+    }
     new Uint8Array(ex.memory.buffer).set(bytes, ex.scratch_ptr());
   }
   _readResult(): string {
