@@ -4,3 +4,6 @@
 
 engine/vendor/rquickjs/target/
 engine/vendor/**/*.o
+
+src/engine-hash.js
+src/engine.wasm
