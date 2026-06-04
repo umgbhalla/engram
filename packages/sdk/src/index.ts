@@ -115,6 +115,8 @@ export interface ConnectOptions {
   apiKey?: string;
   /** In-VM kernel config, applied once at connect. */
   config?: EngramConfig;
+  /** JS evaluated once after create to seed VM globals; runs on every reconnect, so keep it idempotent. */
+  bootstrap?: string;
   /** Throw a typed {@link EngramError} on a failed cell (default true). */
   throwOnError?: boolean;
   /** Auto-reconnect with backoff on transport drop (default true). */
@@ -497,17 +499,19 @@ export class EngramSession {
   private throwOnError: boolean;
   private timeoutMs: number;
   private config: EngramConfig;
+  private bootstrap?: string;
   private onConsole?: (line: ConsoleLine) => void;
 
   /** @internal */
   constructor(
     private transport: Transport,
-    opts: { session: string; throwOnError: boolean; timeoutMs: number; config: EngramConfig; onConsole?: (l: ConsoleLine) => void },
+    opts: { session: string; throwOnError: boolean; timeoutMs: number; config: EngramConfig; bootstrap?: string; onConsole?: (l: ConsoleLine) => void },
   ) {
     this.session = opts.session;
     this.throwOnError = opts.throwOnError;
     this.timeoutMs = opts.timeoutMs;
     this.config = opts.config;
+    this.bootstrap = opts.bootstrap;
     this.onConsole = opts.onConsole;
   }
 
@@ -515,6 +519,10 @@ export class EngramSession {
   async _applyConfig(): Promise<void> {
     if (this.config && Object.keys(this.config).length) {
       await this.transport.request({ t: "create", config: this.config }, this.timeoutMs);
+    }
+    // Seed VM globals once after create, before any user eval (runs on every reconnect).
+    if (this.bootstrap) {
+      await this.transport.request({ t: "eval", src: this.bootstrap }, this.timeoutMs);
     }
   }
 
@@ -649,6 +657,7 @@ export const Engram = {
     const autoReconnect = opts.autoReconnect !== false;
     const timeoutMs = opts.timeoutMs ?? 60000;
     const config = { ...(opts.config || {}) };
+    const bootstrap = typeof opts.bootstrap === "string" && opts.bootstrap.length ? opts.bootstrap : undefined;
     const base = String(opts.url).replace(/\/+$/, "");
 
     // Cloud HTTP path: an API key + an http(s) endpoint.
@@ -659,7 +668,7 @@ export const Engram = {
 
     if (opts.apiKey && isHttp) {
       const transport = new HttpTransport(base, opts.apiKey, session);
-      const s = new EngramSession(transport, { session, throwOnError, timeoutMs, config, onConsole: opts.onConsole });
+      const s = new EngramSession(transport, { session, throwOnError, timeoutMs, config, bootstrap, onConsole: opts.onConsole });
       applyHost(s);
       await s._applyConfig();
       return s;
@@ -681,9 +690,13 @@ export const Engram = {
         if (config && Object.keys(config).length) {
           await raw({ t: "create", config }, timeoutMs);
         }
+        // Seed VM globals once after create, before any user eval (runs on every reconnect).
+        if (bootstrap) {
+          await raw({ t: "eval", src: bootstrap }, timeoutMs);
+        }
       },
     });
-    s = new EngramSession(transport, { session, throwOnError, timeoutMs, config, onConsole: opts.onConsole });
+    s = new EngramSession(transport, { session, throwOnError, timeoutMs, config, bootstrap, onConsole: opts.onConsole });
     applyHost(s);
     // Force the first connect (onReady applies config).
     await transport.request({ t: "ping" }, timeoutMs).catch(() => {});
