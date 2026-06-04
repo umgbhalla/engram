@@ -17,6 +17,7 @@ use js_sys::{Reflect, Uint8Array};
 use serde_json::json;
 use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use worker::{
@@ -61,6 +62,8 @@ extern "C" {
     fn last_restore_timings(this: &GlueKernel) -> String;
     #[wasm_bindgen(method, js_name = evalCode)]
     fn eval_code(this: &GlueKernel, src: &str) -> js_sys::Promise;
+    #[wasm_bindgen(method, js_name = setHostSender)]
+    fn set_host_sender(this: &GlueKernel, send: &JsValue, timeout_ms: f64);
     #[wasm_bindgen(method, js_name = dump)]
     fn dump(this: &GlueKernel) -> js_sys::Promise;
     #[wasm_bindgen(method, js_name = dumpW4)]
@@ -79,6 +82,11 @@ extern "C" {
 
     #[wasm_bindgen(js_name = getEngineHash)]
     fn get_engine_hash() -> String;
+
+    // host-callback bridge: resolve a parked VM host call from a {t:hostcall-result}
+    // frame. Called from websocket_message OUTSIDE the eval mutex (see DEADLOCK note).
+    #[wasm_bindgen(js_name = resolveHostCall)]
+    fn resolve_host_call(id: &str, ok: bool, value_json: &str, error: &str);
 
     type Mutex;
     #[wasm_bindgen(js_name = newMutex)]
@@ -207,13 +215,36 @@ impl DurableObject for KernelDO {
                 return Ok(());
             }
         };
-        let reply = match serde_json::from_str::<serde_json::Value>(&raw) {
-            Ok(msg) => self
-                .handle(msg)
-                .await
-                .unwrap_or_else(|e| json!({"ok": false, "error": format!("{e}")})),
-            Err(_) => json!({"ok": false, "error": "bad json"}),
+        let msg = match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(m) => m,
+            Err(_) => {
+                ws.send_with_str("{\"ok\":false,\"error\":\"bad json\"}")?;
+                return Ok(());
+            }
         };
+        let t = msg.get("t").and_then(|v| v.as_str()).unwrap_or("");
+
+        // HOST-CALLBACK RESULT: a client's reply to a mid-eval {t:hostcall}. It MUST be
+        // resolved WITHOUT acquiring self.mutex — the mutex is held by the suspended eval
+        // that is awaiting this very reply (re-entrant deadlock otherwise; mirrors BUG-1).
+        // No eval reply is sent for this frame; the parked VM promise resumes and the
+        // original {t:eval} reply (sent later by eval_critical) carries the result.
+        if t == "hostcall-result" {
+            let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let ok = msg.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+            let value_json = msg
+                .get("value")
+                .map(|v| serde_json::to_string(v).unwrap_or_default())
+                .unwrap_or_default();
+            let error = msg.get("error").and_then(|v| v.as_str()).unwrap_or("");
+            resolve_host_call(id, ok, &value_json, error);
+            return Ok(());
+        }
+
+        let reply = self
+            .handle_with_ws(msg, Some(&ws))
+            .await
+            .unwrap_or_else(|e| json!({"ok": false, "error": format!("{e}")}));
         ws.send_with_str(&serde_json::to_string(&reply).unwrap())?;
         Ok(())
     }
@@ -311,7 +342,17 @@ impl KernelDO {
         format!("benchrustf/{}/e{}-c{}.qjs.gz", self.do_id, epoch, cell)
     }
 
+    /// No-ws entry (HTTP /frame / facet proxy path). Host callbacks are unavailable
+    /// here (no held client socket), so a non-fetch host.<name> call rejects cleanly.
     async fn handle(&self, msg: serde_json::Value) -> Result<serde_json::Value> {
+        self.handle_with_ws(msg, None).await
+    }
+
+    async fn handle_with_ws(
+        &self,
+        msg: serde_json::Value,
+        ws: Option<&WebSocket>,
+    ) -> Result<serde_json::Value> {
         let t = msg.get("t").and_then(|v| v.as_str()).unwrap_or("");
         match t {
             "gen" => {
@@ -339,7 +380,7 @@ impl KernelDO {
             }
             "eval" => {
                 let release = JsFuture::from(self.mutex.acquire()).await.map_err(to_err)?;
-                let res = self.eval_critical(&msg).await;
+                let res = self.eval_critical(&msg, ws).await;
                 let _ = js_sys::Function::from(release).call0(&JsValue::NULL);
                 res
             }
@@ -394,7 +435,11 @@ impl KernelDO {
         }))
     }
 
-    async fn eval_critical(&self, msg: &serde_json::Value) -> Result<serde_json::Value> {
+    async fn eval_critical(
+        &self,
+        msg: &serde_json::Value,
+        ws: Option<&WebSocket>,
+    ) -> Result<serde_json::Value> {
         let src = msg.get("src").and_then(|v| v.as_str()).unwrap_or("");
         let before = self.glue.borrow().is_some();
 
@@ -410,7 +455,32 @@ impl KernelDO {
 
         let info = self.ensure_glue().await?;
 
-        // eval (async; cell may await host.fetch). Returns rich JSON; never throws.
+        // HOST-CALLBACK BRIDGE: install a per-eval sender on the glue so a non-fetch
+        // host.<name>(...) call round-trips to the connected client over THIS ws. The
+        // sender is a JS closure that ws.send's the {t:hostcall} frame out-of-band; the
+        // client's {t:hostcall-result} reply is demuxed in websocket_message (no mutex)
+        // and resolves the parked VM call. When ws is None (HTTP /frame / facet path) we
+        // clear the sender, so non-fetch host calls reject cleanly (no held client socket).
+        {
+            let glue = clone_glue(self.glue.borrow().as_ref().unwrap());
+            if let Some(ws) = ws {
+                let ws_for_send: WebSocket = ws.clone();
+                let sender = Closure::wrap(Box::new(move |frame: JsValue| -> JsValue {
+                    let s = frame.as_string().unwrap_or_default();
+                    let ok = ws_for_send.send_with_str(&s).is_ok();
+                    JsValue::from_bool(ok)
+                }) as Box<dyn FnMut(JsValue) -> JsValue>);
+                glue.set_host_sender(sender.as_ref().unchecked_ref(), 60000.0);
+                // Leak the closure for the lifetime of this eval; it is replaced/cleared on
+                // the next eval. (One small closure per eval; bounded by serialized evals.)
+                sender.forget();
+            } else {
+                glue.set_host_sender(&JsValue::NULL, 0.0);
+            }
+        }
+
+        // eval (async; cell may await host.fetch OR a client host-callback). Returns rich
+        // JSON; never throws.
         let eval_promise = {
             let glue = clone_glue(self.glue.borrow().as_ref().unwrap());
             glue.eval_code(src)

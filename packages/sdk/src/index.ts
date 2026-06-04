@@ -125,6 +125,12 @@ export interface ConnectOptions {
   WebSocket?: unknown;
   /** Callback for every captured `console.*` line, across all cells. */
   onConsole?: (line: ConsoleLine) => void;
+  /**
+   * Host functions the VM can invoke as `host.<name>(...args)` mid-eval (the VM->client
+   * bridge). Each is bound via {@link EngramSession.bindHost} before connect returns.
+   * Requires the WebSocket transport (no-op over the cloud HTTP path).
+   */
+  host?: Record<string, (...a: unknown[]) => unknown | Promise<unknown>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -190,9 +196,14 @@ interface Frame {
   [k: string]: unknown;
 }
 
+/** A host function the VM can invoke via `host.<name>(...args)` during an eval. */
+type HostFn = (...args: unknown[]) => unknown | Promise<unknown>;
+
 interface Transport {
   /** Send one frame, await its single reply. */
   request(frame: Frame, timeoutMs: number): Promise<any>;
+  /** Register a host function callable from the VM as `host.<name>`. */
+  setHost(name: string, fn: HostFn): void;
   /** Tear down. */
   close(): void;
 }
@@ -216,12 +227,110 @@ class WsTransport implements Transport {
   private queue: Promise<unknown> = Promise.resolve();
   private closed = false;
   private reconnects = 0;
+  /** Host functions callable from the VM as `host.<name>`. */
+  private hostFns = new Map<string, HostFn>();
+  /** The resolver/rejecter for the single in-flight rpc on this socket, if any. */
+  private pending: { resolve: (v: any) => void; reject: (e: any) => void; timer: any } | null = null;
 
   constructor(
     private WS: any,
     private wsUrl: string,
     private opts: { autoReconnect: boolean; onReady?: (raw: (f: Frame, t: number) => Promise<any>) => Promise<void> },
   ) {}
+
+  setHost(name: string, fn: HostFn): void {
+    this.hostFns.set(name, fn);
+  }
+
+  /** Send a frame back to the kernel over the live socket (used for hostcall results). */
+  private sendRaw(obj: unknown): void {
+    try {
+      this.ws?.send(JSON.stringify(obj));
+    } catch {
+      /* socket gone; ignore — the in-flight rpc (if any) will reject via onClose */
+    }
+  }
+
+  /**
+   * Persistent message demux (mirrors the reference makeClient). An out-of-band
+   * `{t:'hostcall'}` frame is dispatched to a registered host fn and answered with a
+   * `{t:'hostcall-result'}` frame WITHOUT touching the in-flight rpc resolver. Every other
+   * frame is the reply to the single in-flight rpc.
+   */
+  private onMessage = (ev: any): void => {
+    const data = ev && ev.data !== undefined ? ev.data : ev;
+    let msg: any;
+    try {
+      msg = JSON.parse(typeof data === "string" ? data : data.toString());
+    } catch {
+      // Malformed frame. If it was meant to be the rpc reply, surface a typed error.
+      const p = this.pending;
+      if (p) {
+        this.pending = null;
+        clearTimeout(p.timer);
+        p.reject(new EngramError("malformed kernel reply"));
+      }
+      return;
+    }
+    if (msg && msg.t === "hostcall") {
+      const fn = this.hostFns.get(msg.name);
+      Promise.resolve()
+        .then(() => (fn ? fn(...((msg.args as unknown[]) || [])) : Promise.reject(new Error("no host fn " + msg.name))))
+        .then(
+          (value) => this.sendRaw({ t: "hostcall-result", id: msg.id, ok: true, value }),
+          (err) => this.sendRaw({ t: "hostcall-result", id: msg.id, ok: false, error: String((err && err.message) || err) }),
+        );
+      return;
+    }
+    // Any other frame is the reply to the in-flight rpc.
+    const p = this.pending;
+    if (p) {
+      this.pending = null;
+      clearTimeout(p.timer);
+      p.resolve(msg);
+    }
+  };
+
+  private onClose = (): void => {
+    const p = this.pending;
+    if (p) {
+      this.pending = null;
+      clearTimeout(p.timer);
+      p.reject(new EngramError("__ws_closed__"));
+    }
+  };
+
+  /**
+   * Detach the persistent listeners from the current socket, close it, and forget it.
+   * Used both on rpc timeout (so a late, orphaned reply lands on a dead socket and is
+   * dropped instead of mis-resolving the NEXT in-flight rpc) and when we replace the
+   * socket on reconnect (so the old socket's handlers can't fire into the new state).
+   * Does NOT reject `pending` — the caller owns that.
+   */
+  private dropSocket(): void {
+    const ws = this.ws;
+    this.ws = null;
+    if (!ws) return;
+    try {
+      if (ws.removeEventListener) {
+        ws.removeEventListener("message", this.onMessage);
+        ws.removeEventListener("close", this.onClose);
+      } else if (ws.off) {
+        ws.off("message", this.onMessage);
+        ws.off("close", this.onClose);
+      } else if (ws.removeListener) {
+        ws.removeListener("message", this.onMessage);
+        ws.removeListener("close", this.onClose);
+      }
+    } catch {
+      /* ignore */
+    }
+    try {
+      ws.close();
+    } catch {
+      /* ignore */
+    }
+  }
 
   private async open(): Promise<void> {
     if (this.ws && this.ws.readyState === 1) return;
@@ -233,9 +342,14 @@ class WsTransport implements Transport {
       if (ws.addEventListener) {
         ws.addEventListener("open", ok, { once: true });
         ws.addEventListener("error", fail, { once: true });
+        // ONE persistent handler for the lifetime of this socket.
+        ws.addEventListener("message", this.onMessage);
+        ws.addEventListener("close", this.onClose);
       } else {
         ws.once("open", ok);
         ws.once("error", fail);
+        ws.on("message", this.onMessage);
+        ws.on("close", this.onClose);
       }
     });
     this.reconnects = 0;
@@ -245,44 +359,31 @@ class WsTransport implements Transport {
     if (this.opts.onReady) await this.opts.onReady((f, t) => this.rawRequest(f, t));
   }
 
+  /**
+   * Send one frame and await its rpc reply. Does NOT install its own message listener —
+   * it just parks `pending`; the persistent {@link onMessage} handler resolves it.
+   */
   private rawRequest(frame: Frame, timeoutMs: number): Promise<any> {
     return new Promise((resolve, reject) => {
       const ws = this.ws;
-      const cleanup = () => {
-        clearTimeout(timer);
-        if (ws.removeEventListener) {
-          ws.removeEventListener("message", onMsg);
-          ws.removeEventListener("close", onClose);
-        } else {
-          ws.off("message", onMsg);
-          ws.off("close", onClose);
-        }
-      };
-      const onMsg = (ev: any) => {
-        cleanup();
-        const data = ev && ev.data !== undefined ? ev.data : ev;
-        try {
-          resolve(JSON.parse(typeof data === "string" ? data : data.toString()));
-        } catch (e) {
-          reject(new EngramError("malformed kernel reply"));
-        }
-      };
-      const onClose = () => {
-        cleanup();
-        reject(new EngramError("__ws_closed__"));
-      };
       const timer = setTimeout(() => {
-        cleanup();
+        // The frame is already on the wire and the kernel is still mid-eval; its late
+        // reply would otherwise mis-resolve the NEXT in-flight rpc on this socket
+        // (cross-talk). Tear the socket down so the orphaned reply lands on a dead
+        // socket and is dropped; the next queued request reconnects fresh (onReady
+        // re-applies config).
+        if (this.pending && this.pending.timer === timer) this.pending = null;
+        this.dropSocket();
         reject(new EngramError("request timed out"));
       }, timeoutMs);
-      if (ws.addEventListener) {
-        ws.addEventListener("message", onMsg, { once: true });
-        ws.addEventListener("close", onClose, { once: true });
-      } else {
-        ws.once("message", onMsg);
-        ws.once("close", onClose);
+      this.pending = { resolve, reject, timer };
+      try {
+        ws.send(JSON.stringify(frame));
+      } catch (e) {
+        if (this.pending && this.pending.timer === timer) this.pending = null;
+        clearTimeout(timer);
+        reject(new EngramError("__ws_closed__"));
       }
-      ws.send(JSON.stringify(frame));
     });
   }
 
@@ -294,7 +395,9 @@ class WsTransport implements Transport {
       } catch (e: any) {
         const dropped = e instanceof EngramError && e.message === "__ws_closed__";
         if (this.opts.autoReconnect && !this.closed && dropped) {
-          this.ws = null;
+          // Detach + close the old socket before replacing it, so its persistent
+          // message/close handlers can't fire into the new socket's state.
+          this.dropSocket();
           const backoff = Math.min(2000, 100 * 2 ** this.reconnects++);
           await sleep(backoff);
           await this.open();
@@ -314,13 +417,7 @@ class WsTransport implements Transport {
 
   close(): void {
     this.closed = true;
-    if (this.ws) {
-      try {
-        this.ws.close();
-      } catch {
-        /* ignore */
-      }
-    }
+    this.dropSocket();
   }
 }
 
@@ -377,6 +474,10 @@ class HttpTransport implements Transport {
       default:
         return this.call("/status", { method: "GET" });
     }
+  }
+
+  setHost(): void {
+    /* host callbacks require the WS bridge; no-op over HTTP */
   }
 
   close(): void {
@@ -511,6 +612,15 @@ export class EngramSession {
     return { restoreSource: reply?.restoreSource, generation: reply?.generation };
   }
 
+  /**
+   * Register a host function the VM can invoke as `host.<name>(...args)` mid-eval. The
+   * kernel sends an out-of-band hostcall frame; the SDK awaits `fn(...args)` and replies
+   * with the result so the parked VM call resumes. No-op over the HTTP (cloud) transport.
+   */
+  bindHost(name: string, fn: (...args: unknown[]) => unknown | Promise<unknown>): void {
+    this.transport.setHost(name, fn);
+  }
+
   /** Close the transport. The durable session persists server-side and can be reconnected. */
   close(): void {
     this.transport.close();
@@ -543,9 +653,14 @@ export const Engram = {
 
     // Cloud HTTP path: an API key + an http(s) endpoint.
     const isHttp = /^https?:\/\//i.test(base);
+    const applyHost = (s: EngramSession) => {
+      if (opts.host) for (const [name, fn] of Object.entries(opts.host)) s.bindHost(name, fn);
+    };
+
     if (opts.apiKey && isHttp) {
       const transport = new HttpTransport(base, opts.apiKey, session);
       const s = new EngramSession(transport, { session, throwOnError, timeoutMs, config, onConsole: opts.onConsole });
+      applyHost(s);
       await s._applyConfig();
       return s;
     }
@@ -569,6 +684,7 @@ export const Engram = {
       },
     });
     s = new EngramSession(transport, { session, throwOnError, timeoutMs, config, onConsole: opts.onConsole });
+    applyHost(s);
     // Force the first connect (onReady applies config).
     await transport.request({ t: "ping" }, timeoutMs).catch(() => {});
     return s;

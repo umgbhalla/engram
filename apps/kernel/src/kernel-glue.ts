@@ -93,6 +93,7 @@ interface KernelConfig {
   modules?: boolean | string[];
   cellBudgetTicks?: number;
   cellGrowCapPages?: number;
+  maxHostCallsPerCell?: number;
 }
 
 interface RestoreTimings {
@@ -256,6 +257,53 @@ function makeWasi(rngSeed: number): WasiCtl {
   return { wasi, setMem };
 }
 
+// ---- host-callback bridge (VM -> client over the kernel WS) ------------------
+//
+// A cell that calls `host.<name>(...args)` for any name OTHER than the built-in
+// `fetch` is a CLIENT host-callback: the kernel parks the VM eval, asks the connected
+// client (over the same WS) to compute the result, and resumes the VM with it. The
+// engine already suspends/resumes (host.fetch path) — we just route the request to the
+// client instead of a local fetch.
+//
+// DEADLOCK CONSTRAINT (the single most important design point): the eval critical
+// section in lib.rs holds `self.mutex` for the WHOLE eval. The client's
+// {t:hostcall-result} reply arrives as a NEW websocket_message. That handler MUST NOT
+// re-acquire the mutex (it is held by the suspended eval) — it must only resolve the
+// pending resolver. So the pending-resolver registry lives HERE in the glue module
+// (one DO isolate == one module instance), and lib.rs resolves it from
+// websocket_message WITHOUT touching the mutex.
+//
+// `host.fetch` is unchanged (serviced locally, DO-side). Determinism + crash-replay are
+// unaffected: the E6 oplog still records the host RESULT, so engine-migration replay
+// feeds the recorded value back WITHOUT re-calling the client (see evalCode replay path).
+
+interface HostCallSender {
+  // send a frame string to the client; returns false if no socket is available.
+  send: (frameJson: string) => boolean;
+  timeoutMs: number;
+}
+
+// One registry per glue module instance (== per DO isolate). callId -> resolver.
+const __pendingHostCalls = new Map<string, { resolve: (r: HostResult) => void; timer: ReturnType<typeof setTimeout> }>();
+let __hostCallSeq = 0;
+
+// Called by lib.rs from websocket_message on a {t:hostcall-result} frame, OUTSIDE the
+// eval mutex. Resolves the parked VM host call. No-throw; unknown ids are ignored
+// (late/duplicate replies).
+export function resolveHostCall(id: string, ok: boolean, valueJson: string, error: string): void {
+  const pend = __pendingHostCalls.get(id);
+  if (!pend) return;
+  __pendingHostCalls.delete(id);
+  clearTimeout(pend.timer);
+  if (ok) {
+    let value: unknown = null;
+    try { value = valueJson === undefined || valueJson === "" ? null : JSON.parse(valueJson); } catch { value = null; }
+    pend.resolve({ ok: true, value });
+  } else {
+    pend.resolve({ ok: false, error: error || "host callback failed" });
+  }
+}
+
 // ---- the GlueKernel the Rust DO drives ----
 export function newGlueKernel(): GlueKernel {
   return new GlueKernel();
@@ -320,6 +368,9 @@ class GlueKernel {
   _stdlibLoaded?: string[];
   _cellHostResults?: HostResult[];
   _replayHostResults?: HostResult[] | null;
+  // host-callback bridge: a per-eval sender the DO installs (via setHostSender) so a
+  // non-fetch host.<name> call can round-trip to the connected client over the WS.
+  _hostSender?: HostCallSender | null;
 
   constructor() {
     this.inst = null;
@@ -333,6 +384,15 @@ class GlueKernel {
     // W4: the previous committed image, retained host-side (NOT in the VM heap), so the next
     // checkpoint can byte-diff against it. Dropped on evict; re-derived on cold wake (base+deltas).
     this._lastImage = null;
+    this._hostSender = null;
+  }
+
+  // setHostSender: the DO installs (per eval) a sender that delivers a {t:hostcall} frame
+  // to the connected client and a timeoutMs. Pass `null` to clear (e.g. facet/HTTP path
+  // with no held client socket) so non-fetch host calls reject cleanly. `send` returns
+  // false when no live socket is available.
+  setHostSender(send: ((frameJson: string) => boolean) | null, timeoutMs: number): void {
+    this._hostSender = send ? { send, timeoutMs: timeoutMs > 0 ? timeoutMs : 60000 } : null;
   }
 
   _newInstance(rngSeed: number): WebAssembly.Instance {
@@ -604,9 +664,12 @@ class GlueKernel {
       const growCapPages = (this.config.cellGrowCapPages ?? 0) || 128; // ~8MB per cell
       let status = ex.eval_begin(ex.scratch_ptr(), srcBytes.length, budget, growCapPages);
       let guard = 0;
+      // host-call loop cap: bound the host calls a single cell may make (re-entrant cells
+      // can chain many). Configurable via config.maxHostCallsPerCell; default 64.
+      const maxHostCalls = (this.config.maxHostCallsPerCell ?? 0) || 64;
       // E6 oplog: capture host requests+results for the crash-tail journal (host-side).
       this._cellHostResults = [];
-      while (status === STATUS_HOST_CALL && guard++ < 64) {
+      while (status === STATUS_HOST_CALL && guard++ < maxHostCalls) {
         const req = this._readHostCall();
         let res: HostResult;
         if (this._replayHostResults && this._replayHostResults.length) {
@@ -637,9 +700,48 @@ class GlueKernel {
   async _serviceHostCall(req: HostCall): Promise<HostResult> {
     const name = req.name;
     const args = req.args || [];
+    // `fetch` is the built-in DO-side host effect (allowlisted). Everything else is a
+    // CLIENT host-callback: round-trip to the connected client over the WS.
     if (name === "fetch") return this._doFetch(args[0] as string, args[1] as RequestInit | undefined);
-    // unknown host fn -> typed reject (engine turns this into a rejected VM promise).
-    return { ok: false, error: "UnknownHostFn: host." + name };
+    return this._clientHostCall(name, args);
+  }
+
+  // _clientHostCall: park the VM eval, send {t:hostcall,id,name,args} to the client, and
+  // await the correlated {t:hostcall-result,id,...} reply (delivered out-of-band by lib.rs
+  // -> resolveHostCall). Rejects cleanly (never throws across the boundary) when there is
+  // no live socket, the payload is oversized, or the client never answers in time — the
+  // engine turns {ok:false} into a rejected VM promise, the cell fails, and the eval mutex
+  // is released.
+  async _clientHostCall(name: string, args: unknown[]): Promise<HostResult> {
+    const sender = this._hostSender;
+    if (!sender) {
+      return { ok: false, error: "HostCallUnavailable: no client socket for host." + name };
+    }
+    const id = "hc-" + (++__hostCallSeq).toString(36) + "-" + Date.now().toString(36);
+    let argsJson: string;
+    try {
+      argsJson = JSON.stringify(args ?? []);
+    } catch {
+      return { ok: false, error: "HostCallArgsError: host." + name + " args not JSON-serialisable" };
+    }
+    const frame = JSON.stringify({ t: "hostcall", id, name, args: JSON.parse(argsJson) });
+    // SIZE GUARD: mirror the engine HOSTCALL buffer (64KB) — refuse an oversized request.
+    if (TEXT_ENC.encode(frame).length > (1 << 16)) {
+      return { ok: false, error: "HostCallSizeError: host." + name + " request exceeds 64KB" };
+    }
+    return new Promise<HostResult>((resolve) => {
+      const timer = setTimeout(() => {
+        __pendingHostCalls.delete(id);
+        resolve({ ok: false, error: "HostCallTimeout: client did not answer host." + name + " in time" });
+      }, sender.timeoutMs);
+      __pendingHostCalls.set(id, { resolve, timer });
+      const sent = sender.send(frame);
+      if (!sent) {
+        __pendingHostCalls.delete(id);
+        clearTimeout(timer);
+        resolve({ ok: false, error: "HostCallUnavailable: client socket send failed for host." + name });
+      }
+    });
   }
 
   async _doFetch(url: string, init?: RequestInit): Promise<HostResult> {
