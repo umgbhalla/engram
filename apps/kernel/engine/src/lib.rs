@@ -400,6 +400,21 @@ if (typeof globalThis.process === 'undefined') {
     // no exit/stdin/kill/binding — the sandbox has no process identity.
   };
 }
+// Timers — IMMEDIATE semantics. setTimeout/setImmediate fire on the microtask queue and IGNORE
+// the delay, so they complete WITHIN the cell's settle drain — deterministic and hibernation-safe
+// (no timer ever spans a snapshot). setInterval is a NO-OP (a real repeating timer can't survive
+// the determinism/snapshot model; an immediate self-loop would hang). This unblocks the large set
+// of bundles that reference setTimeout for deferral. CAVEAT: `setTimeout(fn, 1000)` runs ~now, not
+// after 1s — there are no wall-clock timers in the sandbox.
+if (typeof globalThis.setTimeout === 'undefined') {
+  var __tid = 1; var __tcancel = {};
+  globalThis.setTimeout = function(f){ var a = Array.prototype.slice.call(arguments, 2); var id = __tid++; queueMicrotask(function(){ if (__tcancel[id]) { delete __tcancel[id]; return; } if (typeof f === 'function') f.apply(null, a); }); return id; };
+  globalThis.clearTimeout = function(id){ __tcancel[id] = true; };
+  globalThis.setImmediate = function(f){ var a = Array.prototype.slice.call(arguments, 1); var id = __tid++; queueMicrotask(function(){ if (typeof f === 'function') f.apply(null, a); }); return id; };
+  globalThis.clearImmediate = function(){};
+  globalThis.setInterval = function(){ return __tid++; };   // no-op: no repeating timers
+  globalThis.clearInterval = function(){};
+}
 // fetch() as a thin Response-like wrapper over the mediated, allowlisted host.fetch bridge.
 if (typeof globalThis.fetch === 'undefined') {
   globalThis.fetch = async function(url, init){
@@ -429,6 +444,62 @@ globalThis.console.assert   = function(c){ if (!c) globalThis.console.error.appl
 // NOTE: NOT `require` (sync) and does NOT resolve nested ESM imports — it works for the large set
 // of libraries that ship a self-contained CJS/UMD bundle.
 globalThis.__mods = globalThis.__mods || {};
+
+// Minimal Buffer over Uint8Array — many CJS bundles reference it at module scope. Subset:
+// from / alloc / isBuffer / concat / toString. NOT the full Node Buffer.
+if (typeof globalThis.Buffer === 'undefined') {
+  var __B = function(){};
+  __B.from = function(v, enc){
+    if (typeof v === 'string') { return (enc === 'base64') ? Uint8Array.from(atob(v), function(c){return c.charCodeAt(0);}) : new TextEncoder().encode(v); }
+    if (v instanceof ArrayBuffer) return new Uint8Array(v);
+    return Uint8Array.from(v);
+  };
+  __B.alloc = function(n, fill){ var a = new Uint8Array(n); if (fill) a.fill(typeof fill === 'number' ? fill : fill.charCodeAt(0)); return a; };
+  __B.allocUnsafe = function(n){ return new Uint8Array(n); };
+  __B.isBuffer = function(x){ return x instanceof Uint8Array; };
+  __B.concat = function(list){ var len = 0, i; for (i=0;i<list.length;i++) len += list[i].length; var out = new Uint8Array(len), off = 0; for (i=0;i<list.length;i++){ out.set(list[i], off); off += list[i].length; } return out; };
+  globalThis.Buffer = __B;
+}
+
+// Built-in module shims for require(). Deterministic: crypto routes through the already-seeded
+// crypto.getRandomValues; nothing here adds entropy. These cover the common Node builtins that
+// self-contained CJS bundles pull in (the uuid->require('crypto') class).
+globalThis.__builtins = {
+  crypto: {
+    randomBytes: function(n){ var a = new Uint8Array(n); (globalThis.crypto && globalThis.crypto.getRandomValues) ? globalThis.crypto.getRandomValues(a) : a; return a; },
+    randomFillSync: function(buf){ if (globalThis.crypto && globalThis.crypto.getRandomValues) globalThis.crypto.getRandomValues(buf); return buf; },
+    getRandomValues: function(a){ return globalThis.crypto.getRandomValues(a); },
+    randomUUID: function(){ return globalThis.crypto.randomUUID ? globalThis.crypto.randomUUID() : undefined; },
+  },
+  events: (function(){ function EventEmitter(){ this._e = {}; } EventEmitter.prototype.on = function(k,f){ (this._e[k]||(this._e[k]=[])).push(f); return this; }; EventEmitter.prototype.emit = function(k){ var a = Array.prototype.slice.call(arguments,1); (this._e[k]||[]).slice().forEach(function(f){ f.apply(null,a); }); return (this._e[k]||[]).length>0; }; EventEmitter.prototype.removeListener = function(k,f){ this._e[k] = (this._e[k]||[]).filter(function(g){return g!==f;}); return this; }; EventEmitter.prototype.once = function(k,f){ var s=this; function g(){ s.removeListener(k,g); f.apply(null,arguments); } return this.on(k,g); }; return { EventEmitter: EventEmitter }; })(),
+  util: { inherits: function(c,p){ c.super_ = p; c.prototype = Object.create(p.prototype, { constructor: { value: c } }); }, inspect: function(x){ return globalThis.__preview(x, 4); }, types: {}, promisify: function(f){ return function(){ var a = Array.prototype.slice.call(arguments), s = this; return new Promise(function(res,rej){ a.push(function(e,v){ e?rej(e):res(v); }); f.apply(s,a); }); }; }, TextEncoder: globalThis.TextEncoder, TextDecoder: globalThis.TextDecoder },
+  path: { sep: '/', delimiter: ':', join: function(){ return Array.prototype.join.call(arguments,'/').replace(/\/+/g,'/'); }, basename: function(p){ return String(p).split('/').pop(); }, dirname: function(p){ var s=String(p).split('/'); s.pop(); return s.join('/')||'/'; }, extname: function(p){ var b=String(p).split('/').pop(), i=b.lastIndexOf('.'); return i>0?b.slice(i):''; }, resolve: function(){ return '/'+Array.prototype.join.call(arguments,'/').replace(/\/+/g,'/'); } },
+  os: { platform: function(){ return 'engram'; }, EOL: '\n', homedir: function(){ return '/'; }, tmpdir: function(){ return '/tmp'; }, hostname: function(){ return 'engram'; }, arch: function(){ return 'wasm'; } },
+  assert: (function(){ function assert(c,m){ if(!c) throw new Error(m||'AssertionError'); } assert.ok = assert; assert.equal = function(a,b,m){ if(a!=b) throw new Error(m||('Expected '+a+' == '+b)); }; assert.strictEqual = function(a,b,m){ if(a!==b) throw new Error(m||('Expected '+a+' === '+b)); }; assert.deepEqual = function(a,b,m){ if(JSON.stringify(a)!==JSON.stringify(b)) throw new Error(m||'deepEqual failed'); }; return assert; })(),
+  buffer: { Buffer: globalThis.Buffer },
+};
+// require(name): sync resolver. Built-ins + already-loaded packages (use() cache). Throws a clear
+// error for anything not preloaded (the VM has no SYNC host IO, so require can't fetch). Strips a
+// leading 'node:' and bare relative paths fall through to the cache by basename.
+globalThis.require = function(name){
+  var n = String(name).replace(/^node:/, '');
+  if (globalThis.__builtins[n]) return globalThis.__builtins[n];
+  if (globalThis.__mods[n] !== undefined) return globalThis.__mods[n];
+  var base = n.split('/').pop();
+  if (globalThis.__mods[base] !== undefined) return globalThis.__mods[base];
+  throw new Error("require('" + name + "') is not available — built-in shim missing, or `await use('" + base + "')` it first (the VM cannot synchronously fetch).");
+};
+
+// use(name) — load an npm package at RUNTIME by fetching a pre-bundled CDN build (the "bundler"
+// is jsDelivr/esm.sh) and evaluating it into the heap. Handles CJS (module.exports) and UMD
+// (attaches a global). The bundle frame is given a working `require` (built-in shims + the use()
+// cache), so a self-contained CJS bundle that requires e.g. 'crypto' resolves. Result is cached in
+// globalThis.__mods and snapshot-persists, so a cold wake keeps the module without re-fetching.
+// ASYNC (the VM has no synchronous host IO), so use `const _ = await use('lodash')`. Determinism:
+// source eval adds no entropy; pin a version with `use('lodash@4.17.21')`. Requires the package
+// host on the fetch allowlist (e.g. cdn.jsdelivr.net). NOT require() (sync) and does NOT resolve
+// nested ESM imports — it works for the large set of libraries that ship a self-contained
+// CJS/UMD bundle (deps either inlined or limited to the built-in shims above).
 globalThis.use = async function(name, opts){
   opts = opts || {};
   if (globalThis.__mods[name] !== undefined) return globalThis.__mods[name];
@@ -437,9 +508,11 @@ globalThis.use = async function(name, opts){
   if (!r || !r.ok) throw new Error('use("' + name + '"): fetch failed (' + (r && r.status) + ') from ' + url);
   var before = new Set(Object.getOwnPropertyNames(globalThis));
   var module = { exports: {} };
-  // CJS frame so module.exports is captured; a UMD bundle with no module system attaches a global
-  // instead, which we detect by diffing globalThis.
-  (0, eval)('(function(module, exports){\n' + r.body + '\n})')(module, module.exports);
+  // CJS frame (with require + Buffer + process in scope); a UMD bundle with no module system
+  // attaches a global instead, which we detect by diffing globalThis.
+  (0, eval)('(function(module, exports, require, Buffer, process, global){\n' + r.body + '\n})')(
+    module, module.exports, globalThis.require, globalThis.Buffer, globalThis.process, globalThis
+  );
   var val;
   if (module.exports && (typeof module.exports === 'function' || Object.keys(module.exports).length)) {
     val = module.exports;
@@ -447,7 +520,10 @@ globalThis.use = async function(name, opts){
     for (var k of Object.getOwnPropertyNames(globalThis)) { if (!before.has(k)) { val = globalThis[k]; break; } }
   }
   if (opts.global) val = globalThis[opts.global];
+  // cache under the requested spec AND its bare basename so require('pkg') resolves post-use().
   globalThis.__mods[name] = val;
+  var base = String(name).split('@')[0].split('/').pop();
+  if (base && globalThis.__mods[base] === undefined) globalThis.__mods[base] = val;
   return val;
 };
 // ===== END NODE-PARITY SHIMS =====
