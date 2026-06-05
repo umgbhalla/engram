@@ -141,14 +141,53 @@ export interface EngramConfig {
   [k: string]: unknown;
 }
 
+/**
+ * The minimal WebSocket surface the SDK needs to drive a session over an injected,
+ * pre-opened socket (e.g. a Cloudflare DO->DO socket from `res.webSocket` after
+ * `.accept()`). Both the browser-style (`addEventListener`/`removeEventListener`) and
+ * the Node `ws`-style (`on`/`off`) event APIs are accepted — the SDK feature-detects.
+ * The socket is assumed already OPEN/accepted; the SDK does NOT wait for an `open` event
+ * on injected sockets.
+ */
+export interface WebSocketLike {
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+  readyState: number;
+  addEventListener?(type: string, listener: (ev: any) => void, opts?: any): void;
+  removeEventListener?(type: string, listener: (ev: any) => void): void;
+  on?(type: string, listener: (...args: any[]) => void): void;
+  off?(type: string, listener: (...args: any[]) => void): void;
+  once?(type: string, listener: (...args: any[]) => void): void;
+  removeListener?(type: string, listener: (...args: any[]) => void): void;
+}
+
 /** Options for {@link Engram.connect}. */
 export interface ConnectOptions {
   /**
    * The kernel or cloud endpoint. Accepts `ws://`/`wss://` (kernel WS), or
    * `http(s)://` (auto-upgraded to WS for the kernel, or HTTP for the cloud when
    * an `apiKey` is given). Trailing slashes are fine.
+   *
+   * OPTIONAL when {@link ConnectOptions.socket} or {@link ConnectOptions.openSocket}
+   * is provided (the SDK then drives the injected socket instead of opening one).
    */
-  url: string;
+  url?: string;
+  /**
+   * A single, PRE-OPENED (already-accepted) WebSocket the SDK should drive instead of
+   * opening one from {@link ConnectOptions.url}. Use this for a DO->DO socket
+   * (`const { 0: client, 1: server } = new WebSocketPair()` / `res.webSocket` after
+   * `.accept()`). One-shot: if it drops, the SDK CANNOT reopen it — the in-flight rpc
+   * rejects with a clear closed error and there is no reconnect. For reconnect-capable
+   * injected transport, use {@link ConnectOptions.openSocket} instead.
+   */
+  socket?: WebSocketLike;
+  /**
+   * A factory the transport calls on every (re)connect to obtain a fresh, already-open
+   * WebSocket for the given session id (e.g. mint a new DO->DO socket per session). When
+   * set, `autoReconnect` re-invokes this factory rather than opening from `url`. The
+   * returned socket is assumed already OPEN/accepted.
+   */
+  openSocket?: (session: string) => WebSocketLike | Promise<WebSocketLike>;
   /** Durable session id. The same id reattaches to the same hibernated heap. Default `"default"`. */
   session?: string;
   /** Cloud API key (`x-api-key`). Presence flips the transport to the cloud HTTP/WS path. */
@@ -293,10 +332,25 @@ class WsTransport implements Transport {
   /** The resolver/rejecter for the single in-flight rpc on this socket, if any. */
   private pending: { resolve: (v: any) => void; reject: (e: any) => void; timer: any } | null = null;
 
+  /**
+   * True once a one-shot injected `socket` has been consumed. A one-shot socket cannot be
+   * reopened, so a second open() (e.g. after a drop) surfaces a clear closed error.
+   */
+  private oneShotConsumed = false;
+
   constructor(
     private WS: any,
     private wsUrl: string,
-    private opts: { autoReconnect: boolean; onReady?: (raw: (f: Frame, t: number) => Promise<any>) => Promise<void> },
+    private opts: {
+      autoReconnect: boolean;
+      onReady?: (raw: (f: Frame, t: number) => Promise<any>) => Promise<void>;
+      /** Durable session id, passed to the openSocket factory. */
+      session?: string;
+      /** A single pre-opened socket to drive once (one-shot, no reconnect). */
+      socket?: WebSocketLike;
+      /** A factory invoked on each (re)connect to mint a fresh, already-open socket. */
+      openSocket?: (session: string) => WebSocketLike | Promise<WebSocketLike>;
+    },
   ) {}
 
   setHost(name: string, fn: HostFn): void {
@@ -393,26 +447,57 @@ class WsTransport implements Transport {
     }
   }
 
+  /** Attach the persistent message/close listeners to `ws` (browser- or node-ws-style). */
+  private attachListeners(ws: any): void {
+    if (ws.addEventListener) {
+      // ONE persistent handler for the lifetime of this socket.
+      ws.addEventListener("message", this.onMessage);
+      ws.addEventListener("close", this.onClose);
+    } else {
+      ws.on("message", this.onMessage);
+      ws.on("close", this.onClose);
+    }
+  }
+
   private async open(): Promise<void> {
     if (this.ws && this.ws.readyState === 1) return;
-    await new Promise<void>((resolve, reject) => {
-      const ws = new this.WS(this.wsUrl);
+    if (this.opts.openSocket) {
+      // Injected factory: mint a fresh, already-open socket for this session on every
+      // (re)connect. Skip the 'open' wait — the socket is assumed accepted/open.
+      const ws = await this.opts.openSocket(this.opts.session ?? "default");
       this.ws = ws;
-      const ok = () => resolve();
-      const fail = (e: any) => reject(e instanceof Error ? e : new EngramError("ws connect failed"));
-      if (ws.addEventListener) {
-        ws.addEventListener("open", ok, { once: true });
-        ws.addEventListener("error", fail, { once: true });
-        // ONE persistent handler for the lifetime of this socket.
-        ws.addEventListener("message", this.onMessage);
-        ws.addEventListener("close", this.onClose);
-      } else {
-        ws.once("open", ok);
-        ws.once("error", fail);
-        ws.on("message", this.onMessage);
-        ws.on("close", this.onClose);
+      this.attachListeners(ws);
+    } else if (this.opts.socket) {
+      // One-shot injected socket: use it once. It cannot be reopened, so a second open()
+      // (after a drop) surfaces a clear closed error instead of silently failing.
+      if (this.oneShotConsumed) {
+        throw new EngramError("injected socket closed and cannot be reopened (use openSocket for reconnect)");
       }
-    });
+      const ws = this.opts.socket;
+      this.ws = ws;
+      this.oneShotConsumed = true;
+      // Assumed already OPEN/accepted — skip the 'open' event wait.
+      this.attachListeners(ws);
+    } else {
+      await new Promise<void>((resolve, reject) => {
+        const ws = new this.WS(this.wsUrl);
+        this.ws = ws;
+        const ok = () => resolve();
+        const fail = (e: any) => reject(e instanceof Error ? e : new EngramError("ws connect failed"));
+        if (ws.addEventListener) {
+          ws.addEventListener("open", ok, { once: true });
+          ws.addEventListener("error", fail, { once: true });
+          // ONE persistent handler for the lifetime of this socket.
+          ws.addEventListener("message", this.onMessage);
+          ws.addEventListener("close", this.onClose);
+        } else {
+          ws.once("open", ok);
+          ws.once("error", fail);
+          ws.on("message", this.onMessage);
+          ws.on("close", this.onClose);
+        }
+      });
+    }
     this.reconnects = 0;
     // Pass rawRequest so onReady can talk to the just-opened socket WITHOUT re-entering the
     // queue (which is currently held by the request that triggered this open() — that would
@@ -455,7 +540,9 @@ class WsTransport implements Transport {
         return await this.rawRequest(frame, timeoutMs);
       } catch (e: any) {
         const dropped = e instanceof EngramError && e.message === "__ws_closed__";
-        if (this.opts.autoReconnect && !this.closed && dropped) {
+        // A one-shot injected socket cannot be reopened — never attempt reconnect for it.
+        const reconnectable = !this.opts.socket || !!this.opts.openSocket;
+        if (this.opts.autoReconnect && reconnectable && !this.closed && dropped) {
           // Detach + close the old socket before replacing it, so its persistent
           // message/close handlers can't fire into the new socket's state.
           this.dropSocket();
@@ -464,7 +551,12 @@ class WsTransport implements Transport {
           await this.open();
           return await this.rawRequest(frame, timeoutMs);
         }
-        if (dropped) throw new EngramError("connection closed before reply");
+        if (dropped) {
+          if (this.opts.socket && !this.opts.openSocket) {
+            throw new EngramError("injected socket closed and cannot be reopened (use openSocket for reconnect)");
+          }
+          throw new EngramError("connection closed before reply");
+        }
         throw e;
       }
     };
@@ -896,7 +988,10 @@ export const Engram = {
    * const r = await s.eval("2 + 2");   // r.value === 4
    */
   async connect(opts: ConnectOptions): Promise<EngramSession> {
-    if (!opts || !opts.url) throw new EngramError("connect({ url }) is required");
+    const injected = !!(opts && (opts.socket || opts.openSocket));
+    if (!opts || (!opts.url && !injected)) {
+      throw new EngramError("connect({ url }) is required (or pass { socket } / { openSocket })");
+    }
     const session = opts.session || "default";
     const throwOnError = opts.throwOnError !== false;
     const autoReconnect = opts.autoReconnect !== false;
@@ -912,10 +1007,10 @@ export const Engram = {
       env: opts.env,
       hostModules: opts.hostModules,
     });
-    const base = String(opts.url).replace(/\/+$/, "");
+    const base = opts.url ? String(opts.url).replace(/\/+$/, "") : "";
 
-    // Cloud HTTP path: an API key + an http(s) endpoint.
-    const isHttp = /^https?:\/\//i.test(base);
+    // Cloud HTTP path: an API key + an http(s) endpoint. Never for injected sockets.
+    const isHttp = !injected && /^https?:\/\//i.test(base);
     const applyHost = (s: EngramSession) => {
       if (opts.host) for (const [name, fn] of Object.entries(opts.host)) s.bindHost(name, fn);
       // Namespaced host modules: bind flat dotted names (shims are in the composed bootstrap).
@@ -942,17 +1037,24 @@ export const Engram = {
       return s;
     }
 
-    // WebSocket path (bare kernel, or cloud /connect with a key).
-    const WS = resolveWebSocket(opts.WebSocket);
+    // WebSocket path (bare kernel, cloud /connect, or an INJECTED pre-opened socket).
+    // For injected sockets there is no WS ctor / url to resolve — the transport drives the
+    // provided socket (or factory) directly.
+    const WS = injected ? null : resolveWebSocket(opts.WebSocket);
     const wsBase = base.replace(/^http/i, "ws");
     // Cloud /connect uses ?session=&apiKey=; the bare kernel uses /ws?id=.
-    const wsUrl = opts.apiKey
-      ? `${wsBase}/connect?session=${encodeURIComponent(session)}&apiKey=${encodeURIComponent(opts.apiKey)}`
-      : `${wsBase}/ws?id=${encodeURIComponent(session)}`;
+    const wsUrl = injected
+      ? ""
+      : opts.apiKey
+        ? `${wsBase}/connect?session=${encodeURIComponent(session)}&apiKey=${encodeURIComponent(opts.apiKey)}`
+        : `${wsBase}/ws?id=${encodeURIComponent(session)}`;
 
     let s!: EngramSession;
     const transport = new WsTransport(WS, wsUrl, {
       autoReconnect,
+      session,
+      socket: opts.socket,
+      openSocket: opts.openSocket,
       onReady: async (raw) => {
         // Re-apply config on every (re)connect so a cold session is configured identically.
         if (config && Object.keys(config).length) {
