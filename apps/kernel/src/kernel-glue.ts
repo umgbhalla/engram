@@ -316,6 +316,36 @@ const TEXT_ENC = new TextEncoder();
 const TEXT_DEC = new TextDecoder();
 const STATUS_HOST_CALL = 1;
 
+// ---- ADR-0012 binary-safe host.fetch ----
+// The host fetch effect carries RAW BYTES across the engine<->glue JSON boundary as base64
+// (`bodyB64`), the SAME pattern the R2 fs op uses (ADR-0011). This is the structural unblocker
+// for binary transfers (git packfiles), which the prior `await r.text()` path lossy-corrupted +
+// truncated. We KEEP a utf8 `body` (capped) for back-compat with the existing string fetch shim.
+// Cap raised 1MB -> 32MB (env-overridable via FETCH_MAX_BODY_BYTES). A request body may also be
+// binary (git-upload-pack POSTs a packfile): the engine sends `init.bodyB64` (base64 bytes) which
+// we decode to a Uint8Array before fetch.
+const FETCH_MAX_BODY_BYTES = (() => {
+  const v = (globalThis as { FETCH_MAX_BODY_BYTES?: unknown }).FETCH_MAX_BODY_BYTES;
+  const n = typeof v === "number" ? v : (typeof v === "string" ? parseInt(v, 10) : NaN);
+  return Number.isFinite(n) && n > 0 ? n : 32 * 1024 * 1024;
+})();
+// base64 encode/decode over Uint8Array, chunked so a large packfile does not blow the call stack
+// of String.fromCharCode(...spread). Mirrors the fs-op base64 boundary.
+function bytesToB64(u8: Uint8Array): string {
+  let s = "";
+  const CH = 0x8000;
+  for (let i = 0; i < u8.length; i += CH) {
+    s += String.fromCharCode.apply(null, Array.prototype.slice.call(u8.subarray(i, i + CH)) as number[]);
+  }
+  return btoa(s);
+}
+function b64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
 // ---- W5 compaction thresholds (docs/W5-COMPACTION-PLAN.md, REALCF-VALIDATION sized) ----
 const MAX_USED_BYTES = 50 * 1024 * 1024;            // refuse snapshot above ~50MB live used heap
 const MAX_RESTORE_USED_BYTES = 50 * 1024 * 1024;    // refuse restore above ~50MB recorded used heap
@@ -837,13 +867,44 @@ class GlueKernel {
       else if (Array.isArray(allow)) permitted = allow.includes(host);
       if (!permitted) return { ok: false, error: "FetchBlockedError: " + host + " not allowed" };
 
-      const r = await fetch(url, init || undefined);
-      const body = await r.text();
+      // BINARY-SAFE: a request body may be binary (git-upload-pack POSTs a packfile). The engine
+      // sends it as base64 in `init.bodyB64`; decode to bytes before fetch. (A plain string `body`
+      // still works for back-compat.)
+      let fetchInit: RequestInit | undefined = init;
+      if (init && typeof (init as { bodyB64?: unknown }).bodyB64 === "string") {
+        const ri = { ...(init as Record<string, unknown>) } as RequestInit & { bodyB64?: string };
+        const reqBytes = b64ToBytes((init as { bodyB64: string }).bodyB64);
+        delete ri.bodyB64;
+        ri.body = reqBytes as unknown as BodyInit;
+        fetchInit = ri;
+      }
+
+      const r = await fetch(url, fetchInit || undefined);
+      // BINARY-SAFE: read RAW BYTES (arrayBuffer), never lossy `.text()`. Cross the boundary as
+      // base64 (`bodyB64`) — exact bytes both ways. Cap at FETCH_MAX_BODY_BYTES (was 1MB).
+      const ab = await r.arrayBuffer();
+      let bytes = new Uint8Array(ab);
+      let truncated = false;
+      if (bytes.length > FETCH_MAX_BODY_BYTES) {
+        bytes = bytes.subarray(0, FETCH_MAX_BODY_BYTES);
+        truncated = true;
+      }
+      const bodyB64 = bytesToB64(bytes);
+      // back-compat utf8 view (capped) so the legacy string `body` path keeps working.
+      const body = TEXT_DEC.decode(bytes);
       const headers: Record<string, string> = {};
       r.headers.forEach((v, k) => (headers[k] = v));
       return {
         ok: true,
-        value: { status: r.status, ok: r.ok, headers, body: body.slice(0, 1 << 20) },
+        value: {
+          status: r.status,
+          ok: r.ok,
+          headers,
+          body,
+          bodyB64,
+          byteLength: bytes.length,
+          truncated,
+        },
       };
     } catch (e) {
       const err = e as { message?: string };

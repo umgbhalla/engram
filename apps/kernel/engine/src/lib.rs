@@ -415,16 +415,41 @@ if (typeof globalThis.setTimeout === 'undefined') {
   globalThis.setInterval = function(){ return __tid++; };   // no-op: no repeating timers
   globalThis.clearInterval = function(){};
 }
-// fetch() as a thin Response-like wrapper over the mediated, allowlisted host.fetch bridge.
+// fetch() as a BINARY-SAFE Response-like wrapper over the mediated, allowlisted host.fetch bridge.
+// ADR-0012: the host carries RAW BYTES across the JSON boundary as base64 (`bodyB64`), the same
+// pattern the R2 fs op uses. `.arrayBuffer()` base64-decodes to EXACT bytes (git packfiles work);
+// `.text()`/`.json()` use the utf8 view; a binary REQUEST body (Uint8Array/ArrayBuffer) is base64-
+// encoded into `init.bodyB64` before the host call. The legacy string `r.body` still works.
+(function(){
+  function __b64ToBytes(b64){ var bin = atob(b64 || ''); var out = new Uint8Array(bin.length); for (var i=0;i<bin.length;i++) out[i] = bin.charCodeAt(i); return out; }
+  function __bytesToB64(u8){ var s = '', CH = 0x8000; for (var i=0;i<u8.length;i+=CH){ s += String.fromCharCode.apply(null, u8.subarray(i, i+CH)); } return btoa(s); }
+  globalThis.__fetchB64 = { enc: __bytesToB64, dec: __b64ToBytes };
+})();
 if (typeof globalThis.fetch === 'undefined') {
   globalThis.fetch = async function(url, init){
-    var r = await globalThis.host.fetch(typeof url === 'string' ? url : String(url), init);
+    var u = typeof url === 'string' ? url : String(url);
+    // Binary REQUEST body: convert a Uint8Array/ArrayBuffer/typed-array body to base64 (`bodyB64`)
+    // so it survives the JSON host boundary as exact bytes. A string body passes through unchanged.
+    var sendInit = init;
+    if (init && init.body != null && typeof init.body !== 'string') {
+      var rb = init.body, reqBytes = null;
+      if (rb instanceof Uint8Array) reqBytes = rb;
+      else if (rb instanceof ArrayBuffer) reqBytes = new Uint8Array(rb);
+      else if (rb && rb.buffer instanceof ArrayBuffer) reqBytes = new Uint8Array(rb.buffer, rb.byteOffset||0, rb.byteLength);
+      if (reqBytes) { sendInit = {}; for (var k in init) if (k !== 'body') sendInit[k] = init[k]; sendInit.bodyB64 = globalThis.__fetchB64.enc(reqBytes); }
+    }
+    var r = await globalThis.host.fetch(u, sendInit);
+    var _bytes = null;
+    function bytes(){ if (_bytes) return _bytes; _bytes = (typeof r.bodyB64 === 'string') ? globalThis.__fetchB64.dec(r.bodyB64) : new TextEncoder().encode(r.body || ''); return _bytes; }
     return {
-      ok: !!r.ok, status: r.status|0, url: typeof url === 'string' ? url : String(url),
+      ok: !!r.ok, status: r.status|0, statusText: r.statusText || '', url: u,
       headers: (typeof Headers !== 'undefined') ? new Headers(r.headers || {}) : (r.headers || {}),
-      text: async function(){ return r.body; },
-      json: async function(){ return JSON.parse(r.body); },
-      arrayBuffer: async function(){ return new TextEncoder().encode(r.body).buffer; },
+      // exact bytes (base64-decoded) — the binary path git transfers need.
+      arrayBuffer: async function(){ var b = bytes(); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); },
+      bytes: async function(){ return bytes().slice(); },
+      // text/json from the utf8 view (back-compat; r.body is the capped utf8 decode).
+      text: async function(){ return (typeof r.body === 'string') ? r.body : new TextDecoder().decode(bytes()); },
+      json: async function(){ return JSON.parse((typeof r.body === 'string') ? r.body : new TextDecoder().decode(bytes())); },
     };
   };
 }
@@ -446,16 +471,85 @@ globalThis.console.assert   = function(c){ if (!c) globalThis.console.error.appl
 globalThis.__mods = globalThis.__mods || {};
 
 // Minimal Buffer over Uint8Array — many CJS bundles reference it at module scope. Subset:
-// from / alloc / isBuffer / concat / toString. NOT the full Node Buffer.
+// from / alloc / isBuffer / concat / toString(enc). NOT the full Node Buffer.
+//
+// CRITICAL for binary libs (isomorphic-git smart-HTTP parse): `Buffer.from(bytes).toString('utf8')`
+// MUST utf8-decode, not Array-join the byte numbers. Since this Buffer is a real Uint8Array (the
+// Node "Buffer is a Uint8Array subclass" model), we give Uint8Array.prototype an ENCODING-AWARE
+// toString: with NO arg it keeps the default (engram value-preview/JSON unaffected); with an
+// encoding ('utf8'/'utf-8'/'hex'/'base64'/'latin1'/'ascii') it decodes properly. Pure in-VM, no
+// entropy.
 if (typeof globalThis.Buffer === 'undefined') {
-  var __B = function(){};
+  var __U8P = Uint8Array.prototype;
+  var __u8ToStringOrig = __U8P.toString;
+  __U8P.toString = function(enc){
+    if (enc === undefined || enc === null) return __u8ToStringOrig.apply(this, arguments);
+    var e = String(enc).toLowerCase();
+    if (e === 'utf8' || e === 'utf-8') return new TextDecoder().decode(this);
+    if (e === 'hex'){ var h = ''; for (var i=0;i<this.length;i++) h += (this[i] + 0x100).toString(16).slice(1); return h; }
+    if (e === 'base64'){ var s=''; for (var j=0;j<this.length;j++) s += String.fromCharCode(this[j]); return btoa(s); }
+    if (e === 'latin1' || e === 'binary' || e === 'ascii'){ var t=''; for (var k=0;k<this.length;k++) t += String.fromCharCode(this[k] & (e==='ascii'?0x7f:0xff)); return t; }
+    return new TextDecoder().decode(this);
+  };
+  // Buffer numeric read/write helpers (isomorphic-git's packfile parser uses readUInt32BE etc.).
+  // Defined on Uint8Array.prototype so Buffer.from(bytes) (a Uint8Array) carries them. Big/little
+  // endian via DataView over the same backing buffer (honour byteOffset).
+  function __dv(u8){ return new DataView(u8.buffer, u8.byteOffset, u8.byteLength); }
+  if (typeof __U8P.readUInt32BE !== 'function') {
+    __U8P.readUInt32BE = function(o){ return __dv(this).getUint32(o|0, false); };
+    __U8P.readUInt32LE = function(o){ return __dv(this).getUint32(o|0, true); };
+    __U8P.readInt32BE  = function(o){ return __dv(this).getInt32(o|0, false); };
+    __U8P.readUInt16BE = function(o){ return __dv(this).getUint16(o|0, false); };
+    __U8P.readUInt16LE = function(o){ return __dv(this).getUint16(o|0, true); };
+    __U8P.readUInt8    = function(o){ return this[o|0]; };
+    __U8P.readInt32LE  = function(o){ return __dv(this).getInt32(o|0, true); };
+    __U8P.writeUInt32BE = function(val, o){ __dv(this).setUint32(o|0, val>>>0, false); return (o|0)+4; };
+    __U8P.writeUInt32LE = function(val, o){ __dv(this).setUint32(o|0, val>>>0, true); return (o|0)+4; };
+    __U8P.writeInt32BE = function(val, o){ __dv(this).setInt32(o|0, val|0, false); return (o|0)+4; };
+    __U8P.writeInt32LE = function(val, o){ __dv(this).setInt32(o|0, val|0, true); return (o|0)+4; };
+    __U8P.writeUInt16BE = function(val, o){ __dv(this).setUint16(o|0, val&0xffff, false); return (o|0)+2; };
+    __U8P.writeUInt8    = function(val, o){ this[o|0] = val & 0xff; return (o|0)+1; };
+    // Buffer.copy(target, targetStart, sourceStart, sourceEnd)
+    __U8P.copy = function(target, ts, ss, se){ ts = ts|0; ss = ss|0; se = (se === undefined) ? this.length : (se|0); var sub = this.subarray(ss, se); target.set(sub, ts); return sub.length; };
+    __U8P.equals = function(other){ if (!other || this.length !== other.length) return false; for (var i=0;i<this.length;i++) if (this[i] !== other[i]) return false; return true; };
+    // Buffer.write(string, [offset], [length], [encoding]) — write a string into the buffer at
+    // offset; returns bytes written. Supports utf8 (default) + hex (isomorphic-git writes a hex
+    // sha into a 20-byte buffer). NOTE: native Uint8Array has no `write`; this is the Buffer add-on.
+    __U8P.write = function(str, offset, length, encoding){
+      str = String(str);
+      if (typeof offset === 'string'){ encoding = offset; offset = 0; length = undefined; }
+      else if (typeof length === 'string'){ encoding = length; length = undefined; }
+      offset = offset|0;
+      var e = encoding ? String(encoding).toLowerCase() : 'utf8', src;
+      if (e === 'hex'){ var hl = str.length >> 1; src = new Uint8Array(hl); for (var i=0;i<hl;i++) src[i] = parseInt(str.substr(i*2,2),16); }
+      else if (e === 'base64'){ src = Uint8Array.from(atob(str), function(c){return c.charCodeAt(0);}); }
+      else if (e === 'latin1' || e === 'binary' || e === 'ascii'){ src = new Uint8Array(str.length); for (var j=0;j<str.length;j++) src[j] = str.charCodeAt(j) & 0xff; }
+      else src = new TextEncoder().encode(str);
+      var max = (length === undefined) ? (this.length - offset) : Math.min(length|0, this.length - offset);
+      var n = Math.min(src.length, max);
+      this.set(src.subarray(0, n), offset);
+      return n;
+    };
+  }
+  // __B is ALSO callable as the legacy `Buffer(arg)` constructor (number -> alloc, else -> from):
+  // safe-buffer's feature-detect (Buffer.from && .alloc && .allocUnsafe && .allocUnsafeSlow) must
+  // pass, else it falls back to `Buffer(size)` legacy calls. We provide all four + legacy-callable.
+  var __B = function(arg, a, b){ return (typeof arg === 'number') ? __B.alloc(arg) : __B.from(arg, a, b); };
   __B.from = function(v, enc){
-    if (typeof v === 'string') { return (enc === 'base64') ? Uint8Array.from(atob(v), function(c){return c.charCodeAt(0);}) : new TextEncoder().encode(v); }
+    if (typeof v === 'string') {
+      var e = enc ? String(enc).toLowerCase() : 'utf8';
+      if (e === 'base64') return Uint8Array.from(atob(v), function(c){return c.charCodeAt(0);});
+      if (e === 'hex'){ var out = new Uint8Array(v.length >> 1); for (var i=0;i<out.length;i++) out[i] = parseInt(v.substr(i*2,2),16); return out; }
+      if (e === 'latin1' || e === 'binary' || e === 'ascii'){ var a = new Uint8Array(v.length); for (var j=0;j<v.length;j++) a[j] = v.charCodeAt(j) & 0xff; return a; }
+      return new TextEncoder().encode(v);
+    }
+    if (v instanceof Uint8Array) return new Uint8Array(v); // copy, stays a Uint8Array
     if (v instanceof ArrayBuffer) return new Uint8Array(v);
     return Uint8Array.from(v);
   };
   __B.alloc = function(n, fill){ var a = new Uint8Array(n); if (fill) a.fill(typeof fill === 'number' ? fill : fill.charCodeAt(0)); return a; };
   __B.allocUnsafe = function(n){ return new Uint8Array(n); };
+  __B.allocUnsafeSlow = function(n){ return new Uint8Array(n); };
   __B.isBuffer = function(x){ return x instanceof Uint8Array; };
   __B.concat = function(list){ var len = 0, i; for (i=0;i<list.length;i++) len += list[i].length; var out = new Uint8Array(len), off = 0; for (i=0;i<list.length;i++){ out.set(list[i], off); off += list[i].length; } return out; };
   globalThis.Buffer = __B;
@@ -512,7 +606,19 @@ globalThis.__vfs = globalThis.__vfs || { files: {}, dirs: { '/': true } };
   function ENOENT(p){ var e = new Error("ENOENT: no such file or directory, '" + p + "'"); e.code = 'ENOENT'; return e; }
   function EISDIR(p){ var e = new Error("EISDIR: illegal operation on a directory, '" + p + "'"); e.code = 'EISDIR'; return e; }
   function toBytes(data, enc){ if (data instanceof Uint8Array) return data.slice(); if (typeof data === 'string') return (enc === 'base64') ? Uint8Array.from(atob(data), function(c){return c.charCodeAt(0);}) : ENC.encode(data); if (data && data.buffer) return new Uint8Array(data.buffer.slice(0)); return ENC.encode(String(data)); }
-  function decode(bytes, enc){ if (!enc || enc === 'buffer' || (enc && enc.encoding === 'buffer')) return bytes.slice(); var e = (typeof enc === 'string') ? enc : enc.encoding; if (e === 'base64') return btoa(String.fromCharCode.apply(null, bytes)); return DEC.decode(bytes); }
+  // decode(bytes, enc): Node fs semantics — a STRING encoding ('utf8'/'base64'/...) OR an options
+  // object WITH a string `.encoding` returns a string; NO encoding (undefined / 'buffer' / {} with
+  // no .encoding) returns the raw bytes (Buffer). CRITICAL: isomorphic-git reads binary files with
+  // `readFile(path, {})` — an empty options object must yield BYTES, not a lossy utf8 string (that
+  // corrupted the packfile .idx magic and broke clone).
+  function decode(bytes, enc){
+    var e = (typeof enc === 'string') ? enc : (enc && typeof enc.encoding === 'string' ? enc.encoding : null);
+    if (!e || e === 'buffer') return bytes.slice();
+    if (e === 'base64') return btoa(String.fromCharCode.apply(null, bytes));
+    if (e === 'hex'){ var h = ''; for (var i=0;i<bytes.length;i++) h += (bytes[i] + 0x100).toString(16).slice(1); return h; }
+    if (e === 'latin1' || e === 'binary' || e === 'ascii'){ var s=''; for (var j=0;j<bytes.length;j++) s += String.fromCharCode(bytes[j] & (e==='ascii'?0x7f:0xff)); return s; }
+    return DEC.decode(bytes);
+  }
   function existsSync(p){ p = norm(p); return !!V.files[p] || !!V.dirs[p]; }
   function mkdirSync(p, opts){ p = norm(p); var rec = opts && opts.recursive; if (rec){ var parts = p.split('/').filter(Boolean), cur = ''; for (var i=0;i<parts.length;i++){ cur += '/' + parts[i]; V.dirs[cur] = true; } } else { if (!V.dirs[parent(p)]) throw ENOENT(parent(p)); V.dirs[p] = true; } return p; }
   function ensureParent(p){ var d = parent(p); if (!V.dirs[d]){ var parts = d.split('/').filter(Boolean), cur=''; for (var i=0;i<parts.length;i++){ cur += '/' + parts[i]; V.dirs[cur] = true; } } }
@@ -524,7 +630,12 @@ globalThis.__vfs = globalThis.__vfs || { files: {}, dirs: { '/': true } };
   function readdirSync(p){ p = norm(p); if (!V.dirs[p] && p !== '/') throw ENOENT(p); var set = {}, pre = p === '/' ? '/' : p + '/'; function add(k){ if (k.indexOf(pre) === 0){ var rest = k.slice(pre.length); if (rest){ var name = rest.split('/')[0]; if (name) set[name] = true; } } } Object.keys(V.files).forEach(add); Object.keys(V.dirs).forEach(function(k){ if (k !== p) add(k); }); return Object.keys(set); }
   function renameSync(a, b){ a = norm(a); b = norm(b); if (V.files[a]){ ensureParent(b); V.files[b] = V.files[a]; delete V.files[a]; } else if (V.dirs[a]){ V.dirs[b] = true; delete V.dirs[a]; } else throw ENOENT(a); }
   function copyFileSync(a, b){ a = norm(a); b = norm(b); var f = V.files[a]; if (!f) throw ENOENT(a); ensureParent(b); V.files[b] = { data: f.data.slice(), mtime: 0 }; }
-  function statSync(p){ p = norm(p); var isF = !!V.files[p], isD = !!V.dirs[p]; if (!isF && !isD) throw ENOENT(p); var size = isF ? V.files[p].data.length : 0; return { size: size, mtimeMs: 0, isFile: function(){ return isF; }, isDirectory: function(){ return isD; }, isSymbolicLink: function(){ return false; } }; }
+  function statSync(p){ p = norm(p); var isF = !!V.files[p], isD = !!V.dirs[p]; if (!isF && !isD) throw ENOENT(p); var size = isF ? V.files[p].data.length : 0; return { size: size, mtimeMs: 0, mode: isD ? 16877 : 33188, isFile: function(){ return isF; }, isDirectory: function(){ return isD; }, isSymbolicLink: function(){ return false; } }; }
+  // VFS has no symlinks: readlink always EINVAL (isomorphic-git catches it), symlink writes the
+  // target as a regular file (best-effort; the durable VFS is a flat byte store). These exist so
+  // libraries (isomorphic-git) that BIND every fs method at construction don't fail on undefined.
+  function readlinkSync(p){ var e = new Error("EINVAL: invalid argument, readlink '" + norm(p) + "'"); e.code = 'EINVAL'; throw e; }
+  function symlinkSync(target, p){ p = norm(p); ensureParent(p); V.files[p] = { data: toBytes(String(target)), mtime: 0 }; }
   var P = function(fn){ return function(){ var a = arguments; return new Promise(function(res, rej){ try { res(fn.apply(null, a)); } catch(e){ rej(e); } }); }; };
 
   // ----- provider dispatch -----------------------------------------------------------------
@@ -557,13 +668,16 @@ globalThis.__vfs = globalThis.__vfs || { files: {}, dirs: { '/': true } };
     rmSync: S('rmSync', rmSync), rmdirSync: S('rmdirSync', rmSync), readdirSync: S('readdirSync', readdirSync),
     renameSync: S('renameSync', renameSync), copyFileSync: S('copyFileSync', copyFileSync),
     statSync: S('statSync', statSync), lstatSync: S('lstatSync', statSync),
+    readlinkSync: S('readlinkSync', readlinkSync), symlinkSync: S('symlinkSync', symlinkSync),
     promises: {
       readFile: A(readFileSync, hReadFile), writeFile: A(writeFileSync, hWriteFile),
       appendFile: A(appendFileSync, hAppendFile), mkdir: A(mkdirSync, async function(){ /* r2 has no dirs */ }),
-      readdir: A(readdirSync, hReaddir), rm: A(rmSync, hUnlink), unlink: A(unlinkSync, hUnlink),
+      readdir: A(readdirSync, hReaddir), rm: A(rmSync, hUnlink), rmdir: A(rmSync, hUnlink), unlink: A(unlinkSync, hUnlink),
       rename: A(renameSync, async function(a,b){ var d = await hReadFile(a); await hWriteFile(b, d); await hUnlink(a); }),
       copyFile: A(copyFileSync, async function(a,b){ await hWriteFile(b, await hReadFile(a)); }),
-      stat: A(statSync, hStat),
+      stat: A(statSync, hStat), lstat: A(statSync, hStat),
+      readlink: A(readlinkSync, async function(p){ return readlinkSync(p); }),
+      symlink: A(symlinkSync, async function(t,p){ await hWriteFile(p, String(t)); }),
       access: A(function(p){ if (!existsSync(p)) throw ENOENT(norm(p)); }, async function(p){ if (!(await hExists(p))) throw ENOENT(norm(p)); }),
     },
     constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1 },

@@ -167,3 +167,27 @@
 **Why.** A test that can't finish provides no signal. Decoupling the build from `wrangler dev` makes the real-workerd suite actually runnable and fast to iterate.
 
 **Consequence.** Production deploys still use the real `wrangler.jsonc` build. Deploys reuse fresh artifacts via `wrangler deploy --name engram-kernel -c wrangler.dev.jsonc` (with `.env` creds) — the root `deploy:kernel` script is currently broken (pins wrangler 3.x + wrong cwd → `tsconfig.json not found`); deploy from `apps/kernel` with `wrangler@^4`.
+
+
+---
+
+## ADR-0012 — Binary-safe `host.fetch` + isomorphic-git as a first-class stdlib (git clone over engram-native `fs`)
+
+**Status:** Accepted (live on `engram-kernel-ouru`; binary fetch + `git.clone` of a public repo over the default VFS proven).
+
+**Context.** A REPL cell could not `git.clone` a public repo. Root cause (proven by a prior spike): the VM's `fetch()` returned the body as a UTF-8 **string** with a 1 MB cap — glue `_doFetch` did `await r.text()`, and the engine fetch shim exposed only a string `body`. Git transfers **binary** packfiles, so the body was lossy-corrupted (favicon 6518 B → 7666 B with 574 U+FFFD) and truncated; isomorphic-git could not parse it. The CDN dep-tree / ESM / relative-`require` path for loading isomorphic-git at runtime is too fragile (the spike).
+
+**Decision.**
+1. **Binary-safe `host.fetch` (the structural unblocker).** The host fetch effect carries **raw bytes both ways as base64** (the same engine↔glue boundary pattern as the R2 fs op, ADR-0011):
+   - Glue `_doFetch` reads `await r.arrayBuffer()` (not `.text()`), returns the body as `bodyB64` (+ a capped utf8 `body` for back-compat, + `byteLength`/`truncated`). A **binary request body** is accepted as `init.bodyB64` (base64) and decoded to bytes before `fetch` (git-upload-pack POSTs a binary packfile). Cap raised **1 MB → 32 MB** (`FETCH_MAX_BODY_BYTES`, env-overridable).
+   - The engine fetch shim (`BOOTSTRAP`) returns a Response-like with `.arrayBuffer()`/`.bytes()` (base64-decode `bodyB64` → exact bytes), `.text()`/`.json()` (utf8 view), `status`/`statusText`/`headers`. A binary request body (`Uint8Array`/`ArrayBuffer`) is base64-encoded into `init.bodyB64` before the host call. The legacy string `body` path still works.
+2. **isomorphic-git as a first-class stdlib module.** `isomorphic-git` (v1.27.1) is esbuilt to a single self-contained CJS IIFE (all deps inlined) and registered into the in-VM `__mods` so `require('isomorphic-git')` resolves from the stdlib bundle — **no CDN, no ESM dep-tree, no relative-require**. A small git smart-HTTP client (`isomorphic-git-http`, also aliased `isomorphic-git/http`) implements isomorphic-git's `http.request` contract over the binary fetch (request/response bodies as async-iterables of `Uint8Array`). Both ship **opt-in** in `stdlib-meta` (loaded only when named in `config.modules`, since the bundle is ~210 KB).
+3. **`Buffer`/`Uint8Array` + `fs` parity required by binary libs** (all in `BOOTSTRAP`):
+   - `Buffer.from(bytes).toString(enc)` must decode (encoding-aware `Uint8Array.prototype.toString`), not Array-join byte numbers (broke the smart-HTTP header parse). `Buffer` is legacy-callable + has `allocUnsafeSlow` so `safe-buffer`'s feature-detect passes (else it falls back to `Buffer(size)` legacy calls returning `undefined`).
+   - `Uint8Array.prototype` gains the Buffer numeric read/write methods isomorphic-git's packfile/idx parser uses (`readUInt32BE`/`writeUInt32BE`/`readInt32BE`/`writeInt32BE`/`readUInt16BE`/`readUInt8`/…) + `write(str,off,len,enc)`/`copy`/`equals`.
+   - VFS adds `lstat`/`rmdir`/`readlink`/`symlink` (sync + promises) so isomorphic-git's `FileSystem` can bind every required method at construction.
+   - **`fs.readFile(path, {})` returns bytes, not a lossy utf8 string.** Node semantics: a string encoding (or `{encoding:'utf8'}`) → string; no encoding (`undefined`/`'buffer'`/`{}` with no `.encoding`) → bytes. isomorphic-git reads the binary `.idx` with `readFile(path, {})`; the old `decode` treated `{}` as utf8 and corrupted the packfile-index magic, so checkout returned `undefined`. This was the final clone blocker.
+
+**Why.** Binary-safe fetch is the one structural fix that unblocks every binary transfer (git, tarballs, wasm, images) — bytes in, exact bytes out. Bundling isomorphic-git + its http client as stdlib avoids the fragile runtime CDN path and gives `require('isomorphic-git')` deterministically from the in-VM heap.
+
+**Consequence.** Proven live on `engram-kernel-ouru` (prod `engram-kernel` untouched): a cell fetching `github.com/favicon.ico` via `.arrayBuffer()` gets **exactly 6518 bytes** (no U+FFFD); a binary request body round-trips byte-exact; and `git.clone({fs, http, dir:'/repo', url:'https://github.com/octocat/Hello-World.git', singleBranch:true, depth:1})` over the **default in-heap VFS** writes `/repo/{.git, README}` and `fs.readFileSync('/repo/README','utf8') === 'Hello World!\n'`. Existing suites stay green: bridge E2E 12/12, completion 11/11, VFS round-trip. The encoding-aware `Uint8Array.prototype.toString` only changes behavior when an explicit encoding arg is passed (no-arg/JSON/value-preview unchanged; determinism intact). A known benign `valueOf` log surfaces during clone (caught internally by isomorphic-git; does not affect the result).

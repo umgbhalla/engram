@@ -14,5 +14,8 @@
     "build:sdk": "bun run --filter @engram/sdk build",
     "build:cli": "bun run --filter @engram/cli build",
     "build:ui": "bun run --filter @engram/ui-app build"
+  },
+  "devDependencies": {
+    "isomorphic-git": "1.27.1"
   }
 }
