@@ -83,10 +83,17 @@ export interface KernelEndpoint {
   apiKey: string;
 }
 
+/** A host function the VM can invoke as `host.<name>(...args)` mid-eval (the bridge). */
+export type HostFn = (...args: unknown[]) => unknown | Promise<unknown>;
+
 export class Kernel {
   private ws: WebSocket | null = null;
   private queue: Promise<void> = Promise.resolve();
   private config: EngramConfig | undefined;
+  /** Host functions callable from the VM as `host.<name>` (bridge). */
+  private hostFns = new Map<string, HostFn>();
+  /** The single in-flight rpc on the current socket. */
+  private pending: { resolve: (v: KernelReply) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> } | null = null;
   /** Resolves the live connection coordinates. */
   resolve: () => KernelEndpoint;
   onState: (s: KernelState) => void = () => {};
@@ -99,9 +106,60 @@ export class Kernel {
     this.config = c;
   }
 
+  /**
+   * Register a host function callable from a cell as `host.<name>(...args)`. The kernel
+   * parks the VM eval, sends an out-of-band `{t:'hostcall'}` frame; we await `fn(...args)`
+   * and reply with `{t:'hostcall-result'}` so the parked call resumes. `fetch` is NOT a
+   * client host fn — it is serviced kernel-side.
+   */
+  setHost(name: string, fn: HostFn): void {
+    this.hostFns.set(name, fn);
+  }
+
   private url(): string {
     const { endpoint, sessionId, apiKey } = this.resolve();
     return kernelUrl(endpoint, sessionId, apiKey);
+  }
+
+  /**
+   * Persistent message demux (mirrors @engram/sdk WsTransport). An out-of-band
+   * `{t:'hostcall'}` frame is dispatched to a registered host fn and answered WITHOUT
+   * touching the in-flight rpc resolver; every other frame is the reply to the single
+   * in-flight rpc. The old per-call `{once:true}` listener resolved on the FIRST frame,
+   * so a mid-eval hostcall would mis-resolve the eval — this fixes that.
+   */
+  private onMessage = (ev: MessageEvent): void => {
+    let msg: KernelReply & { t?: string; id?: string; name?: string; args?: unknown[] };
+    try {
+      msg = JSON.parse(String(ev.data));
+    } catch {
+      const p = this.pending;
+      if (p) { this.pending = null; clearTimeout(p.timer); p.reject(new Error("malformed kernel reply")); }
+      return;
+    }
+    if (msg && msg.t === "hostcall") {
+      const fn = this.hostFns.get(String(msg.name));
+      const id = msg.id;
+      Promise.resolve()
+        .then(() => (fn ? fn(...((msg.args as unknown[]) || [])) : Promise.reject(new Error("no host fn " + msg.name))))
+        .then(
+          (value) => this.sendRaw({ t: "hostcall-result", id, ok: true, value }),
+          (err) => this.sendRaw({ t: "hostcall-result", id, ok: false, error: String((err && err.message) || err) }),
+        );
+      return;
+    }
+    const p = this.pending;
+    if (p) { this.pending = null; clearTimeout(p.timer); p.resolve(msg as KernelReply); }
+  };
+
+  private onClose = (): void => {
+    this.onState("disconnected");
+    const p = this.pending;
+    if (p) { this.pending = null; clearTimeout(p.timer); p.reject(new Error("ws closed before reply")); }
+  };
+
+  private sendRaw(obj: unknown): void {
+    try { this.ws?.send(JSON.stringify(obj)); } catch { /* socket gone */ }
   }
 
   async open(): Promise<void> {
@@ -112,7 +170,9 @@ export class Kernel {
       this.ws = ws;
       ws.addEventListener("open", () => res(), { once: true });
       ws.addEventListener("error", () => rej(new Error("ws error")), { once: true });
-      ws.addEventListener("close", () => this.onState("disconnected"), { once: true });
+      // ONE persistent message/close handler for the lifetime of this socket.
+      ws.addEventListener("message", this.onMessage);
+      ws.addEventListener("close", this.onClose);
     });
     if (this.config) await this.raw({ t: "create", config: this.config });
   }
@@ -120,34 +180,19 @@ export class Kernel {
   private raw(msg: KernelFrame, timeoutMs = 120000): Promise<KernelReply> {
     return new Promise<KernelReply>((resolve, reject) => {
       const ws = this.ws;
-      if (!ws) {
-        reject(new Error("ws not open"));
-        return;
-      }
-      const onMsg = (ev: MessageEvent): void => {
-        cleanup();
-        try {
-          resolve(JSON.parse(String(ev.data)) as KernelReply);
-        } catch (e) {
-          reject(e instanceof Error ? e : new Error(String(e)));
-        }
-      };
-      const onClose = (): void => {
-        cleanup();
-        reject(new Error("ws closed before reply"));
-      };
-      const t = setTimeout(() => {
-        cleanup();
+      if (!ws) { reject(new Error("ws not open")); return; }
+      const timer = setTimeout(() => {
+        if (this.pending && this.pending.timer === timer) this.pending = null;
         reject(new Error("rpc timeout"));
       }, timeoutMs);
-      function cleanup(): void {
-        clearTimeout(t);
-        ws!.removeEventListener("message", onMsg);
-        ws!.removeEventListener("close", onClose);
+      this.pending = { resolve, reject, timer };
+      try {
+        ws.send(JSON.stringify(msg));
+      } catch (e) {
+        if (this.pending && this.pending.timer === timer) this.pending = null;
+        clearTimeout(timer);
+        reject(e instanceof Error ? e : new Error(String(e)));
       }
-      ws.addEventListener("message", onMsg, { once: true });
-      ws.addEventListener("close", onClose, { once: true });
-      ws.send(JSON.stringify(msg));
     });
   }
 

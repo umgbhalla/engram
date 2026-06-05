@@ -53,6 +53,13 @@ const kernel = new Kernel(() => ({
   apiKey: $in("cfgApiKey").value,
 }));
 
+// Demo host functions: a cell can call `host.<name>(...)` mid-eval (the VM->client bridge).
+// These run in the browser, so they showcase the reentrancy without any external key. Swap
+// `subLM` for a real LLM fetch to drive an agent loop from a cell.
+kernel.setHost("subLM", async (prompt: unknown) => `LM<${String(prompt).slice(0, 200)}>`);
+kernel.setHost("echo", async (...args: unknown[]) => args);
+kernel.setHost("now", async () => new Date().toISOString());
+
 // --- state indicator --------------------------------------------------------
 function setSessionPill(): void {
   el("sessionPill").textContent = "session " + ($in("cfgSession").value || "–");
