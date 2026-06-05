@@ -45,3 +45,108 @@
 - Cost/perf of many facets per supervisor + heap snapshots each — unmeasured.
 
 **Sequencing.** V0.1 first proves the kernel is *usable/useful* as a flat DO (current V0 hardened + a real product surface). Only if that lands do we layer facets for multi-tenancy. Don't add facet complexity before the single-tenant kernel earns it.
+
+---
+
+## ADR-0004 — Generic VM→client host-callback bridge (not an RLM/agent API)
+
+**Status:** Accepted (live, `engram-kernel`). Implements the `host.<name>()` reentrancy path.
+
+**Context.** A durable cell sometimes needs a value the kernel can't compute inside `wasm32-wasip1` — e.g. an LLM call, a DB lookup, anything the *connected client* owns. The earlier design baked specific verbs into the kernel (`host.subLM` / `host.ctx.*` / `host.final` / `host.kv`), which couples the kernel to one use case (RLM) and bloats its trust surface.
+
+**Decision.** The kernel exposes **one built-in host effect — `host.fetch`** (DO-side, allowlisted). **Every other `host.<name>(...args)` is a generic bridge**: the engine parks the VM eval, the glue emits a `{t:hostcall,id,name,args}` frame to the connected client over the same WebSocket, and resumes the parked VM when the client replies `{t:hostcall-result,id,...}`. The kernel has **no knowledge** of `subLM`, "final", convergence, etc.
+
+**Why.** One generic mechanism covers all client-mediated effects and keeps the kernel a dumb, sandboxed pump. RLM/agent loops become *application code* on top (see ADR-0007).
+
+**Critical constraint — mutex-safe demux.** The `eval` critical section holds `self.mutex` for the whole eval. The client's `{t:hostcall-result}` arrives as a *new* `websocket_message`; that handler **must not re-acquire the mutex** (the suspended eval holds it → re-entrant deadlock, the BUG-1 class). So the pending-resolver registry lives in the glue module (one DO isolate == one module instance) and `lib.rs` resolves it from `websocket_message` **without touching the mutex**. A per-eval sender closure is installed on the glue (`setHostSender`); when there is no live client socket (HTTP `/frame` / facet path) the sender is null and non-fetch host calls reject cleanly.
+
+**Consequence.** Determinism + crash-replay preserved: the E6 oplog still records the host *result*, so engine-migration replay feeds the recorded value back **without re-calling the client**. Verified live (`tests/kernel-rust/hostcall-local.mjs`, 12/12): single + sequential calls, client-throw → catchable rejection + mutex released, unbound fn → clean reject, oplog replay does not re-call. Cloud **HTTP** transport cannot do host callbacks (no held socket) — WS only.
+
+---
+
+## ADR-0005 — REPL completion value for top-level-await cells
+
+**Status:** Accepted (live).
+
+**Context.** The engine runs a cell three ways (`install_cell`): expression form (`return (src)`, supports await), **async-body form** (`new AsyncFn(src)` when the cell contains `await`), and global-`eval` form (no await). A *function body* has **no completion value**, so an await-using multi-statement cell ending in a trailing expression (e.g. a loop then `({m,i})`) silently returned `undefined`. No-await cells were fine because they use indirect `eval`, which *does* yield the last-expression value. Symptom: an agent/await loop "ran but converged on nothing."
+
+**Decision.** Host-side, after the persistence transform, a scoped `wrapAsyncCompletion` (in `repl-transform.ts`) rewrites an await-cell's trailing expression (after a depth-0 `}`/`;`) into `; return ( … );`, so the async-body wrapper yields it. It **bails to the input on any ambiguity** (no depth-0 await, no boundary, keyword-led tail, unbalanced source) → zero regression for no-await / single-expr / trailing-semicolon cells.
+
+**Why.** Fixing it in the host transform (which already tokenizes at depth 0) avoids touching the precompiled engine for a parsing concern, and the bail-safe design means it can only *add* a completion value, never corrupt a cell.
+
+**Consequence.** `let m=...; while(...){ m = await host.subLM(m); } ({m,i})` now returns its value. Verified `tests/kernel-rust/completion-local.mjs` (11/11): loops, if, for, template, declarations persist, trailing-semicolon stays `undefined`.
+
+---
+
+## ADR-0006 — Node-parity shims + runtime npm via a CDN bundler (`use()`)
+
+**Status:** Accepted (live). Closes the easy half of the Node-gap matrix.
+
+**Context.** The VM is bare QuickJS — no `require`/modules/`fs`/`process`/`Buffer`/timers/`fetch`. Many libraries probe for these. A true async `import('pkg')` is **architecturally blocked**: QuickJS module resolution is *synchronous*, but the only host IO (`host.fetch`) is *asynchronous* (parked VM, resumed by Rust). You cannot synchronously fetch inside the module loader without a heavy, fragile dependency walker.
+
+**Decision.** Add pure-in-VM, snapshot-persisted shims to the engine `BOOTSTRAP` (zero entropy, no new host capability): `global`, a `process` shim (`env`/`argv`/`platform`/`nextTick`), a `fetch()` Response-like wrapper over the allowlisted `host.fetch`, `console.dir/group/table/assert`, REPL `_` last-value, a `Buffer` subset over `Uint8Array`, `require()` over built-in shims (`crypto` via the **seeded** `getRandomValues`, `events`/`util`/`path`/`os`/`assert`/`buffer`) plus the `use()` cache, and **immediate timers** (`setTimeout`/`setImmediate` fire on the microtask queue, **delay ignored**; `setInterval` is a safe no-op). For npm: `await use(name)` fetches a **pre-bundled CDN build** (jsDelivr/esm.sh — *that* is the bundler), evals it in a CJS frame (`module`/`exports`/`require`/`Buffer`/`process`), and caches the result in `globalThis.__mods`.
+
+**Why.** Immediate timers are determinism- and hibernation-safe (a timer never spans a snapshot — it completes within the cell's microtask drain), which retired the earlier over-cautious "no timers" stance. `use()` + a real `require` frame covers the large class of self-contained CJS/UMD bundles with no engine changes, and because the loaded source lives in the heap it **survives hibernation with no re-fetch** — something Node's runtime `require` cannot freeze into a portable image.
+
+**Consequence.** Verified live: `use('lodash')`/`use('dayjs')`/`use('ramda')`/`bcryptjs` (which `require('crypto')` + `setTimeout`), `_` last-value, `process`, immediate `setTimeout`, all surviving evict→cold-restore. **Limits (honest):** `use()` is async (not sync `require`); needs the CDN host on the fetch allowlist; works for self-contained bundles only — **ESM-only** packages and **multi-file relative-`require`** packages still fail. Full `import('x')` needs the QuickJS async module loader wired in Rust (deferred — the one item that would close the ESM gap).
+
+---
+
+## ADR-0007 — RLM/agent loops are an SDK example, not a kernel feature
+
+**Status:** Accepted.
+
+**Context.** "RLM" (recursive-LM / agent loop) drove early demos, and host verbs (`host.subLM`/`host.final`) were once kernel-native. That couples a general durable REPL to one application and re-introduces an opinionated surface the kernel shouldn't own.
+
+**Decision.** The kernel ships **only** the generic bridge (ADR-0004). The agent loop — the LM call, the iteration, the stop/convergence condition, "final" — is **application code**: the *client* registers `host.subLM` (SDK `host:` option / CLI / UI `setHost`) and the *cell* contains the loop. The canonical illustration lives at **`examples/agent-loop.mjs`** (repo root), not in the kernel, SDK core, or the UI default.
+
+**Why.** Keeps the kernel a generic, sandboxed, durable REPL; lets RLM evolve independently; avoids implying native support that isn't (and shouldn't be) there. The UI was reverted to bind **no** host functions by default — only the generic `setHost` + demux remain.
+
+**Consequence.** `host.subLM` in any demo is just a client-provided host fn (mechanically identical to `host.echo`). Naming that evokes RLM is illustrative, not a kernel contract.
+
+---
+
+## ADR-0008 — Hibernation is platform-driven: eager snapshot, passive eviction, lazy wake
+
+**Status:** Accepted (describes the live mechanism).
+
+**Context.** "How does it self-hibernate?" — there is **no kernel-side hibernate timer**. Hibernation is the Cloudflare Durable Object **idle-eviction + WebSocket Hibernation** behaviour; the kernel is designed so that eviction is *safe* and waking is *cheap*.
+
+**Decision.** Three separated concerns:
+1. **Persist eagerly (active, per cell).** Every `eval` ends with a checkpoint: dump live WASM linear memory → gzip → DO **SQLite** (chunked rows; R2 only if >2MB gz). The durable image is always current; the live WASM instance (`self.glue`) is disposable, held only in the DO JS heap.
+2. **Hibernate passively (platform).** On WS connect: `state.accept_web_socket(server)` marks the socket **hibernatable**, and `set_websocket_auto_response("ping","pong")` lets the **edge answer keep-alive pings without waking the DO**. When idle, Cloudflare evicts the isolate — the live WASM instance is gone, the socket is parked, SQLite survives.
+3. **Wake lazily (on next touch).** The next message instantiates a **fresh DO** (`generation++`, `glue = None`); `ensure_glue()` reads config + manifest from SQLite (or R2), blits the snapshot into a new WASM instance, `reattach()`, and continues — **no source replay, no re-fired effects** (ADR-0002).
+
+**Why.** The kernel cannot (and a *facet* may not) set alarms; making eviction safe by construction beats trying to control it. Auto-response ping/pong is the key to staying hibernated cheaply under a heartbeat. Per-cell snapshot means eviction can happen at any quiescent boundary with zero data loss.
+
+**Consequence.** A real hibernation is observable: `generation` bumps and `inMemory:false` on the next op (`hibernateThenResume()` / the UI pill). The `Hibernate` button / `{t:evict}` is a **manual** force-evict (`self.glue.take()`) for demos/tests, not the normal path. In `engram-cloud`, idle/TTL/keep-warm scheduling lives on the **supervisor** (which *can* set alarms), not the per-session facet. Deep-eviction wake is platform-bound (~1.5s worst real, dominated by WS-connect + isolate spin-up), state always survives (docs/results/deep-hibernation.md).
+
+---
+
+## ADR-0009 — Two deployables: `engram-kernel` (engine) vs `engram-cloud` (multi-tenant SaaS)
+
+**Status:** Accepted (both live).
+
+**Context.** The single-tenant kernel and the multi-tenant SaaS have different trust models, bindings, and lifecycles. Folding auth/metering/routing into the kernel would bloat its trust surface and bindings.
+
+**Decision.** Ship **two workers**:
+- **`engram-kernel`** — the engine. One `KernelDO` class, one DO per session id, **unauthed** raw WebSocket. Direct, open, dev-friendly.
+- **`engram-cloud`** — the SaaS wrapper. A `SupervisorDO` (64-shard) that **embeds the kernel** (`bake-rust.ts` bakes the kernel build into `modules.rust.gen.js`) and loads it **per session as a facet** (own SQLite, failure-isolated) via the Worker Loader `{wasm}` module type. Adds per-tenant API keys (`x-api-key`), Analytics-Engine metering + `/usage`, routing, and supervisor-owned alarms (ADR-0003, ADR-0008).
+
+**Why.** Separation lets the kernel evolve and deploy independently; the cloud just re-bakes the latest kernel. Cloud needs `worker_loaders` + facets bindings the kernel doesn't. Different auth/tenancy boundaries stay isolated.
+
+**Consequence.** SDK auto-detects transport: `apiKey` + `http(s)://` → cloud HTTP; otherwise → kernel WS. The cloud **HTTP** path cannot do `host.<name>` callbacks (no held socket; ADR-0004) — those need the WS path. The UI talks raw WS to `engram-kernel` and needs **no API key**.
+
+---
+
+## ADR-0010 — Fast local test infra: build-once + no-rebuild dev config
+
+**Status:** Accepted.
+
+**Context.** `wrangler dev` re-runs the full Rust release build (~90s: cargo + wasm-bindgen + worker-build) on **every start**, which raced the E2E harness's ready-wait — so the on-real-workerd bridge/completion tests effectively never ran (they timed out before the server came up).
+
+**Decision.** Add `apps/kernel/wrangler.dev.jsonc` — a copy of the prod config with `build.command` = `"true"` (no-op) and `name` = `engram-kernel-dev`. The kernel E2E harnesses (`hostcall-local.mjs`, `completion-local.mjs`) **build once** up-front (skippable with `ENGRAM_SKIP_BUILD=1`) then launch `wrangler dev -c wrangler.dev.jsonc`, so the server is ready in **~5s** instead of timing out.
+
+**Why.** A test that can't finish provides no signal. Decoupling the build from `wrangler dev` makes the real-workerd suite actually runnable and fast to iterate.
+
+**Consequence.** Production deploys still use the real `wrangler.jsonc` build. Deploys reuse fresh artifacts via `wrangler deploy --name engram-kernel -c wrangler.dev.jsonc` (with `.env` creds) — the root `deploy:kernel` script is currently broken (pins wrangler 3.x + wrong cwd → `tsconfig.json not found`); deploy from `apps/kernel` with `wrangler@^4`.
