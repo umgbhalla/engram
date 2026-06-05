@@ -17,7 +17,7 @@
 //
 // The engine ABI (C exports) is documented in engine/src/lib.rs.
 
-import { transformCell } from "./repl-transform.js";
+import { transformCell, wrapAsyncCompletion } from "./repl-transform.js";
 import tsBlankSpace from "ts-blank-space";
 
 // stripTypes: erase TS type syntax to whitespace (length-preserving, no codegen) so the
@@ -640,6 +640,11 @@ class GlueKernel {
       // source on any ambiguity (never corrupts the cell). See src/repl-transform.ts.
       let transformed = tsOut;
       try { transformed = transformCell(tsOut); } catch { transformed = tsOut; }
+      // REPL completion value for top-level-await cells: the engine runs an await-using
+      // multi-statement cell as an async function BODY (no completion value), so a trailing
+      // expression after a loop/block is otherwise lost. Rewrite it into an explicit `return`.
+      // Bails to the input on any ambiguity (no regression for non-await / single-expr cells).
+      try { transformed = wrapAsyncCompletion(transformed); } catch { /* keep transformed */ }
       const srcBytes = TEXT_ENC.encode(transformed);
       // (a) PROTOCOL/SOURCE size guard: reject an oversized cell source BEFORE writing it into the
       // fixed scratch buffer. Typed ProtocolSizeError, socket alive, mutex released, next eval works.

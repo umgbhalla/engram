@@ -71,10 +71,22 @@ function makeClient(url, hostFns) {
 }
 
 // ---- boot wrangler dev ----
-console.log("[hostcall-local] starting wrangler dev on :" + PORT + " ...");
+// TEST INFRA: `wrangler dev` re-runs the full Rust release build (~90s) on every start,
+// which races the ready-wait below. To keep the bridge E2E runnable, build ONCE up-front
+// here, then launch dev against wrangler.dev.jsonc (build.command = "true" => no rebuild),
+// so the server is ready in seconds. Set ENGRAM_SKIP_BUILD=1 to reuse existing artifacts.
+const { execSync } = await import("node:child_process");
+if (!process.env.ENGRAM_SKIP_BUILD) {
+  console.log("[hostcall-local] building kernel once (skip with ENGRAM_SKIP_BUILD=1) ...");
+  execSync(
+    "bun x tsc -p tsconfig.json && node scripts/build-ts.ts && node scripts/build-engine.ts && node scripts/engine-hash.ts && worker-build --release",
+    { cwd: kernelDir, stdio: "inherit" },
+  );
+}
+console.log("[hostcall-local] starting wrangler dev (no-rebuild) on :" + PORT + " ...");
 const dev = spawn(
   "bun",
-  ["x", "wrangler@^4", "dev", "--port", String(PORT), "--local", "--ip", "127.0.0.1"],
+  ["x", "wrangler@^4", "dev", "-c", "wrangler.dev.jsonc", "--port", String(PORT), "--local", "--ip", "127.0.0.1"],
   { cwd: kernelDir, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env } },
 );
 let devLog = "";

@@ -340,6 +340,95 @@ function handleDeclaration(src: string, kw: string, kwStart: number, getI: GetI,
   }
 }
 
+// ---------------------------------------------------------------------------
+// wrapAsyncCompletion — REPL completion value for top-level-await cells.
+//
+// The engine (engine/src/lib.rs install_cell) runs an await-using multi-statement cell as
+// `new AsyncFn(src)` — an async function BODY. A function body has NO completion value, so a
+// trailing expression like `({m,i})` after a loop is DISCARDED and the cell returns undefined.
+// (No-await cells use indirect `eval`, which DOES yield the last-expression value — so only the
+// await path is affected.)
+//
+// FIX: when the cell uses a depth-0 `await` AND ends in a trailing expression after a depth-0
+// `}` or `;` boundary, rewrite that trailing expression into `; return ( … );`. The engine's
+// expr-mode (`return (src)`) then fails to compile (statements before the return), so it falls
+// to the asyncbody path `new AsyncFn(src)` — where our explicit `return` now yields the value.
+//
+// SAFETY: this is a heuristic, applied AFTER transformCell. On ANY ambiguity (no depth-0
+// await, no boundary, empty/keyword-led tail, unbalanced/exotic source) it returns the input
+// UNCHANGED — i.e. today's behaviour (completion value undefined), never a correctness change.
+const STMT_LEAD = new Set([
+  "if", "for", "while", "switch", "try", "do", "else", "return", "throw", "break",
+  "continue", "var", "let", "const", "function", "class", "with", "debugger", "export", "import",
+]);
+
+export function wrapAsyncCompletion(src: string): string {
+  if (typeof src !== "string" || src.length === 0) return src;
+  if (!/\bawait\b/.test(src)) return src; // engine uses the eval path → completion value already fine.
+  let scan: { lastBoundaryEnd: number } | null;
+  try {
+    scan = scanTopLevel(src);
+  } catch {
+    return src;
+  }
+  if (!scan) return src;
+  const b = scan.lastBoundaryEnd;
+  if (b <= 0 || b >= src.length) return src; // no boundary, or boundary is the last char (no tail).
+  const tail = src.slice(b);
+  const tailTrim = tail.trim();
+  if (tailTrim === "") return src; // trailing whitespace/comment only.
+  // The tail must be a single EXPRESSION statement, not a nested statement/declaration.
+  const m = /^[A-Za-z_$][\w$]*/.exec(tailTrim);
+  if (m && STMT_LEAD.has(m[0])) return src; // already a return / control / declaration → leave it.
+  if (tailTrim[0] === "{") return src; // block, not an object-literal expression statement → leave.
+  // Rewrite: keep everything up to and including the boundary, then return the trailing expr.
+  // A leading `;` guards against the boundary being a `}` (ASI-safe) and the wrapped `( … )`
+  // makes an object-literal tail an expression, not a block.
+  return src.slice(0, b) + ";return (\n" + tailTrim + "\n);";
+}
+
+// Scan `src` tracking string/template/regex/comment state and ()[]{} depth, returning the end
+// offset of the LAST depth-0 statement boundary (a `;` or a `}` that returns depth to 0) and
+// whether a depth-0 `await` identifier appears. Throws on nothing; returns null on unbalanced.
+function scanTopLevel(src: string): { lastBoundaryEnd: number } | null {
+  const n = src.length;
+  let i = 0;
+  let depth = 0;
+  let prev = "start";
+  let lastBoundaryEnd = -1;
+  while (i < n) {
+    const c = src[i];
+    if (c === " " || c === "\t" || c === "\r" || c === "\n") { i++; continue; }
+    if (c === "/" && src[i + 1] === "/") { i += 2; while (i < n && src[i] !== "\n") i++; continue; }
+    if (c === "/" && src[i + 1] === "*") { i += 2; while (i < n && !(src[i] === "*" && src[i + 1] === "/")) i++; i += 2; continue; }
+    if (c === '"' || c === "'" || c === "`") {
+      if (!skipString(src, () => i, (v) => (i = v), c)) return null;
+      prev = "val"; continue;
+    }
+    if (c === "/") {
+      const regexOk = prev === "start" || prev === "op" || prev === "open" || prev === "kw" || prev === "boundary";
+      if (regexOk) { if (!skipRegex(src, () => i, (v) => (i = v))) return null; prev = "val"; continue; }
+      i++; prev = "op"; continue;
+    }
+    if (c === "(" || c === "[" || c === "{") { depth++; i++; prev = "open"; continue; }
+    if (c === ")" || c === "]" || c === "}") {
+      depth--; if (depth < 0) return null; i++;
+      if (c === "}" && depth === 0) { lastBoundaryEnd = i; prev = "boundary"; } else { prev = "val"; }
+      continue;
+    }
+    if (c === ";") { i++; if (depth === 0) { lastBoundaryEnd = i; prev = "boundary"; } else prev = "op"; continue; }
+    if (isIdentStart(c)) {
+      const s = i; i++; while (i < n && isIdentPart(src[i])) i++;
+      const w = src.slice(s, i);
+      prev = STMT_LEAD.has(w) || ["typeof", "instanceof", "in", "of", "new", "delete", "void", "yield", "await", "case"].includes(w) ? "kw" : "val";
+      continue;
+    }
+    i++; prev = "op";
+  }
+  if (depth !== 0) return null;
+  return { lastBoundaryEnd };
+}
+
 // ---- shared string/regex skippers (operate on the caller's `i` via get/set) ----
 function skipString(src: string, getI: GetI, setI: SetI, q: string): boolean {
   const n = src.length;

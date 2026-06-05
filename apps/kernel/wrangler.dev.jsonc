@@ -1,0 +1,46 @@
+{
+  "name": "engram-kernel-dev",
+  // Wrapper entry: imports the rquickjs engine.wasm as CompiledWasm and re-exports the
+  // worker-build output (Rust DO shim + kernel-glue.mjs WASI shim).
+  "main": "entry.mjs",
+  "compatibility_date": "2025-05-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  // Build pipeline:
+  //   1. tsc --noEmit — typecheck the authored TS (kernel-glue / repl-transform / entry / stdlib-meta).
+  //   2. esbuild — bundle src/kernel-glue.ts -> src/kernel-glue.mjs (repl-transform inlined) and
+  //      entry.ts -> entry.mjs (engine.wasm / stdlib.bundle.txt / engine-hash.js / shim external),
+  //      preserving the exact module exports worker-build + lib.rs #[wasm_bindgen(module=...)] expect.
+  //   3. build the rquickjs ENGINE (wasm32-wasip1) + copy to src/engine.wasm.
+  //   4. SHA-256 the engine wasm into src/engine-hash.js (AFTER esbuild, which keeps it external).
+  //   5. worker-build --release — compile the Rust DO shell (reads src/kernel-glue.mjs).
+  "build": {
+    "command": "true"
+  },
+
+  // engine.wasm bundled as CompiledWasm => importable as a precompiled WebAssembly.Module
+  // (workerd forbids runtime WebAssembly.compile of arbitrary bytes).
+  "rules": [
+    { "type": "CompiledWasm", "globs": ["src/engine.wasm"], "fallthrough": true },
+    { "type": "Text", "globs": ["src/stdlib.bundle.txt"], "fallthrough": true }
+  ],
+
+  "durable_objects": {
+    "bindings": [{ "name": "KERNEL_DO", "class_name": "KernelDO" }]
+  },
+
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["KernelDO"] }],
+
+  // R2 OVERFLOW only (gz image > ~2MB). benchrustf/ key prefix per the guardrails.
+  "r2_buckets": [
+    { "binding": "SNAPSHOTS", "bucket_name": "engram-snapshots" }
+  ],
+
+  // V0.5 OBSERVABILITY parity: per-op Analytics Engine datapoint
+  // (env.AE.writeDataPoint), called via js_sys Reflect on Env (worker crate has no
+  // AE binding). Queryable via the AE SQL API. dataset engram_kernel.
+  "analytics_engine_datasets": [
+    { "binding": "AE", "dataset": "engram_kernel" }
+  ]
+}

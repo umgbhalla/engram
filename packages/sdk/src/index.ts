@@ -59,8 +59,36 @@ export interface EvalErrorInfo {
   stack?: string;
 }
 
+/**
+ * A typed runtime environment applied at connect (and re-applied on every reconnect,
+ * exactly like {@link ConnectOptions.bootstrap}). It composes with — and runs after —
+ * any explicit `bootstrap`.
+ *
+ * - `globals`: host-side functions serialised by `.toString()` into an idempotent
+ *   in-VM bootstrap (`g.<name> ||= <fn>`), so a cell can call them directly by name.
+ *   These are PURE in-VM functions (no host round-trip) — they are stringified and
+ *   re-created inside the VM.
+ * - `prelude`: extra JS appended to the generated bootstrap (idempotent — runs on every reconnect).
+ * - `modules`: forwarded into `config.modules` (load the in-VM stdlib bundle).
+ *
+ * The SDK always injects a tiny built-in prelude that wires `host.final(x)` / `FINAL(x)`
+ * over the reserved `__engram_final` host channel, so faithful-final works for free
+ * (see {@link EvalResult.final}).
+ */
+export interface RuntimeEnv {
+  /** In-VM helper functions, serialised by `.toString()` into an idempotent bootstrap. */
+  globals?: Record<string, (...a: any[]) => any>;
+  /** Extra idempotent JS appended to the generated bootstrap (runs on every reconnect). */
+  prelude?: string;
+  /** Forwarded into `config.modules` (in-VM stdlib bundle: `true` or a name list). */
+  modules?: boolean | string[];
+}
+
+/** A namespaced bundle of host functions registered together via {@link EngramSession.defineHostModule}. */
+export type HostModule = Record<string, (...args: any[]) => unknown | Promise<unknown>>;
+
 /** The typed result of {@link EngramSession.eval}. */
-export interface EvalResult<T = unknown> {
+export interface EvalResult<T = unknown, F = unknown> {
   /** `true` if the cell completed without throwing. */
   ok: boolean;
   /**
@@ -81,6 +109,18 @@ export interface EvalResult<T = unknown> {
   checkpoint?: Checkpoint;
   /** Monotonic cell index. */
   cell?: number;
+  /**
+   * `true` if `host.final(x)` (the reserved `__engram_final` channel) fired during this
+   * cell. Lets you distinguish "a final was set to `undefined`" from "no final".
+   */
+  finalSet: boolean;
+  /**
+   * The argument of the LAST `host.final(x)` / `FINAL(x)` call that fired during this
+   * cell — surfaced as FAITHFUL JSON (it crossed the wire as hostcall args, NOT through
+   * the value-preview path), so async-IIFE object completions round-trip intact instead
+   * of mis-previewing as `{}`.
+   */
+  final?: F;
 }
 
 /** In-VM kernel configuration, applied at session create and persisted across hibernation. */
@@ -133,6 +173,25 @@ export interface ConnectOptions {
    * Requires the WebSocket transport (no-op over the cloud HTTP path).
    */
   host?: Record<string, (...a: unknown[]) => unknown | Promise<unknown>>;
+  /**
+   * A typed runtime environment ({@link RuntimeEnv}): in-VM `globals`, a `prelude`, and
+   * `modules`. Applied (and re-applied on reconnect) the same way as {@link ConnectOptions.bootstrap},
+   * composing after it. Always also wires `host.final` / `FINAL` over the reserved channel.
+   */
+  env?: RuntimeEnv;
+  /**
+   * Seed the first-class durable context map (`globalThis.__engram_ctx`), readable in-VM
+   * via the injected `host.ctx` getter and from the SDK via {@link EngramSession.ctx}.
+   * Survives hibernation (persisted global).
+   */
+  ctx?: Record<string, unknown>;
+  /**
+   * Namespaced host modules: each fn is registered under the literal name `<ns>.<fn>`
+   * (the kernel dispatches any name) and a namespacing shim makes the VM see
+   * `host.<ns>.<fn>(...)`. See {@link EngramSession.defineHostModule}.
+   * Requires the WebSocket transport (no-op over the cloud HTTP path).
+   */
+  hostModules?: Record<string, HostModule>;
 }
 
 // ---------------------------------------------------------------------------
@@ -488,6 +547,95 @@ class HttpTransport implements Transport {
 }
 
 // ---------------------------------------------------------------------------
+// Env / bootstrap composition (SDK-only extension points)
+// ---------------------------------------------------------------------------
+
+/** The reserved host channel that records a cell's faithful final value. */
+const FINAL_HOST = "__engram_final";
+/** The reserved durable context global, persisted across hibernation. */
+const CTX_GLOBAL = "__engram_ctx";
+
+/**
+ * The tiny built-in default prelude. It is idempotent (safe to re-run on every reconnect)
+ * and gives consumers faithful final + a `host.ctx` getter for free:
+ *  - `host.final(x)` / `FINAL(x)` round-trip `x` over the reserved {@link FINAL_HOST} channel
+ *    (so object finals come back as faithful JSON, not the `{}` value-preview).
+ *  - `host.ctx` reflects the persisted {@link CTX_GLOBAL} map seeded by `connect({ctx})`
+ *    and {@link EngramSession.ctx}`.set`.
+ */
+function defaultEnvPrelude(): string {
+  // NOTE: in-VM `host` is a recursive proxy whose `get` returns a callable for EVERY
+  // property name (so `host.final` is already truthy and `||=` would be a no-op, leaving
+  // the buggy native value-preview path in place). We therefore ASSIGN unconditionally so
+  // our reserved-channel router wins. The proxy permits own-property assignment (verified).
+  return [
+    `(globalThis.host ||= {});`,
+    // Faithful-final: route host.final / FINAL through the reserved host channel
+    // (host.__engram_final), whose args cross as faithful JSON — fixing the {} preview bug.
+    `globalThis.host.final = function(x){ globalThis.host.${FINAL_HOST}(x); return x; };`,
+    `globalThis.FINAL = function(x){ return globalThis.host.final(x); };`,
+    // First-class durable ctx: expose the persisted global map as host.ctx (own property,
+    // assigned each (re)connect so it reflects the restored global).
+    `(globalThis.${CTX_GLOBAL} ||= {});`,
+    `globalThis.host.ctx = (globalThis.${CTX_GLOBAL} ||= {});`,
+  ].join("\n");
+}
+
+/** Serialise a {@link RuntimeEnv}'s globals into an idempotent in-VM bootstrap (`g.<name> ||= <fn>`). */
+function serialiseEnvGlobals(globals?: Record<string, (...a: any[]) => any>): string {
+  if (!globals) return "";
+  const lines: string[] = [`(globalThis.host ||= {});`];
+  for (const [name, fn] of Object.entries(globals)) {
+    lines.push(`globalThis[${JSON.stringify(name)}] ||= (${fn.toString()});`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Build the namespacing shim that makes a host module visible in-VM as `host.<ns>.<fn>`
+ * even though each fn is registered flat under the literal name `<ns>.<fn>`. Idempotent.
+ */
+function hostModuleShim(namespace: string, fnNames: string[]): string {
+  const ns = JSON.stringify(namespace);
+  // ASSIGN (not ||=): the host proxy returns a callable for host[ns], so ||= would no-op.
+  // Replace it with a real namespace object whose methods forward to the flat dotted name.
+  const lines: string[] = [`(globalThis.host ||= {});`, `globalThis.host[${ns}] = (globalThis.host[${ns}] && typeof globalThis.host[${ns}] === 'object') ? globalThis.host[${ns}] : {};`];
+  for (const fn of fnNames) {
+    const flat = JSON.stringify(`${namespace}.${fn}`);
+    const key = JSON.stringify(fn);
+    // Each shim forwards to the flat reserved name; the kernel dispatches the dotted name.
+    lines.push(
+      `globalThis.host[${ns}][${key}] = function(...a){ return globalThis.host[${flat}](...a); };`,
+    );
+  }
+  return lines.join("\n");
+}
+
+/** Compose explicit bootstrap + default env prelude + env.globals + env.prelude + host-module shims. */
+function composeBootstrap(parts: {
+  bootstrap?: string;
+  env?: RuntimeEnv;
+  hostModules?: Record<string, HostModule>;
+}): string | undefined {
+  const segments: string[] = [];
+  // Built-in default prelude first (wires host.final / FINAL / host.ctx).
+  segments.push(defaultEnvPrelude());
+  if (parts.env) {
+    const g = serialiseEnvGlobals(parts.env.globals);
+    if (g) segments.push(g);
+    if (typeof parts.env.prelude === "string" && parts.env.prelude.length) segments.push(parts.env.prelude);
+  }
+  if (parts.hostModules) {
+    for (const [ns, mod] of Object.entries(parts.hostModules)) {
+      segments.push(hostModuleShim(ns, Object.keys(mod)));
+    }
+  }
+  // Explicit user bootstrap runs LAST so it can override/extend env-provided globals.
+  if (typeof parts.bootstrap === "string" && parts.bootstrap.length) segments.push(parts.bootstrap);
+  return segments.length ? segments.join("\n") : undefined;
+}
+
+// ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
 
@@ -502,6 +650,21 @@ export class EngramSession {
   private bootstrap?: string;
   private onConsole?: (line: ConsoleLine) => void;
 
+  /**
+   * Per-eval capture of the LAST `host.__engram_final(value)` hostcall. `WsTransport`
+   * serialises one rpc at a time, so attribution to the in-flight eval is unambiguous.
+   * Reset before each eval (see {@link EngramSession.eval}).
+   */
+  private capturedFinal: { set: boolean; value: unknown } = { set: false, value: undefined };
+
+  /** First-class durable context accessor (`session.ctx.set/get`), backed by the persisted ctx global. */
+  readonly ctx: {
+    /** Persist `value` under `key` in the durable ctx map (survives hibernation). */
+    set: (key: string, value: unknown) => Promise<void>;
+    /** Read a value previously stored in the durable ctx map. */
+    get: <T = unknown>(key: string) => Promise<T | undefined>;
+  };
+
   /** @internal */
   constructor(
     private transport: Transport,
@@ -513,6 +676,31 @@ export class EngramSession {
     this.config = opts.config;
     this.bootstrap = opts.bootstrap;
     this.onConsole = opts.onConsole;
+    // Reserved final channel: record the LAST arg of each __engram_final call this eval.
+    this.transport.setHost(FINAL_HOST, (...args: unknown[]) => {
+      this.capturedFinal = { set: true, value: args.length ? args[0] : undefined };
+      return undefined;
+    });
+    // First-class ctx accessor over the persisted ctx global (reserved hostfn marshals values).
+    this.ctx = {
+      set: async (key: string, value: unknown): Promise<void> => {
+        await this.transport.request(
+          {
+            t: "eval",
+            src: `(globalThis.${CTX_GLOBAL} ||= {})[${JSON.stringify(key)}] = ${JSON.stringify(value)}; void 0`,
+          },
+          this.timeoutMs,
+        );
+      },
+      get: async <T = unknown>(key: string): Promise<T | undefined> => {
+        const reply = await this.transport.request(
+          { t: "eval", src: `(globalThis.${CTX_GLOBAL} ||= {})[${JSON.stringify(key)}]` },
+          this.timeoutMs,
+        );
+        const r = this.normalize<T>(reply);
+        return (r.value as T) ?? undefined;
+      },
+    };
   }
 
   /** @internal applied once when the transport first connects. */
@@ -534,9 +722,15 @@ export class EngramSession {
    * @param opts `throwOnError` overrides the session default for this call; `timeoutMs` overrides the timeout.
    * @returns a typed {@link EvalResult}. Throws a typed {@link EngramError} on failure unless `throwOnError` is false.
    */
-  async eval<T = unknown>(code: string, opts: { throwOnError?: boolean; timeoutMs?: number } = {}): Promise<EvalResult<T>> {
+  async eval<T = unknown, F = unknown>(code: string, opts: { throwOnError?: boolean; timeoutMs?: number } = {}): Promise<EvalResult<T, F>> {
+    // Reset the captured final before each eval; the reserved __engram_final hostfn
+    // records the LAST value during this (serialised) rpc.
+    this.capturedFinal = { set: false, value: undefined };
     const reply = await this.transport.request({ t: "eval", src: code }, opts.timeoutMs ?? this.timeoutMs);
-    const result = this.normalize<T>(reply);
+    const result = this.normalize<T, F>(reply);
+    // Surface the faithful final (crossed as hostcall args, not the value-preview path).
+    result.finalSet = this.capturedFinal.set;
+    if (this.capturedFinal.set) result.final = this.capturedFinal.value as F;
     for (const line of result.console) this.onConsole?.(line);
     const shouldThrow = opts.throwOnError ?? this.throwOnError;
     if (!result.ok && shouldThrow) {
@@ -546,7 +740,7 @@ export class EngramSession {
   }
 
   /** Normalise a raw kernel/cloud reply into a typed {@link EvalResult}. */
-  private normalize<T>(reply: any): EvalResult<T> {
+  private normalize<T, F = unknown>(reply: any): EvalResult<T, F> {
     const console: ConsoleLine[] = Array.isArray(reply?.logs)
       ? reply.logs.map((l: any) =>
           typeof l === "string"
@@ -573,6 +767,8 @@ export class EngramSession {
       error: reply?.error || undefined,
       checkpoint: reply?.checkpoint || undefined,
       cell: typeof reply?.cell === "number" ? reply.cell : undefined,
+      // Populated by eval() after the rpc returns (the captured final is per-eval).
+      finalSet: false,
     };
   }
 
@@ -629,6 +825,35 @@ export class EngramSession {
     this.transport.setHost(name, fn);
   }
 
+  /**
+   * Typed overload of {@link bindHost}: register a host fn with explicit arg/return types.
+   * The VM still calls it flat as `host.<name>(...args)`. No-op over the HTTP (cloud) transport.
+   */
+  defineHost<A extends unknown[] = unknown[], R = unknown>(
+    name: string,
+    fn: (...args: A) => R | Promise<R>,
+  ): void {
+    this.transport.setHost(name, fn as HostFn);
+  }
+
+  /**
+   * Register a namespaced bundle of host fns. Each fn is bound flat under the literal
+   * name `<namespace>.<fn>` (the kernel dispatches any name), and a namespacing shim is
+   * installed in-VM (idempotently, surviving reconnect) so the VM calls
+   * `host.<namespace>.<fn>(...)`. No-op for the dispatch part is impossible over HTTP
+   * (the cloud transport ignores host binds), but the shim eval is still applied.
+   */
+  defineHostModule(namespace: string, mod: HostModule): void {
+    for (const [fnName, fn] of Object.entries(mod)) {
+      this.transport.setHost(`${namespace}.${fnName}`, fn as HostFn);
+    }
+    // Install the namespacing shim now (best-effort) and make it part of the durable
+    // bootstrap so it is re-applied on every reconnect / cold restore.
+    const shim = hostModuleShim(namespace, Object.keys(mod));
+    this.bootstrap = this.bootstrap ? `${this.bootstrap}\n${shim}` : shim;
+    void this.transport.request({ t: "eval", src: shim }, this.timeoutMs).catch(() => {});
+  }
+
   /** Close the transport. The durable session persists server-side and can be reconnected. */
   close(): void {
     this.transport.close();
@@ -657,18 +882,41 @@ export const Engram = {
     const autoReconnect = opts.autoReconnect !== false;
     const timeoutMs = opts.timeoutMs ?? 60000;
     const config = { ...(opts.config || {}) };
-    const bootstrap = typeof opts.bootstrap === "string" && opts.bootstrap.length ? opts.bootstrap : undefined;
+    // env.modules feeds config.modules (explicit config.modules wins if both given).
+    if (opts.env && opts.env.modules !== undefined && config.modules === undefined) {
+      config.modules = opts.env.modules;
+    }
+    // Compose: built-in final/ctx prelude + env.globals + env.prelude + host-module shims + explicit bootstrap.
+    const bootstrap = composeBootstrap({
+      bootstrap: typeof opts.bootstrap === "string" && opts.bootstrap.length ? opts.bootstrap : undefined,
+      env: opts.env,
+      hostModules: opts.hostModules,
+    });
     const base = String(opts.url).replace(/\/+$/, "");
 
     // Cloud HTTP path: an API key + an http(s) endpoint.
     const isHttp = /^https?:\/\//i.test(base);
     const applyHost = (s: EngramSession) => {
       if (opts.host) for (const [name, fn] of Object.entries(opts.host)) s.bindHost(name, fn);
+      // Namespaced host modules: bind flat dotted names (shims are in the composed bootstrap).
+      if (opts.hostModules) {
+        for (const [ns, mod] of Object.entries(opts.hostModules)) {
+          for (const [fnName, fn] of Object.entries(mod)) s.bindHost(`${ns}.${fnName}`, fn as HostFn);
+        }
+      }
     };
+    // Seed the initial ctx map. Idempotent + reconnect-safe: only fills keys that are
+    // ABSENT, so a value later changed via session.ctx.set survives a cold restore (the
+    // persisted global is restored first, then this seed is a no-op for existing keys).
+    const ctxSeed =
+      opts.ctx && Object.keys(opts.ctx).length
+        ? `{ const __c = (globalThis.${CTX_GLOBAL} ||= {}), __s = ${JSON.stringify(opts.ctx)}; for (const __k in __s) if (!(__k in __c)) __c[__k] = __s[__k]; }`
+        : undefined;
+    const fullBootstrap = ctxSeed ? (bootstrap ? `${bootstrap}\n${ctxSeed}` : ctxSeed) : bootstrap;
 
     if (opts.apiKey && isHttp) {
       const transport = new HttpTransport(base, opts.apiKey, session);
-      const s = new EngramSession(transport, { session, throwOnError, timeoutMs, config, bootstrap, onConsole: opts.onConsole });
+      const s = new EngramSession(transport, { session, throwOnError, timeoutMs, config, bootstrap: fullBootstrap, onConsole: opts.onConsole });
       applyHost(s);
       await s._applyConfig();
       return s;
@@ -691,12 +939,12 @@ export const Engram = {
           await raw({ t: "create", config }, timeoutMs);
         }
         // Seed VM globals once after create, before any user eval (runs on every reconnect).
-        if (bootstrap) {
-          await raw({ t: "eval", src: bootstrap }, timeoutMs);
+        if (fullBootstrap) {
+          await raw({ t: "eval", src: fullBootstrap }, timeoutMs);
         }
       },
     });
-    s = new EngramSession(transport, { session, throwOnError, timeoutMs, config, bootstrap, onConsole: opts.onConsole });
+    s = new EngramSession(transport, { session, throwOnError, timeoutMs, config, bootstrap: fullBootstrap, onConsole: opts.onConsole });
     applyHost(s);
     // Force the first connect (onReady applies config).
     await transport.request({ t: "ping" }, timeoutMs).catch(() => {});
