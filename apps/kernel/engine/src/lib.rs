@@ -490,6 +490,57 @@ globalThis.require = function(name){
   throw new Error("require('" + name + "') is not available — built-in shim missing, or `await use('" + base + "')` it first (the VM cannot synchronously fetch).");
 };
 
+// ===== IN-HEAP VIRTUAL FILESYSTEM — a SYNCHRONOUS, Node-like `fs` =====
+// Backed by a plain object in the heap (globalThis.__vfs), so the whole fs API can be SYNC
+// (readFileSync etc.) — impossible for a host-backed fs, where IO is async (parked VM). Because
+// it lives in the heap it is DURABLE (snapshot-persisted; survives hibernate/cold-restore) and
+// DETERMINISTIC (no host entropy). It is the VM's OWN scratch disk: NOT shared with the host /
+// thinkx tools, and bounded by the heap size-admission cap. For a shared/host-backed workspace,
+// register an async host module (host.fs.*) instead — that can only expose fs.promises.*.
+globalThis.__vfs = globalThis.__vfs || { files: {}, dirs: { '/': true } };
+(function(){
+  var V = globalThis.__vfs;
+  var ENC = new TextEncoder(), DEC = new TextDecoder();
+  function norm(p){
+    p = String(p == null ? '' : p);
+    if (p[0] !== '/') p = '/' + p;
+    var parts = p.split('/'), out = [];
+    for (var i=0;i<parts.length;i++){ var s = parts[i]; if (s === '' || s === '.') continue; if (s === '..') out.pop(); else out.push(s); }
+    return '/' + out.join('/');
+  }
+  function parent(p){ var i = p.lastIndexOf('/'); return i <= 0 ? '/' : p.slice(0, i); }
+  function ENOENT(p){ var e = new Error("ENOENT: no such file or directory, '" + p + "'"); e.code = 'ENOENT'; return e; }
+  function EISDIR(p){ var e = new Error("EISDIR: illegal operation on a directory, '" + p + "'"); e.code = 'EISDIR'; return e; }
+  function toBytes(data, enc){ if (data instanceof Uint8Array) return data.slice(); if (typeof data === 'string') return (enc === 'base64') ? Uint8Array.from(atob(data), function(c){return c.charCodeAt(0);}) : ENC.encode(data); if (data && data.buffer) return new Uint8Array(data.buffer.slice(0)); return ENC.encode(String(data)); }
+  function decode(bytes, enc){ if (!enc || enc === 'buffer' || (enc && enc.encoding === 'buffer')) return bytes.slice(); var e = (typeof enc === 'string') ? enc : enc.encoding; if (e === 'base64') return btoa(String.fromCharCode.apply(null, bytes)); return DEC.decode(bytes); }
+  function existsSync(p){ p = norm(p); return !!V.files[p] || !!V.dirs[p]; }
+  function mkdirSync(p, opts){ p = norm(p); var rec = opts && opts.recursive; if (rec){ var parts = p.split('/').filter(Boolean), cur = ''; for (var i=0;i<parts.length;i++){ cur += '/' + parts[i]; V.dirs[cur] = true; } } else { if (!V.dirs[parent(p)]) throw ENOENT(parent(p)); V.dirs[p] = true; } return p; }
+  function ensureParent(p){ var d = parent(p); if (!V.dirs[d]){ var parts = d.split('/').filter(Boolean), cur=''; for (var i=0;i<parts.length;i++){ cur += '/' + parts[i]; V.dirs[cur] = true; } } }
+  function writeFileSync(p, data, enc){ p = norm(p); if (V.dirs[p]) throw EISDIR(p); ensureParent(p); V.files[p] = { data: toBytes(data, enc && enc.encoding ? enc.encoding : enc), mtime: 0 }; }
+  function appendFileSync(p, data, enc){ p = norm(p); var prev = V.files[p] ? V.files[p].data : new Uint8Array(0); var add = toBytes(data, enc); var out = new Uint8Array(prev.length + add.length); out.set(prev); out.set(add, prev.length); ensureParent(p); V.files[p] = { data: out, mtime: 0 }; }
+  function readFileSync(p, enc){ p = norm(p); var f = V.files[p]; if (!f){ if (V.dirs[p]) throw EISDIR(p); throw ENOENT(p); } return decode(f.data, enc && enc.encoding ? enc.encoding : enc); }
+  function unlinkSync(p){ p = norm(p); if (!V.files[p]) throw ENOENT(p); delete V.files[p]; }
+  function rmSync(p, opts){ p = norm(p); var rec = opts && opts.recursive, force = opts && opts.force; if (V.files[p]) { delete V.files[p]; return; } if (V.dirs[p]) { if (rec){ Object.keys(V.files).forEach(function(k){ if (k === p || k.indexOf(p + '/') === 0) delete V.files[k]; }); Object.keys(V.dirs).forEach(function(k){ if (k === p || k.indexOf(p + '/') === 0) delete V.dirs[k]; }); } else { delete V.dirs[p]; } return; } if (!force) throw ENOENT(p); }
+  function readdirSync(p){ p = norm(p); if (!V.dirs[p] && p !== '/') throw ENOENT(p); var set = {}, pre = p === '/' ? '/' : p + '/'; function add(k){ if (k.indexOf(pre) === 0){ var rest = k.slice(pre.length); if (rest){ var name = rest.split('/')[0]; if (name) set[name] = true; } } } Object.keys(V.files).forEach(add); Object.keys(V.dirs).forEach(function(k){ if (k !== p) add(k); }); return Object.keys(set); }
+  function renameSync(a, b){ a = norm(a); b = norm(b); if (V.files[a]){ ensureParent(b); V.files[b] = V.files[a]; delete V.files[a]; } else if (V.dirs[a]){ V.dirs[b] = true; delete V.dirs[a]; } else throw ENOENT(a); }
+  function copyFileSync(a, b){ a = norm(a); b = norm(b); var f = V.files[a]; if (!f) throw ENOENT(a); ensureParent(b); V.files[b] = { data: f.data.slice(), mtime: 0 }; }
+  function statSync(p){ p = norm(p); var isF = !!V.files[p], isD = !!V.dirs[p]; if (!isF && !isD) throw ENOENT(p); var size = isF ? V.files[p].data.length : 0; return { size: size, mtimeMs: 0, isFile: function(){ return isF; }, isDirectory: function(){ return isD; }, isSymbolicLink: function(){ return false; } }; }
+  var P = function(fn){ return function(){ var a = arguments; return new Promise(function(res, rej){ try { res(fn.apply(null, a)); } catch(e){ rej(e); } }); }; };
+  var fs = {
+    existsSync: existsSync, mkdirSync: mkdirSync, writeFileSync: writeFileSync, appendFileSync: appendFileSync,
+    readFileSync: readFileSync, unlinkSync: unlinkSync, rmSync: rmSync, rmdirSync: rmSync, readdirSync: readdirSync,
+    renameSync: renameSync, copyFileSync: copyFileSync, statSync: statSync, lstatSync: statSync,
+    // promises mirror (resolve synchronously — the VFS has no real async work).
+    promises: { readFile: P(readFileSync), writeFile: P(writeFileSync), appendFile: P(appendFileSync), mkdir: P(mkdirSync), readdir: P(readdirSync), rm: P(rmSync), unlink: P(unlinkSync), rename: P(renameSync), copyFile: P(copyFileSync), stat: P(statSync), access: P(function(p){ if (!existsSync(p)) throw ENOENT(norm(p)); }) },
+    constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1 },
+  };
+  globalThis.__builtins.fs = fs;
+  globalThis.__builtins['node:fs'] = fs;
+  globalThis.__builtins['fs/promises'] = fs.promises;
+  globalThis.fs = fs;
+})();
+// ===== END IN-HEAP VIRTUAL FILESYSTEM =====
+
 // use(name) — load an npm package at RUNTIME by fetching a pre-bundled CDN build (the "bundler"
 // is jsDelivr/esm.sh) and evaluating it into the heap. Handles CJS (module.exports) and UMD
 // (attaches a global). The bundle frame is given a working `require` (built-in shims + the use()
