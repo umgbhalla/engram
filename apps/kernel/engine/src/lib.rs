@@ -386,6 +386,72 @@ globalThis.host = new Proxy({}, {
   }
 });
 
+// ===== NODE-PARITY SHIMS (snapshot-persisted, zero entropy) =====
+// Best-effort parity with the bits of the Node/REPL surface that are pure in-VM. These add NO
+// host capability (no fs/process/net identity) and NO non-determinism — they are convenience
+// globals many libraries probe for. All survive hibernation (they live in the heap).
+globalThis.global = globalThis;
+if (typeof globalThis.process === 'undefined') {
+  globalThis.process = {
+    env: {}, argv: [], argv0: 'engram', execPath: '/engram', pid: 1, platform: 'engram',
+    arch: 'wasm', version: 'v0.0.0-engram', versions: { quickjs: '1', engram: '1' },
+    cwd: function(){ return '/'; },
+    nextTick: function(f){ var a = Array.prototype.slice.call(arguments, 1); queueMicrotask(function(){ f.apply(null, a); }); },
+    // no exit/stdin/kill/binding — the sandbox has no process identity.
+  };
+}
+// fetch() as a thin Response-like wrapper over the mediated, allowlisted host.fetch bridge.
+if (typeof globalThis.fetch === 'undefined') {
+  globalThis.fetch = async function(url, init){
+    var r = await globalThis.host.fetch(typeof url === 'string' ? url : String(url), init);
+    return {
+      ok: !!r.ok, status: r.status|0, url: typeof url === 'string' ? url : String(url),
+      headers: (typeof Headers !== 'undefined') ? new Headers(r.headers || {}) : (r.headers || {}),
+      text: async function(){ return r.body; },
+      json: async function(){ return JSON.parse(r.body); },
+      arrayBuffer: async function(){ return new TextEncoder().encode(r.body).buffer; },
+    };
+  };
+}
+// console.dir/group/table over the existing capture + __preview.
+globalThis.console.dir      = function(x, o){ globalThis.console.log(globalThis.__preview(x, (o && o.depth) || 4)); };
+globalThis.console.group    = function(){ globalThis.console.log.apply(null, arguments); };
+globalThis.console.groupEnd = function(){};
+globalThis.console.table    = function(rows){ globalThis.console.log(globalThis.__preview(rows, 3)); };
+globalThis.console.assert   = function(c){ if (!c) globalThis.console.error.apply(null, ['Assertion failed:'].concat(Array.prototype.slice.call(arguments, 1))); };
+
+// use(name) — load an npm package at RUNTIME by fetching a pre-bundled CDN build (the "bundler"
+// is jsDelivr/esm.sh) and evaluating it into the heap. Handles CJS (module.exports) and UMD
+// (attaches a global). Result is cached in globalThis.__mods and snapshot-persists, so a cold
+// wake keeps the module without re-fetching. ASYNC (the VM has no synchronous host IO), so use
+// `const _ = await use('lodash')`. Determinism: source eval adds no entropy; pin a version with
+// `use('lodash@4.17.21')`. Requires the package host on the fetch allowlist (e.g. cdn.jsdelivr.net).
+// NOTE: NOT `require` (sync) and does NOT resolve nested ESM imports — it works for the large set
+// of libraries that ship a self-contained CJS/UMD bundle.
+globalThis.__mods = globalThis.__mods || {};
+globalThis.use = async function(name, opts){
+  opts = opts || {};
+  if (globalThis.__mods[name] !== undefined) return globalThis.__mods[name];
+  var url = opts.url || ('https://cdn.jsdelivr.net/npm/' + name);
+  var r = await globalThis.host.fetch(url);
+  if (!r || !r.ok) throw new Error('use("' + name + '"): fetch failed (' + (r && r.status) + ') from ' + url);
+  var before = new Set(Object.getOwnPropertyNames(globalThis));
+  var module = { exports: {} };
+  // CJS frame so module.exports is captured; a UMD bundle with no module system attaches a global
+  // instead, which we detect by diffing globalThis.
+  (0, eval)('(function(module, exports){\n' + r.body + '\n})')(module, module.exports);
+  var val;
+  if (module.exports && (typeof module.exports === 'function' || Object.keys(module.exports).length)) {
+    val = module.exports;
+  } else {
+    for (var k of Object.getOwnPropertyNames(globalThis)) { if (!before.has(k)) { val = globalThis[k]; break; } }
+  }
+  if (opts.global) val = globalThis[opts.global];
+  globalThis.__mods[name] = val;
+  return val;
+};
+// ===== END NODE-PARITY SHIMS =====
+
 // util.inspect-style preview. Renders Map/Set/Date/RegExp/Symbol/Promise/Error/
 // typed arrays/Array/Object correctly — NOT JSON.stringify(x)=>"{}" (the FAFO bug).
 globalThis.__preview = function(v, depth){
@@ -855,6 +921,8 @@ fn install_cell(src: &str) {
                           r = await (0, eval)(globalThis.__cellSrc);
                         }
                         globalThis.__cellResult = r;
+                        // REPL last-value: `_` holds the previous cell's completion value (persists).
+                        try { if (r !== undefined) globalThis._ = r; } catch(_e) {}
                         globalThis.__cellOk = true;
                       } catch(e) {
                         globalThis.__cellError = e;
