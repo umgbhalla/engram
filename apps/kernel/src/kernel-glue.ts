@@ -94,6 +94,9 @@ interface KernelConfig {
   cellBudgetTicks?: number;
   cellGrowCapPages?: number;
   maxHostCallsPerCell?: number;
+  // fs provider: undefined / {provider:"vfs"} = in-heap VFS (sync, durable in snapshot);
+  // {provider:"r2",binding?,prefix?} = host-backed R2 (async-only; serviced DO-side in lib.rs).
+  fs?: { provider?: string; binding?: string; prefix?: string };
 }
 
 interface RestoreTimings {
@@ -371,6 +374,9 @@ class GlueKernel {
   // host-callback bridge: a per-eval sender the DO installs (via setHostSender) so a
   // non-fetch host.<name> call can round-trip to the connected client over the WS.
   _hostSender?: HostCallSender | null;
+  // fs provider handler: the DO (lib.rs) installs a JS async closure (R2/S3 servicer) per eval
+  // when config.fs.provider != vfs; the engine's `host.__fs` effect routes here. null = in-heap VFS.
+  _fsHandler?: ((payload: unknown) => Promise<unknown>) | null;
 
   constructor() {
     this.inst = null;
@@ -393,6 +399,25 @@ class GlueKernel {
   // false when no live socket is available.
   setHostSender(send: ((frameJson: string) => boolean) | null, timeoutMs: number): void {
     this._hostSender = send ? { send, timeoutMs: timeoutMs > 0 ? timeoutMs : 60000 } : null;
+  }
+
+  // setFsHandler: the DO installs (per eval) the R2/S3 fs servicer closure when
+  // config.fs.provider != vfs. `null` clears it (in-heap VFS path; the engine never calls host.__fs).
+  setFsHandler(handler: ((payload: unknown) => Promise<unknown>) | null): void {
+    this._fsHandler = typeof handler === "function" ? handler : null;
+  }
+
+  // _applyFsProvider: tell the in-VM fs router which provider is active (it reads
+  // globalThis.__fsProvider). Called after create/restore. 'vfs' = in-heap; else host-backed.
+  _applyFsProvider(): void {
+    const prov = (this.config.fs && this.config.fs.provider) || "vfs";
+    try {
+      const ex = this._ex();
+      const src = "globalThis.__fsProvider=" + JSON.stringify(String(prov)) + ";0";
+      const b = TEXT_ENC.encode(src);
+      this._writeScratch(b);
+      ex.eval_begin(ex.scratch_ptr(), b.length, BigInt(100000), 0);
+    } catch { /* non-fatal: defaults to 'vfs' in the bootstrap */ }
   }
 
   _newInstance(rngSeed: number): WebAssembly.Instance {
@@ -441,6 +466,7 @@ class GlueKernel {
     // stdlib injection: eval the selected esbuilt IIFEs into the live VM so they snapshot-
     // persist (survive hibernation, no re-inject). Subset chosen by config.modules.
     this._injectStdlib(cfg.modules);
+    this._applyFsProvider();
     this.lastTimings = { instantiateMs: 0, growCount: 0 };
     return "fresh";
   }
@@ -525,6 +551,7 @@ class GlueKernel {
     if (kvJson && kvJson !== "{}") this._importKv(kvJson);
     // W4: retain the reconstructed image so the next warm checkpoint diffs against it.
     this._lastImage = raw.slice();
+    this._applyFsProvider();
     this.lastTimings = { gunzipMs, instantiateMs: 0, growCount, neededPages: needPages };
     return label || "sqlite-restore";
   }
@@ -598,6 +625,7 @@ class GlueKernel {
     this._ex().set_counters(BigInt(clockCalls | 0), BigInt(rngCalls | 0));
     if (kvJson && kvJson !== "{}") this._importKv(kvJson);
     this._lastImage = image.slice();
+    this._applyFsProvider();
     this.lastTimings = { gunzipMs, instantiateMs: 0, growCount, neededPages: needPages, deltas: deltas.length };
     return label || "sqlite-restore";
   }
@@ -708,7 +736,51 @@ class GlueKernel {
     // `fetch` is the built-in DO-side host effect (allowlisted). Everything else is a
     // CLIENT host-callback: round-trip to the connected client over the WS.
     if (name === "fetch") return this._doFetch(args[0] as string, args[1] as RequestInit | undefined);
+    // host-backed fs (config.fs.provider != vfs): serviced DO-side via the installed _fsHandler.
+    if (name === "__fs") return this._serviceFs(args[0] as Record<string, unknown>);
     return this._clientHostCall(name, args);
+  }
+
+  // _serviceFs: bridge the engine's `host.__fs({op,path,data?})` to the DO-side R2/S3 handler.
+  // Binary crosses the engine boundary as base64 (`data`); here we decode it to a Uint8Array for
+  // the handler, and re-encode returned bytes to base64 for the engine. Errors are passed back as
+  // a value `{error}` so the in-VM fs throws them (e.g. ENOENT), never crossing as a reject.
+  async _serviceFs(req: Record<string, unknown>): Promise<HostResult> {
+    const h = this._fsHandler;
+    if (!h) {
+      return { ok: true, value: { error: "FsError: no fs provider active (set config.fs.provider)" } };
+    }
+    const op = String(req && req.op);
+    const payload: Record<string, unknown> = { op, path: req && req.path };
+    if (op === "write" && typeof req.data === "string") {
+      try {
+        payload.bytes = Uint8Array.from(atob(req.data as string), (c) => c.charCodeAt(0));
+      } catch {
+        return { ok: true, value: { error: "FsError: bad base64 write payload" } };
+      }
+    }
+    let res: Record<string, unknown>;
+    try {
+      res = (await h(payload)) as Record<string, unknown>;
+    } catch (e) {
+      const err = e as { message?: string };
+      return { ok: true, value: { error: "FsError: " + String((err && err.message) || e) } };
+    }
+    if (res && res.error) return { ok: true, value: { error: res.error } };
+    const value: Record<string, unknown> = { ok: true };
+    if (res && res.bytes instanceof Uint8Array) {
+      let s = "";
+      const u8 = res.bytes as Uint8Array;
+      for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+      value.data = btoa(s);
+    }
+    if (res && Array.isArray(res.names)) value.names = res.names;
+    if (res && typeof res.size === "number") {
+      value.size = res.size;
+      value.isFile = !!res.isFile;
+      value.isDirectory = !!res.isDirectory;
+    }
+    return { ok: true, value };
   }
 
   // _clientHostCall: park the VM eval, send {t:hostcall,id,name,args} to the client, and

@@ -92,6 +92,23 @@
 
 ---
 
+## ADR-0011 — `fs`: in-heap VFS by default, swappable to a host-backed provider (R2)
+
+**Status:** Accepted (live; VFS + R2 provider deployed, S3 deferred).
+
+**Context.** The VM had no filesystem. A genuine *synchronous* Node `fs` (`readFileSync`) is impossible over a host-backed store because host IO is async (parked VM) — the same sync/async wall as the module loader (ADR-0006). But code wants `fs`, and some use cases want a *shared/persistent* workspace beyond the heap.
+
+**Decision.** Ship a Node-like `fs` (in `BOOTSTRAP`, exposed as `require('fs')`/`'node:fs'`/`'fs/promises'` + global `fs`) with a **provider switch** read from `config.fs`:
+- **`{provider:"vfs"}` (default)** — backed by an **in-heap object** (`globalThis.__vfs`). Full **synchronous** API (`readFileSync`/`writeFileSync`/`mkdirSync`/`readdirSync`/`statSync`/…) + a `promises` mirror. Sync is possible *only* because the data lives in the heap; it is **durable** (snapshot-persisted, survives hibernate — verified) and **deterministic**. It is the VM's own scratch disk: **not shared** with the host, bounded by the heap size-admission cap.
+- **`{provider:"r2", binding?, prefix?}`** — **host-backed** R2. R2 is a DO binding (`env`), not a glue global, so it is serviced **DO-side in `lib.rs`** (`r2_fs_op`) via an async closure the kernel installs per eval; the engine's `host.__fs` effect routes there. **Async-only**: `fs.promises.*` work; **sync methods throw** a typed `ERR_FS_ASYNC_ONLY`. Binary crosses the engine↔glue JSON boundary as base64 (glue decodes to `Uint8Array` for the Rust handler; no Rust base64 dep). Keyed `<prefix><path>` (default `fs/<do_id>/`) in the configured bucket binding (default `SNAPSHOTS`, both configurable on-demand).
+- **`{provider:"s3", …}`** — deferred (needs SigV4 signing + carrying credentials in config).
+
+**Why.** VFS gives real *synchronous* Node `fs` for the common scratch-file case, free and durable, with no host round-trip. R2 gives a *shared, beyond-heap, cross-session* store for code that needs it — at the cost of async-only. The provider switch lets a caller pick per session.
+
+**Consequence.** Verified live: VFS sync round-trip + survives hibernate; R2 `promises` write/read/readdir/stat, `ERR_FS_ASYNC_ONLY` on sync, `ENOENT` propagation, and a file **written to R2 survived a real evict + cold read** (host-backed, not heap-coupled — so it also survives engine-hash changes, unlike VFS). The client-provided `host.fs.*` pattern (e.g. ThinkDO + `@cloudflare/shell`) remains valid and orthogonal — that's a *different* host module over the WS bridge; this ADR is the kernel-native, binding-backed path.
+
+---
+
 ## ADR-0007 — RLM/agent loops are an SDK example, not a kernel feature
 
 **Status:** Accepted.

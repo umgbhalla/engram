@@ -64,6 +64,8 @@ extern "C" {
     fn eval_code(this: &GlueKernel, src: &str) -> js_sys::Promise;
     #[wasm_bindgen(method, js_name = setHostSender)]
     fn set_host_sender(this: &GlueKernel, send: &JsValue, timeout_ms: f64);
+    #[wasm_bindgen(method, js_name = setFsHandler)]
+    fn set_fs_handler(this: &GlueKernel, handler: &JsValue);
     #[wasm_bindgen(method, js_name = dump)]
     fn dump(this: &GlueKernel) -> js_sys::Promise;
     #[wasm_bindgen(method, js_name = dumpW4)]
@@ -476,6 +478,47 @@ impl KernelDO {
                 sender.forget();
             } else {
                 glue.set_host_sender(&JsValue::NULL, 0.0);
+            }
+        }
+
+        // FS PROVIDER: when config.fs.provider == "r2", install a DO-side handler for the
+        // engine's `host.__fs` effect. R2 is a DO binding (env), NOT a glue global, so it must
+        // be serviced here (unlike host.fetch). The handler is an async JS closure returning a
+        // Promise; the glue awaits it from the eval pump. Keyed under <prefix><path> in the
+        // configured bucket binding. provider == vfs (default) clears the handler (in-heap fs).
+        {
+            let sql = self.state.storage().sql();
+            let cfg: serde_json::Value = serde_json::from_str(
+                &read_str(&sql, "config").unwrap_or_else(|| "{}".into()),
+            )
+            .unwrap_or_else(|_| json!({}));
+            let fsv = cfg
+                .get("fs")
+                .and_then(|f| f.get("provider"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("vfs");
+            let glue = clone_glue(self.glue.borrow().as_ref().unwrap());
+            if fsv == "r2" {
+                let binding = cfg
+                    .get("fs").and_then(|f| f.get("binding")).and_then(|v| v.as_str())
+                    .unwrap_or("SNAPSHOTS").to_string();
+                let prefix = cfg
+                    .get("fs").and_then(|f| f.get("prefix")).and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("fs/{}/", self.do_id));
+                let env = self.env.clone();
+                let handler = Closure::wrap(Box::new(move |payload: JsValue| -> js_sys::Promise {
+                    let env = env.clone();
+                    let binding = binding.clone();
+                    let prefix = prefix.clone();
+                    wasm_bindgen_futures::future_to_promise(async move {
+                        r2_fs_op(&env, &binding, &prefix, payload).await
+                    })
+                }) as Box<dyn FnMut(JsValue) -> js_sys::Promise>);
+                glue.set_fs_handler(handler.as_ref().unchecked_ref());
+                handler.forget();
+            } else {
+                glue.set_fs_handler(&JsValue::NULL);
             }
         }
 
@@ -1087,6 +1130,91 @@ fn clone_glue(g: &GlueKernel) -> GlueKernel {
 
 fn to_err(e: JsValue) -> worker::Error {
     worker::Error::RustError(format!("{:?}", e))
+}
+
+/// DO-side R2 servicer for the in-VM `fs` host-backed provider (config.fs.provider == "r2").
+/// `payload` is the JS object the glue forwards: { op, path, bytes?:Uint8Array }. Returns a JS
+/// object the glue marshals back to the engine: { ok, bytes?:Uint8Array, names?, size?, isFile?,
+/// isDirectory?, error? }. Binary crosses as Uint8Array (glue does the base64 at the engine edge).
+async fn r2_fs_op(
+    env: &Env,
+    binding: &str,
+    prefix: &str,
+    payload: JsValue,
+) -> std::result::Result<JsValue, JsValue> {
+    let getp = |k: &str| Reflect::get(&payload, &JsValue::from_str(k)).ok();
+    let op = getp("op").and_then(|v| v.as_string()).unwrap_or_default();
+    let path = getp("path").and_then(|v| v.as_string()).unwrap_or_default();
+    let key = format!("{}{}", prefix, path.trim_start_matches('/'));
+    let bucket = env
+        .bucket(binding)
+        .map_err(|e| JsValue::from_str(&format!("FsError: bucket '{}' — {e}", binding)))?;
+    let out = js_sys::Object::new();
+    let set = |k: &str, v: &JsValue| {
+        let _ = Reflect::set(&out, &JsValue::from_str(k), v);
+    };
+    let enoent = |p: &str| format!("ENOENT: no such file or directory, '{}'", p);
+    match op.as_str() {
+        "read" => match bucket.get(&key).execute().await {
+            Ok(Some(obj)) => {
+                let body = obj.body().ok_or_else(|| JsValue::from_str("FsError: empty body"))?;
+                let bytes = body.bytes().await.map_err(|e| JsValue::from_str(&format!("{e}")))?;
+                let arr = Uint8Array::new_with_length(bytes.len() as u32);
+                arr.copy_from(&bytes);
+                set("ok", &JsValue::TRUE);
+                set("bytes", &arr.into());
+            }
+            _ => set("error", &JsValue::from_str(&enoent(&path))),
+        },
+        "write" => {
+            let bytes_val = getp("bytes").unwrap_or(JsValue::NULL);
+            let arr: Uint8Array = bytes_val
+                .dyn_into()
+                .map_err(|_| JsValue::from_str("FsError: write bytes missing"))?;
+            bucket
+                .put(&key, arr.to_vec())
+                .execute()
+                .await
+                .map_err(|e| JsValue::from_str(&format!("FsError: {e}")))?;
+            set("ok", &JsValue::TRUE);
+        }
+        "delete" => {
+            let _ = bucket.delete(&key).await;
+            set("ok", &JsValue::TRUE);
+        }
+        "stat" => match bucket.get(&key).execute().await {
+            Ok(Some(obj)) => {
+                set("ok", &JsValue::TRUE);
+                set("isFile", &JsValue::TRUE);
+                set("isDirectory", &JsValue::FALSE);
+                set("size", &JsValue::from_f64(obj.size() as f64));
+            }
+            _ => set("error", &JsValue::from_str(&enoent(&path))),
+        },
+        "list" => {
+            let lpfx = format!("{}{}", prefix, path.trim_start_matches('/'));
+            let listing = bucket
+                .list()
+                .prefix(lpfx.clone())
+                .execute()
+                .await
+                .map_err(|e| JsValue::from_str(&format!("FsError: {e}")))?;
+            let names = js_sys::Array::new();
+            let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for o in listing.objects() {
+                let k = o.key();
+                let rest = k.strip_prefix(&lpfx).unwrap_or(&k);
+                let name = rest.trim_start_matches('/').split('/').next().unwrap_or("");
+                if !name.is_empty() && seen.insert(name.to_string()) {
+                    names.push(&JsValue::from_str(name));
+                }
+            }
+            set("ok", &JsValue::TRUE);
+            set("names", &names.into());
+        }
+        other => set("error", &JsValue::from_str(&format!("FsError: unknown op '{}'", other))),
+    }
+    Ok(out.into())
 }
 
 fn num_field(obj: &JsValue, k: &str) -> Option<f64> {

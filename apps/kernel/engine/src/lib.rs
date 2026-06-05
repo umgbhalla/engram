@@ -526,12 +526,46 @@ globalThis.__vfs = globalThis.__vfs || { files: {}, dirs: { '/': true } };
   function copyFileSync(a, b){ a = norm(a); b = norm(b); var f = V.files[a]; if (!f) throw ENOENT(a); ensureParent(b); V.files[b] = { data: f.data.slice(), mtime: 0 }; }
   function statSync(p){ p = norm(p); var isF = !!V.files[p], isD = !!V.dirs[p]; if (!isF && !isD) throw ENOENT(p); var size = isF ? V.files[p].data.length : 0; return { size: size, mtimeMs: 0, isFile: function(){ return isF; }, isDirectory: function(){ return isD; }, isSymbolicLink: function(){ return false; } }; }
   var P = function(fn){ return function(){ var a = arguments; return new Promise(function(res, rej){ try { res(fn.apply(null, a)); } catch(e){ rej(e); } }); }; };
+
+  // ----- provider dispatch -----------------------------------------------------------------
+  // globalThis.__fsProvider is set by the host glue at create/restore from config.fs.provider.
+  // 'vfs' (default) = in-heap (above). Anything else = HOST-BACKED (r2/s3): the kernel services
+  // a `host.__fs` effect DO-side. Host-backed IO is ASYNC, so SYNC methods THROW a typed error
+  // and only fs.promises.* work.
+  function provider(){ return globalThis.__fsProvider || 'vfs'; }
+  function asyncOnly(name){ var e = new Error("FsAsyncError: " + name + " is async-only under the '" + provider() + "' fs provider — use fs.promises." + name.replace(/Sync$/, '')); e.code = 'ERR_FS_ASYNC_ONLY'; return e; }
+  // host round-trip: host.__fs({op, path, ...}) -> { ok, data?(base64), names?, size?, isFile?, isDirectory?, error? }
+  function hostFs(op, args){ return globalThis.host.__fs(Object.assign({ op: op }, args || {})); }
+  function hostThrow(res, p){ if (res && res.error){ var e = new Error(res.error); e.code = (res.error.indexOf('ENOENT') === 0) ? 'ENOENT' : (res.code || undefined); throw e; } return res; }
+  async function hReadFile(p, enc){ var r = hostThrow(await hostFs('read', { path: norm(p) }), p); var bytes = r.data ? Uint8Array.from(atob(r.data), function(c){return c.charCodeAt(0);}) : new Uint8Array(0); return decode(bytes, enc && enc.encoding ? enc.encoding : enc); }
+  async function hWriteFile(p, data, enc){ var bytes = toBytes(data, enc && enc.encoding ? enc.encoding : enc); var b64 = btoa(String.fromCharCode.apply(null, bytes)); hostThrow(await hostFs('write', { path: norm(p), data: b64 }), p); }
+  async function hAppendFile(p, data, enc){ var cur; try { cur = await hReadFile(p); } catch(e){ cur = new Uint8Array(0); } var add = toBytes(data, enc); var out = new Uint8Array(cur.length + add.length); out.set(cur); out.set(add, cur.length); await hWriteFile(p, out); }
+  async function hUnlink(p){ hostThrow(await hostFs('delete', { path: norm(p) }), p); }
+  async function hReaddir(p){ var r = hostThrow(await hostFs('list', { path: norm(p) }), p); return r.names || []; }
+  async function hStat(p){ var r = hostThrow(await hostFs('stat', { path: norm(p) }), p); return { size: r.size || 0, mtimeMs: r.mtimeMs || 0, isFile: function(){ return !!r.isFile; }, isDirectory: function(){ return !!r.isDirectory; }, isSymbolicLink: function(){ return false; } }; }
+  async function hExists(p){ var r = await hostFs('stat', { path: norm(p) }); return !(r && r.error); }
+
+  // sync method: in-heap for vfs, THROW for host-backed providers.
+  function S(name, vfsFn){ return function(){ if (provider() !== 'vfs') throw asyncOnly(name); return vfsFn.apply(null, arguments); }; }
+  // promises method: in-heap (wrapped) for vfs, host round-trip otherwise.
+  function A(vfsFn, hostFn){ return function(){ var a = arguments; return (provider() === 'vfs') ? new Promise(function(res, rej){ try { res(vfsFn.apply(null, a)); } catch(e){ rej(e); } }) : hostFn.apply(null, a); }; }
+
   var fs = {
-    existsSync: existsSync, mkdirSync: mkdirSync, writeFileSync: writeFileSync, appendFileSync: appendFileSync,
-    readFileSync: readFileSync, unlinkSync: unlinkSync, rmSync: rmSync, rmdirSync: rmSync, readdirSync: readdirSync,
-    renameSync: renameSync, copyFileSync: copyFileSync, statSync: statSync, lstatSync: statSync,
-    // promises mirror (resolve synchronously — the VFS has no real async work).
-    promises: { readFile: P(readFileSync), writeFile: P(writeFileSync), appendFile: P(appendFileSync), mkdir: P(mkdirSync), readdir: P(readdirSync), rm: P(rmSync), unlink: P(unlinkSync), rename: P(renameSync), copyFile: P(copyFileSync), stat: P(statSync), access: P(function(p){ if (!existsSync(p)) throw ENOENT(norm(p)); }) },
+    existsSync: S('existsSync', existsSync), mkdirSync: S('mkdirSync', mkdirSync),
+    writeFileSync: S('writeFileSync', writeFileSync), appendFileSync: S('appendFileSync', appendFileSync),
+    readFileSync: S('readFileSync', readFileSync), unlinkSync: S('unlinkSync', unlinkSync),
+    rmSync: S('rmSync', rmSync), rmdirSync: S('rmdirSync', rmSync), readdirSync: S('readdirSync', readdirSync),
+    renameSync: S('renameSync', renameSync), copyFileSync: S('copyFileSync', copyFileSync),
+    statSync: S('statSync', statSync), lstatSync: S('lstatSync', statSync),
+    promises: {
+      readFile: A(readFileSync, hReadFile), writeFile: A(writeFileSync, hWriteFile),
+      appendFile: A(appendFileSync, hAppendFile), mkdir: A(mkdirSync, async function(){ /* r2 has no dirs */ }),
+      readdir: A(readdirSync, hReaddir), rm: A(rmSync, hUnlink), unlink: A(unlinkSync, hUnlink),
+      rename: A(renameSync, async function(a,b){ var d = await hReadFile(a); await hWriteFile(b, d); await hUnlink(a); }),
+      copyFile: A(copyFileSync, async function(a,b){ await hWriteFile(b, await hReadFile(a)); }),
+      stat: A(statSync, hStat),
+      access: A(function(p){ if (!existsSync(p)) throw ENOENT(norm(p)); }, async function(p){ if (!(await hExists(p))) throw ENOENT(norm(p)); }),
+    },
     constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1 },
   };
   globalThis.__builtins.fs = fs;
