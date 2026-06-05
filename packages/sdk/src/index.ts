@@ -550,41 +550,65 @@ class HttpTransport implements Transport {
 // Env / bootstrap composition (SDK-only extension points)
 // ---------------------------------------------------------------------------
 
-/** The reserved host channel that records a cell's faithful final value. */
+/**
+ * The reserved host channel that records a cell's faithful final value. Calling
+ * `host.final(x)` or `host.__engram_final(x)` in-VM round-trips `x` to the SDK as a
+ * hostcall whose args cross as FAITHFUL JSON (not the buggy value-preview path).
+ */
 const FINAL_HOST = "__engram_final";
+/** The public in-VM alias for the reserved final channel. Both are registered as host fns. */
+const FINAL_ALIAS = "final";
 /** The reserved durable context global, persisted across hibernation. */
 const CTX_GLOBAL = "__engram_ctx";
+/** A reserved global recording the active host-module namespaces (for the wrapping proxy). */
+const NS_REGISTRY = "__engram_host_ns";
 
 /**
- * The tiny built-in default prelude. It is idempotent (safe to re-run on every reconnect)
- * and gives consumers faithful final + a `host.ctx` getter for free:
- *  - `host.final(x)` / `FINAL(x)` round-trip `x` over the reserved {@link FINAL_HOST} channel
- *    (so object finals come back as faithful JSON, not the `{}` value-preview).
- *  - `host.ctx` reflects the persisted {@link CTX_GLOBAL} map seeded by `connect({ctx})`
- *    and {@link EngramSession.ctx}`.set`.
+ * The tiny built-in default prelude. Idempotent (safe to re-run on every reconnect).
+ *
+ * In-VM, `host` is a recursive Proxy whose `get` trap returns a hostcall-forwarder for
+ * EVERY property name — so we cannot override `host.final` / `host.ctx` by assignment
+ * (the trap ignores own props). Instead:
+ *  - FAITHFUL FINAL is achieved purely SDK-side: the SDK registers host fns named
+ *    `"final"` and `"__engram_final"`, so the proxy forwards `host.final(x)` straight to
+ *    the SDK with faithful JSON args. We only need to define the `FINAL(x)` global alias
+ *    here. (No `host.final` override is needed or possible.)
+ *  - `host.ctx` and host-module namespaces (`host.<ns>.<fn>`) are exposed by WRAPPING the
+ *    real host proxy in a thin outer proxy: its `get` returns the persisted ctx object for
+ *    `'ctx'`, a namespace forwarder object for any registered namespace, and otherwise
+ *    falls through to the real proxy (so `host.final`, `host.subLM`, flat names still work).
  */
 function defaultEnvPrelude(): string {
-  // NOTE: in-VM `host` is a recursive proxy whose `get` returns a callable for EVERY
-  // property name (so `host.final` is already truthy and `||=` would be a no-op, leaving
-  // the buggy native value-preview path in place). We therefore ASSIGN unconditionally so
-  // our reserved-channel router wins. The proxy permits own-property assignment (verified).
   return [
-    `(globalThis.host ||= {});`,
-    // Faithful-final: route host.final / FINAL through the reserved host channel
-    // (host.__engram_final), whose args cross as faithful JSON — fixing the {} preview bug.
-    `globalThis.host.final = function(x){ globalThis.host.${FINAL_HOST}(x); return x; };`,
-    `globalThis.FINAL = function(x){ return globalThis.host.final(x); };`,
-    // First-class durable ctx: expose the persisted global map as host.ctx (own property,
-    // assigned each (re)connect so it reflects the restored global).
     `(globalThis.${CTX_GLOBAL} ||= {});`,
-    `globalThis.host.ctx = (globalThis.${CTX_GLOBAL} ||= {});`,
+    `(globalThis.${NS_REGISTRY} ||= {});`,
+    // FINAL(x) global alias -> faithful reserved channel (host.final is intercepted SDK-side).
+    `globalThis.FINAL = function(x){ globalThis.host.${FINAL_ALIAS}(x); return x; };`,
+    // Install the wrapping proxy once. It is idempotent: re-running just rewraps the (already
+    // wrapped) host, and the inner real proxy is preserved via the saved __engram_host_real.
+    `(function(){`,
+    `  if (!globalThis.__engram_host_real) globalThis.__engram_host_real = globalThis.host;`,
+    `  var real = globalThis.__engram_host_real;`,
+    `  globalThis.host = new Proxy(real, {`,
+    `    get: function(t, p, r){`,
+    `      if (p === 'ctx') return (globalThis.${CTX_GLOBAL} ||= {});`,
+    `      var ns = globalThis.${NS_REGISTRY};`,
+    `      if (ns && typeof p === 'string' && ns[p]) {`,
+    `        var fns = ns[p], mod = {};`,
+    `        for (var i=0;i<fns.length;i++){ (function(fn){ mod[fn] = function(){ return real[p+'.'+fn].apply(null, arguments); }; })(fns[i]); }`,
+    `        return mod;`,
+    `      }`,
+    `      return Reflect.get(t, p, r);`,
+    `    }`,
+    `  });`,
+    `})();`,
   ].join("\n");
 }
 
 /** Serialise a {@link RuntimeEnv}'s globals into an idempotent in-VM bootstrap (`g.<name> ||= <fn>`). */
 function serialiseEnvGlobals(globals?: Record<string, (...a: any[]) => any>): string {
   if (!globals) return "";
-  const lines: string[] = [`(globalThis.host ||= {});`];
+  const lines: string[] = [];
   for (const [name, fn] of Object.entries(globals)) {
     lines.push(`globalThis[${JSON.stringify(name)}] ||= (${fn.toString()});`);
   }
@@ -592,23 +616,15 @@ function serialiseEnvGlobals(globals?: Record<string, (...a: any[]) => any>): st
 }
 
 /**
- * Build the namespacing shim that makes a host module visible in-VM as `host.<ns>.<fn>`
- * even though each fn is registered flat under the literal name `<ns>.<fn>`. Idempotent.
+ * Register a host-module namespace in the in-VM {@link NS_REGISTRY} so the wrapping proxy
+ * (see {@link defaultEnvPrelude}) exposes it as `host.<ns>.<fn>`, forwarding to the flat
+ * reserved name `<ns>.<fn>`. Idempotent.
  */
 function hostModuleShim(namespace: string, fnNames: string[]): string {
-  const ns = JSON.stringify(namespace);
-  // ASSIGN (not ||=): the host proxy returns a callable for host[ns], so ||= would no-op.
-  // Replace it with a real namespace object whose methods forward to the flat dotted name.
-  const lines: string[] = [`(globalThis.host ||= {});`, `globalThis.host[${ns}] = (globalThis.host[${ns}] && typeof globalThis.host[${ns}] === 'object') ? globalThis.host[${ns}] : {};`];
-  for (const fn of fnNames) {
-    const flat = JSON.stringify(`${namespace}.${fn}`);
-    const key = JSON.stringify(fn);
-    // Each shim forwards to the flat reserved name; the kernel dispatches the dotted name.
-    lines.push(
-      `globalThis.host[${ns}][${key}] = function(...a){ return globalThis.host[${flat}](...a); };`,
-    );
-  }
-  return lines.join("\n");
+  return [
+    `(globalThis.${NS_REGISTRY} ||= {});`,
+    `globalThis.${NS_REGISTRY}[${JSON.stringify(namespace)}] = ${JSON.stringify(fnNames)};`,
+  ].join("\n");
 }
 
 /** Compose explicit bootstrap + default env prelude + env.globals + env.prelude + host-module shims. */
@@ -676,11 +692,15 @@ export class EngramSession {
     this.config = opts.config;
     this.bootstrap = opts.bootstrap;
     this.onConsole = opts.onConsole;
-    // Reserved final channel: record the LAST arg of each __engram_final call this eval.
-    this.transport.setHost(FINAL_HOST, (...args: unknown[]) => {
+    // Reserved final channel: record the LAST arg of each host.final / host.__engram_final
+    // call this eval. Both names are registered so the in-VM host proxy forwards them here
+    // with FAITHFUL JSON args (the kernel dispatches client-registered names to the client).
+    const captureFinal = (...args: unknown[]): unknown => {
       this.capturedFinal = { set: true, value: args.length ? args[0] : undefined };
-      return undefined;
-    });
+      return args.length ? args[0] : undefined;
+    };
+    this.transport.setHost(FINAL_HOST, captureFinal);
+    this.transport.setHost(FINAL_ALIAS, captureFinal);
     // First-class ctx accessor over the persisted ctx global (reserved hostfn marshals values).
     this.ctx = {
       set: async (key: string, value: unknown): Promise<void> => {
