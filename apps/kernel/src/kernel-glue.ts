@@ -329,6 +329,14 @@ const FETCH_MAX_BODY_BYTES = (() => {
   const n = typeof v === "number" ? v : (typeof v === "string" ? parseInt(v, 10) : NaN);
   return Number.isFinite(n) && n > 0 ? n : 32 * 1024 * 1024;
 })();
+// The back-compat utf8 `body` is a CAPPED PREVIEW only — the exact bytes always travel as `bodyB64`.
+// Capping is REQUIRED for big binary payloads: a 6.6MB PDF would otherwise also ship a ~6.6MB utf8
+// `body` string ALONGSIDE the ~8.9MB base64 in the SAME host-call result, and the engine would hold
+// BOTH as UTF-16 strings (~2x) — ~30MB of redundant strings that blew the VM's linear memory past
+// the per-cell grow cap. `.text()`/`.json()` on a body larger than this cap fall back to decoding
+// the exact bytes from `bodyB64` (engine shim), so correctness is unaffected; only the convenience
+// preview is truncated. 64KB is enough for the common text/JSON case while keeping binary cheap.
+const FETCH_BODY_UTF8_PREVIEW_BYTES = 64 * 1024;
 // base64 encode/decode over Uint8Array, chunked so a large packfile does not blow the call stack
 // of String.fromCharCode(...spread). Mirrors the fs-op base64 boundary.
 function bytesToB64(u8: Uint8Array): string {
@@ -347,12 +355,33 @@ function b64ToBytes(b64: string): Uint8Array {
 }
 
 // ---- W5 compaction thresholds (docs/W5-COMPACTION-PLAN.md, REALCF-VALIDATION sized) ----
+// The engine's static SCRATCH buffer was raised 1MB -> 32MB (lib.rs, to let big fetch bodies / fs
+// writes cross the host boundary). That 32MB lives in the SAME linear memory that the W4 snapshot
+// blits, so EVERY session's buffer_bytes() is now ~32MB higher (the zero-filled scratch gzips to
+// ~nothing, so the STORED image barely grows — only the RAW image size does). The raw-image (buffer)
+// caps below were therefore raised by the +31MB scratch delta so a session that also pulled in a big
+// payload can still snapshot/restore. The USED-HEAP caps measure the rquickjs allocator tally
+// (memory_used_size) only — the static scratch is NOT counted there — so they are unchanged (heap
+// cap untouched, per the task). The W4 delta path is preserved for all buffer sizes (resetting it to
+// full would also reset the engine-migration oplog tail — see lib.rs checkpoint full path).
+const SCRATCH_DELTA_BYTES = 31 * 1024 * 1024;       // 32MB scratch - the old 1MB it replaced
 const MAX_USED_BYTES = 50 * 1024 * 1024;            // refuse snapshot above ~50MB live used heap
 const MAX_RESTORE_USED_BYTES = 50 * 1024 * 1024;    // refuse restore above ~50MB recorded used heap
-const SAFE_SERIALIZE_BUFFER_BYTES = 45 * 1024 * 1024; // ABSOLUTE cap (avoids the W4-ceiling regression)
-const MAX_RESTORE_RAW_BYTES = 45 * 1024 * 1024;     // safe-to-instantiate raw ceiling (lockstep w/ dump)
+const SAFE_SERIALIZE_BUFFER_BYTES = 45 * 1024 * 1024 + SCRATCH_DELTA_BYTES; // 76MB raw-image cap (+31MB resident scratch)
+const MAX_RESTORE_RAW_BYTES = 45 * 1024 * 1024 + SCRATCH_DELTA_BYTES;       // 76MB safe-to-instantiate ceiling (lockstep w/ dump)
+// Above this raw-image size, dumpW4 takes a 2-copy NO-RETAIN full path (it does NOT retain
+// _lastImage and does NOT diff against prev) so peak DO memory during the dump is ~raw + gz, not
+// the ~3x raw the delta/full-with-retain paths cost — which OOMs the DO once the buffer carries a
+// big payload on top of the 32MB scratch (measured: a 2.2MB-PDF cell pushes the buffer to ~67MB;
+// the 3-copy full retain at 67MB hung the DO, while a normal session tops out at ~59MB and is safe).
+// The threshold sits ABOVE the normal-session ceiling (~59MB) so ordinary cells keep the delta path
+// (which preserves the engine-migration oplog tail); only a genuinely large payload trips it. A
+// large-payload cell that trips it forces a full base (resetting the oplog tail), so engine-migration
+// REPLAY of that specific cell would no-op — an accepted edge: the byte-blit image stays the primary
+// restore path, and 32MB-class payload cells are the rare exception, not the steady state.
+const LARGE_BUFFER_NO_RETAIN_BYTES = 63 * 1024 * 1024;
 const SCRUB_SLACK_BYTES = 4 * 1024 * 1024;          // scrub when freed slack exceeds this
-const SCRUB_MAX_BUFFER_BYTES = 44 * 1024 * 1024;    // only scrub below this (stay under the absolute cap)
+const SCRUB_MAX_BUFFER_BYTES = 44 * 1024 * 1024 + SCRATCH_DELTA_BYTES;      // only scrub below this (stay under the absolute cap)
 const COMPACT_TRIGGER_BYTES = 12 * 1024 * 1024;     // cell-boundary scrub trigger (bloated buffer)
 const COMPACT_USED_RATIO = 0.4;                     // ...AND used/buffer < 0.4 (>=60% slack = freed spike)
 
@@ -723,8 +752,20 @@ class GlueKernel {
       // per-cell guards: interrupt-tick budget + per-cell buffer-growth cap (pages). The budget
       // counts INTERRUPT-HANDLER invocations (QuickJS fires the handler every ~Nk bytecodes), so
       // the certified value is ~1200 (parity with the JS kernel's default 1200 / cap 2000).
-      const budget = BigInt((this.config.cellBudgetTicks ?? 0) || 1200);
-      const growCapPages = (this.config.cellGrowCapPages ?? 0) || 128; // ~8MB per cell
+      // Per-cell instruction budget (interrupt-handler ticks; the timeout fence). Default raised
+      // 1200 -> 500000: decoding a large fetch body (base64 -> bytes) inside the VM burns far more
+      // bytecode than a normal cell, and the old 1200 tripped a TimeoutError before a big-payload
+      // cell (e.g. fetching + writing a 2.2MB PDF) could finish (~150k ticks observed for 2.2MB).
+      // Memory bombs are still caught by the grow-cap tripwire + rquickjs heap limit; the platform
+      // also bounds wall-clock CPU. Overridable per-session via config.cellBudgetTicks.
+      const budget = BigInt((this.config.cellBudgetTicks ?? 0) || 500000);
+      // Per-cell linear-memory growth cap (pages, 64KB each). Default raised 128p/8MB -> 1024p/64MB:
+      // a single cell may legitimately pull in a fetch body up to FETCH_MAX_BODY_BYTES (32MB) and
+      // then hold a working copy or two (decoded bytes, an fs write) while it runs — the old 8MB cap
+      // tripped a MemoryLimitError before such a cell could finish (e.g. a 6.6MB PDF). The rquickjs
+      // heap limit (set_memory_limit, 64MB in the engine) and the snapshot size-admission guard
+      // remain the hard OOM fences; this tripwire just catches runaway per-cell growth.
+      const growCapPages = (this.config.cellGrowCapPages ?? 0) || 1024;
       let status = ex.eval_begin(ex.scratch_ptr(), srcBytes.length, budget, growCapPages);
       let guard = 0;
       // host-call loop cap: bound the host calls a single cell may make (re-entrant cells
@@ -890,8 +931,12 @@ class GlueKernel {
         truncated = true;
       }
       const bodyB64 = bytesToB64(bytes);
-      // back-compat utf8 view (capped) so the legacy string `body` path keeps working.
-      const body = TEXT_DEC.decode(bytes);
+      // back-compat utf8 view — CAPPED to a small preview (the exact bytes are in bodyB64). Decoding
+      // the FULL body here for a large payload would double the host-call result size and OOM the VM
+      // (see FETCH_BODY_UTF8_PREVIEW_BYTES). The engine's .text()/.json() fall back to bodyB64 when
+      // the body is truncated, so this only shrinks the convenience preview, never correctness.
+      const bodyTruncated = bytes.length > FETCH_BODY_UTF8_PREVIEW_BYTES;
+      const body = TEXT_DEC.decode(bodyTruncated ? bytes.subarray(0, FETCH_BODY_UTF8_PREVIEW_BYTES) : bytes);
       const headers: Record<string, string> = {};
       r.headers.forEach((v, k) => (headers[k] = v));
       return {
@@ -901,6 +946,7 @@ class GlueKernel {
           ok: r.ok,
           headers,
           body,
+          bodyTruncated,
           bodyB64,
           byteLength: bytes.length,
           truncated,
@@ -996,7 +1042,19 @@ class GlueKernel {
   async dumpW4(forceFull: boolean): Promise<DumpResult> {
     const { raw, usedHeap, bufferBytes, scrubbed } = this._serializeForDump();
     const common = this._dumpCommon(usedHeap, bufferBytes, scrubbed, raw);
-    const prev = this._lastImage;
+    let prev = this._lastImage;
+    // LARGE-BUFFER 2-COPY NO-RETAIN PATH (memory-safety fence; see LARGE_BUFFER_NO_RETAIN_BYTES).
+    // Only trips when the buffer carries a big payload (well above the ~59MB normal-session ceiling),
+    // so ordinary cells are unaffected and keep the delta path + oplog tail. RELEASE the retained
+    // image FIRST (free prev), gzip raw to a single full base, and do NOT retain a new _lastImage —
+    // peak memory is ~raw + gz. Emits mode:"full" (the DO full path resets the oplog tail).
+    if (raw.byteLength > LARGE_BUFFER_NO_RETAIN_BYTES) {
+      this._lastImage = null;
+      prev = null;
+      const gz = await gzip(raw);
+      return { mode: "full", gz, indicesGz: null, nChanged: 0, grain: DELTA_GRAIN_BYTES,
+        imageLen: raw.byteLength, sizeGz: gz.byteLength, ...common };
+    }
     // W4 (growth-tolerant): the WASM linear buffer is MONOTONIC and commonly grows by whole 64KB
     // pages between cells; allow a delta when the current buffer is the SAME size or LARGER than
     // prev — diff the overlapping prefix grain-by-grain and mark every newly-grown grain as
@@ -1095,7 +1153,8 @@ class GlueKernel {
     return JSON.stringify({ replayed, failed, effectfulCells: effectful, errors });
   }
 
-  // _writeScratch: copy `bytes` into the engine's FIXED 1MB SCRATCH buffer. The engine exposes
+  // _writeScratch: copy `bytes` into the engine's FIXED 32MB SCRATCH buffer (raised from 1MB to
+  // match FETCH_MAX_BODY_BYTES so large fetch bodies / fs writes can cross the boundary). The engine exposes
   // scratch_cap() = capacity; we bounds-check FIRST so an oversized payload throws a typed
   // ProtocolSizeError (caller turns it into {ok:false}) instead of a TypedArray.set RangeError
   // ("offset is out of bounds") that overruns linear memory. Universal backstop for every caller

@@ -46,11 +46,16 @@ thread_local! {
 }
 
 // ---- IO buffers -----------------------------------------------------------
+// SCRATCH carries eval source IN and host-call results (fetch bodies, fs writes crossing the
+// boundary) IN on resume. Raised 1MB -> 32MB to match the host FETCH_MAX_BODY_BYTES (32MB) so a
+// large payload (e.g. a 6.6MB PDF) can cross into the VM without a ProtocolSizeError. Stays well
+// under the DO ~128MB budget (32MB scratch + ~45MB heap cap + runtime overhead).
+const SCRATCH_CAP: usize = 32 << 20; // 32MB
 static mut RESULT: [u8; 1 << 20] = [0; 1 << 20]; // 1MB result (value previews + logs)
 static mut RESULT_LEN: usize = 0;
 static mut HOSTCALL: [u8; 1 << 16] = [0; 1 << 16];
 static mut HOSTCALL_LEN: usize = 0;
-static mut SCRATCH: [u8; 1 << 20] = [0; 1 << 20]; // 1MB cell source / resume payload
+static mut SCRATCH: [u8; SCRATCH_CAP] = [0; SCRATCH_CAP]; // 32MB cell source / resume payload
 static mut KV_OUT: [u8; 1 << 18] = [0; 1 << 18];
 static mut KV_OUT_LEN: usize = 0;
 static mut BOOT_ERR: [u8; 4096] = [0; 4096];
@@ -90,7 +95,7 @@ pub extern "C" fn scratch_ptr() -> *const u8 {
 }
 #[no_mangle]
 pub extern "C" fn scratch_cap() -> usize {
-    1 << 20
+    SCRATCH_CAP
 }
 #[no_mangle]
 pub extern "C" fn result_ptr() -> *const u8 {
@@ -441,15 +446,19 @@ if (typeof globalThis.fetch === 'undefined') {
     var r = await globalThis.host.fetch(u, sendInit);
     var _bytes = null;
     function bytes(){ if (_bytes) return _bytes; _bytes = (typeof r.bodyB64 === 'string') ? globalThis.__fetchB64.dec(r.bodyB64) : new TextEncoder().encode(r.body || ''); return _bytes; }
+    // r.body is a CAPPED utf8 PREVIEW (the host truncates big bodies — see FETCH_BODY_UTF8_PREVIEW_BYTES).
+    // Use it directly ONLY when it is the WHOLE body (!r.bodyTruncated); otherwise decode the exact,
+    // full bytes from bodyB64 so .text()/.json() never return a truncated string.
+    function fullText(){ return (typeof r.body === 'string' && !r.bodyTruncated) ? r.body : new TextDecoder().decode(bytes()); }
     return {
       ok: !!r.ok, status: r.status|0, statusText: r.statusText || '', url: u,
       headers: (typeof Headers !== 'undefined') ? new Headers(r.headers || {}) : (r.headers || {}),
       // exact bytes (base64-decoded) — the binary path git transfers need.
       arrayBuffer: async function(){ var b = bytes(); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); },
       bytes: async function(){ return bytes().slice(); },
-      // text/json from the utf8 view (back-compat; r.body is the capped utf8 decode).
-      text: async function(){ return (typeof r.body === 'string') ? r.body : new TextDecoder().decode(bytes()); },
-      json: async function(){ return JSON.parse((typeof r.body === 'string') ? r.body : new TextDecoder().decode(bytes())); },
+      // text/json: full body (preview when complete, else exact bytes from bodyB64).
+      text: async function(){ return fullText(); },
+      json: async function(){ return JSON.parse(fullText()); },
     };
   };
 }
