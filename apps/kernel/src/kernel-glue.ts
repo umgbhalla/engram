@@ -57,6 +57,8 @@ interface EngineExports {
   scrub_arena(budgetMb: number): number | bigint;
   scratch_ptr(): number;
   scratch_cap(): number;
+  scratch_reserve(len: number): number; // grow dynamic scratch to fit; returns (possibly moved) ptr
+  scratch_release(): void;               // shrink dynamic scratch back to the 1MB floor after a cell
   result_ptr(): number;
   result_len(): number;
   pending_host_call_ptr(): number;
@@ -734,7 +736,10 @@ class GlueKernel {
       try { transformed = wrapAsyncCompletion(transformed); } catch { /* keep transformed */ }
       const srcBytes = TEXT_ENC.encode(transformed);
       // (a) PROTOCOL/SOURCE size guard: reject an oversized cell source BEFORE writing it into the
-      // fixed scratch buffer. Typed ProtocolSizeError, socket alive, mutex released, next eval works.
+      // scratch buffer. Reserve the DYNAMIC scratch to fit first (grows to the 32MB ceiling), then
+      // read the cap — if the source still exceeds it (i.e. > ceiling) reject with a typed
+      // ProtocolSizeError (socket alive, mutex released, next eval works).
+      ex.scratch_reserve(srcBytes.length);
       const cap = ex.scratch_cap();
       if (srcBytes.length > cap) {
         return JSON.stringify({
@@ -796,6 +801,11 @@ class GlueKernel {
         logs: [],
         error: { name: (err && err.name) || "GlueError", message: String((err && err.message) || e), stack: "" },
       });
+    } finally {
+      // DYNAMIC scratch: release the (possibly grown) buffer back to the 1MB floor after EVERY cell
+      // (success or error), so a big-payload cell does not leave this kernel resident-large for the
+      // rest of its life — the key to keeping idle/parked kernels small in the conjoined isolate.
+      try { this._ex().scratch_release(); } catch { /* engine not ready / torn down */ }
     }
   }
 
@@ -1161,6 +1171,10 @@ class GlueKernel {
   // (eval source, stdlib IIFE, resume payload, kv import).
   _writeScratch(bytes: Uint8Array): void {
     const ex = this._ex();
+    // DYNAMIC scratch: grow to fit (up to the 32MB ceiling), THEN re-read cap / ptr / memory.buffer
+    // — a reserve can relocate the Vec AND detach+replace memory.buffer (wasm grow), so nothing may
+    // be cached across it. scratch_release() (in the eval finally) returns it to the 1MB floor.
+    ex.scratch_reserve(bytes.length);
     const cap = ex.scratch_cap();
     if (bytes.length > cap) {
       const e = new Error(

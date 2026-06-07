@@ -47,15 +47,26 @@ thread_local! {
 
 // ---- IO buffers -----------------------------------------------------------
 // SCRATCH carries eval source IN and host-call results (fetch bodies, fs writes crossing the
-// boundary) IN on resume. Raised 1MB -> 32MB to match the host FETCH_MAX_BODY_BYTES (32MB) so a
-// large payload (e.g. a 6.6MB PDF) can cross into the VM without a ProtocolSizeError. Stays well
-// under the DO ~128MB budget (32MB scratch + ~45MB heap cap + runtime overhead).
-const SCRATCH_CAP: usize = 32 << 20; // 32MB
+// boundary) IN on resume. It is a DYNAMIC, releasable buffer (was a fixed 32MB `static mut` BSS
+// array). The fixed array forced EVERY kernel instance's initial wasm linear memory to ~32MB, so
+// N co-resident KernelDOs in a CONJOINED isolate (ThinkDO + one in-Worker kernel per subLM depth)
+// paid N×32MB and OOM'd the 128MB DO budget at depth >= 4. A Vec at a 1MB FLOOR lets idle/parked
+// kernels stay ~1MB; only the ACTIVE kernel doing a big payload grows (scratch_reserve, up to a
+// 32MB CEIL), then drops back to the floor (scratch_release) after the cell. NOTE: wasm linear
+// memory never shrinks, so a kernel that actually DID a big payload keeps that peak memory.size for
+// its life — but a parent parked on host.subLM only ever held small orchestration source, so it
+// stays ~1MB, which is exactly what collapses the conjoined N×32MB multiplier.
+const SCRATCH_FLOOR: usize = 1 << 20; // 1MB idle floor (the buffer never drops below this)
+const SCRATCH_CEIL: usize = 32 << 20; // 32MB hard ceiling (matches host FETCH_MAX_BODY_BYTES)
 static mut RESULT: [u8; 1 << 20] = [0; 1 << 20]; // 1MB result (value previews + logs)
 static mut RESULT_LEN: usize = 0;
 static mut HOSTCALL: [u8; 1 << 16] = [0; 1 << 16];
 static mut HOSTCALL_LEN: usize = 0;
-static mut SCRATCH: [u8; SCRATCH_CAP] = [0; SCRATCH_CAP]; // 32MB cell source / resume payload
+thread_local! {
+    // Dynamic scratch buffer: 1MB floor, grows to SCRATCH_CEIL on demand (scratch_reserve),
+    // releases to the floor after a cell (scratch_release). Replaces the old fixed 32MB array.
+    static SCRATCH: RefCell<Vec<u8>> = RefCell::new(vec![0u8; SCRATCH_FLOOR]);
+}
 static mut KV_OUT: [u8; 1 << 18] = [0; 1 << 18];
 static mut KV_OUT_LEN: usize = 0;
 static mut BOOT_ERR: [u8; 4096] = [0; 4096];
@@ -91,11 +102,41 @@ fn set_hostcall(s: &str) {
 
 #[no_mangle]
 pub extern "C" fn scratch_ptr() -> *const u8 {
-    core::ptr::addr_of!(SCRATCH) as *const u8
+    SCRATCH.with(|s| s.borrow().as_ptr())
 }
 #[no_mangle]
 pub extern "C" fn scratch_cap() -> usize {
-    SCRATCH_CAP
+    SCRATCH.with(|s| s.borrow().len())
+}
+// Grow scratch to hold >= `len` bytes (64KB-rounded, clamped to SCRATCH_CEIL) and return its
+// (possibly relocated) data pointer. The glue calls this BEFORE writing a payload, then RE-READS
+// scratch_ptr()/scratch_cap() — it never caches a pointer across a reserve. If `len` exceeds
+// SCRATCH_CEIL the buffer grows only to the ceiling, so the glue's `len > scratch_cap()` check then
+// rejects the payload (ProtocolSizeError) instead of overrunning linear memory.
+#[no_mangle]
+pub extern "C" fn scratch_reserve(len: usize) -> *const u8 {
+    SCRATCH.with(|s| {
+        let mut v = s.borrow_mut();
+        let want = ((len + 0xFFFF) & !0xFFFF).clamp(SCRATCH_FLOOR, SCRATCH_CEIL);
+        if want > v.len() {
+            v.resize(want, 0);
+        }
+        v.as_ptr()
+    })
+}
+// Release scratch back to the 1MB floor after a cell completes (frees the big payload to the
+// allocator for reuse). wasm linear memory does not shrink, so this does not lower memory.size, but
+// it lets the next big payload reuse freed space instead of growing further, and keeps a kernel
+// that only runs small cells from ever holding a big buffer.
+#[no_mangle]
+pub extern "C" fn scratch_release() {
+    SCRATCH.with(|s| {
+        let mut v = s.borrow_mut();
+        if v.len() > SCRATCH_FLOOR {
+            v.truncate(SCRATCH_FLOOR);
+            v.shrink_to_fit();
+        }
+    })
 }
 #[no_mangle]
 pub extern "C" fn result_ptr() -> *const u8 {
