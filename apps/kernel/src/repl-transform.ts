@@ -27,8 +27,55 @@
 
 const KW = new Set(["let", "const", "function", "class"]);
 
+// RESERVED HOST GLOBALS — names the engine BOOTSTRAP installs on globalThis as load-bearing
+// host primitives (apps/kernel/engine/src/lib.rs): the seeded `crypto` (getRandomValues/subtle),
+// the binary-safe `fetch`, the host-effect `host` Proxy, plus process/console/Buffer/require/use/
+// performance. A top-level `const crypto = require('crypto')` (THE standard Node idiom) must NOT
+// be globalized by the persistence transform: rewriting it to `crypto = require('crypto')` writes
+// `globalThis.crypto`, CLOBBERING the host primitive. For crypto specifically that is fatal — the
+// require('crypto') shim's getRandomValues delegates to `globalThis.crypto.getRandomValues`, so
+// once `globalThis.crypto` IS the shim it calls ITSELF → infinite recursion → stack overflow
+// (surfaces as `RuntimeError: unreachable`). FIX: when a top-level declaration binds a reserved
+// name we KEEP IT LEXICAL (leave the let/const/function/class keyword) so it is a true cell-local
+// that cleanly SHADOWS the host global inside the cell without ever overwriting globalThis — the
+// host primitive (and its seeded entropy / subtle / binary-fetch) stays intact. The only cost is
+// that that specific name does not persist to later cells (re-require it; the host global is still
+// there). Mirrors how a real module-scoped `const crypto = require('crypto')` shadows a global.
+const RESERVED_HOST_GLOBALS = new Set([
+  "crypto", "fetch", "host", "process", "console", "Buffer",
+  "require", "use", "performance", "globalThis",
+]);
+
 function isIdentStart(c: string): boolean { return /[A-Za-z_$]/.test(c); }
 function isIdentPart(c: string): boolean { return /[A-Za-z0-9_$]/.test(c); }
+
+// Does a let/const declarator list (the text after the keyword, up to but excluding any trailing
+// `;`) BIND any reserved host-global name? For a plain identifier list (`a, b, c = …`) we read the
+// leading identifier of each comma-separated segment. For a destructuring pattern we conservatively
+// scan every identifier token in the BINDING region (left of the first top-level `=`) — over-
+// detecting a reserved name used merely as a default-value reference is harmless (it only keeps the
+// rare declaration lexical, never corrupts it).
+function declListBindsReserved(declText: string, startsWithPattern: boolean): boolean {
+  if (startsWithPattern) {
+    // Binding region = up to the first top-level `=` (depth-aware over (){}[]).
+    let depth = 0, end = declText.length;
+    for (let j = 0; j < declText.length; j++) {
+      const ch = declText[j];
+      if (ch === "(" || ch === "{" || ch === "[") depth++;
+      else if (ch === ")" || ch === "}" || ch === "]") depth--;
+      else if (ch === "=" && depth === 0 && declText[j + 1] !== "=" && declText[j - 1] !== "=" &&
+               declText[j - 1] !== "!" && declText[j - 1] !== "<" && declText[j - 1] !== ">") { end = j; break; }
+    }
+    const region = declText.slice(0, end);
+    const ids = region.match(/[A-Za-z_$][\w$]*/g) || [];
+    return ids.some((w) => RESERVED_HOST_GLOBALS.has(w));
+  }
+  // Plain identifier list: the bound name is the leading identifier of each comma segment.
+  return declText.split(",").some((seg) => {
+    const m = /^\s*([A-Za-z_$][\w$]*)/.exec(seg);
+    return !!m && RESERVED_HOST_GLOBALS.has(m[1]);
+  });
+}
 
 // An in-place edit: delete `consume` chars at `at`, insert `replacement`. `prefix` marks the
 // hoist block emitted at offset 0 (applied last so it lands strictly at the front).
@@ -47,11 +94,14 @@ interface Hoist {
   consume: number;
 }
 
-// Result of handling a single declaration: either one `edit`, a set of `edits`, or a `hoist`.
+// Result of handling a single declaration: either one `edit`, a set of `edits`, a `hoist`, or
+// `keepLexical` (the declaration binds a reserved host-global → leave it verbatim as a cell-local
+// so it shadows the host global without clobbering globalThis; `i` is still advanced past it).
 interface DeclResult {
   edit?: Edit;
   edits?: Edit[];
   hoist?: Hoist;
+  keepLexical?: boolean;
 }
 
 // Cursor get/set indirection so the shared string/regex skippers can mutate the caller's index.
@@ -142,6 +192,9 @@ function planEdits(src: string): Edit[] | null {
         if (pendingAsyncOrExport) return null; // `async function`/`export …` → bail.
         const edit = handleDeclaration(src, word, start, () => i, (v) => (i = v));
         if (!edit) return null; // unparseable declaration → bail (whole cell).
+        // keepLexical: a reserved-host-global binding — leave it verbatim (cell-local shadow).
+        // `i` is already advanced past the whole declaration; push NO edit.
+        if (edit.keepLexical) { atStmtStart = true; prev = "stmt"; pendingAsyncOrExport = false; continue; }
         if (edit.edit) edits.push(edit.edit);
         if (edit.edits) for (const e of edit.edits) edits.push(e);
         if (edit.hoist) {
@@ -203,6 +256,8 @@ function handleDeclaration(src: string, kw: string, kwStart: number, getI: GetI,
     if (!skipToBlockEnd()) return null;
     const bodyEnd = i; // just past the closing `}` of the function/class body
     setI(i);
+    // Reserved host-global name (e.g. `function fetch(){}`) → keep lexical (do NOT clobber the host).
+    if (RESERVED_HOST_GLOBALS.has(name)) return { keepLexical: true };
     if (kw === "function") {
       // HOIST: caller emits `globalThis.NAME = function NAME(…){…};` at the top of the cell.
       return { hoist: { name, declText: src.slice(kwStart, bodyEnd), at: kwStart, consume: bodyEnd - kwStart } };
@@ -232,6 +287,11 @@ function handleDeclaration(src: string, kw: string, kwStart: number, getI: GetI,
 
   // Bare `let x;` with no initializer → safe global declare.
   const declText = src.slice(firstNonKw, hadSemi ? i - 1 : i);
+  // Reserved host-global binding (e.g. `const crypto = require('crypto')`, `let fetch = …`,
+  // `const {crypto} = …`) → keep lexical so it shadows the host global cell-locally WITHOUT
+  // overwriting globalThis (which would clobber the seeded crypto / binary fetch and, for crypto,
+  // self-recurse into a stack overflow). `i` already points past the whole declaration.
+  if (declListBindsReserved(declText, startsWithPattern)) return { keepLexical: true };
   if (!/=/.test(declText) && !startsWithPattern) {
     // one-or-more bare names: `let a, b;` → `void(globalThis.a ??= undefined, globalThis.b ??= undefined);`
     const names = declText.split(",").map((s) => s.trim()).filter(Boolean);

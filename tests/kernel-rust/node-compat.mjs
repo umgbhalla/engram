@@ -11,6 +11,10 @@
 //   querystring: stringify/parse (incl. repeated-key arrays)
 //   string_decoder: StringDecoder buffers a split UTF-8 multibyte sequence across writes
 //   __nodeCompat: builtins enumerates the new set; require() throw lists builtins + flags EXCLUDED modules
+//   WAVE2      : crypto createHash(sha256/sha1/md5)+createHmac known vectors, zlib gzip/deflate round-trip,
+//                url.parse, http/https client surface; crypto-shadow defense (manual globalThis.crypto
+//                reassign does NOT recurse). The full transform-pipeline shadow regression is in
+//                tests/kernel-rust/node-compat-wave2.mjs.
 //
 // All evals run as top-level-await cells (the engine wraps them); these shims make NO host call, so
 // evalCell never parks — but we keep the host-park loop for parity with the harness.
@@ -270,6 +274,32 @@ ok("require('os').EOL", val(ex, `require('os').EOL`) === '\n');
 ok("fs VFS still round-trips", val(ex, `(function(){ var fs=require('fs'); fs.writeFileSync('/t.txt','hi'); return fs.readFileSync('/t.txt','utf8'); })()`) === 'hi');
 ok("util.inherits + EventEmitter subclass emits",
   val(ex, `(function(){ var util=require('util'); var EE=require('events'); function My(){ EE.call(this); } util.inherits(My, EE); var m=new My(); var got=null; m.on('e', function(v){ got=v; }); m.emit('e', 7); return got; })()`) === 7);
+
+// ===== crypto-SHADOW defense-in-depth (engine-level; the transform-pipeline regression is in
+// node-compat-wave2.mjs). require('crypto').getRandomValues captures the SEEDED primitive once, so
+// even a MANUAL `globalThis.crypto = require('crypto')` can never recurse into itself (was a stack
+// overflow -> RuntimeError: unreachable when the shim's getRandomValues resolved to itself). =====
+ok("crypto randomBytes does NOT recurse after globalThis.crypto reassign",
+  val(ex, `(function(){ globalThis.crypto = require('crypto'); return globalThis.crypto.randomBytes(8).length; })()`) === 8);
+
+// ===== Node-compat WAVE 2 surface (crypto hashes/hmac, zlib, url, http) — known vectors. =====
+ok("crypto.createHash('sha256') of 'abc' == ba7816bf...",
+  val(ex, `require('crypto').createHash('sha256').update('abc').digest('hex')`) === 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+ok("crypto.createHash sha1/md5 known vectors",
+  val(ex, `(function(){var c=require('crypto');return c.createHash('sha1').update('abc').digest('hex')==='a9993e364706816aba3e25717850c26c9cd0d89d' && c.createHash('md5').update('abc').digest('hex')==='900150983cd24fb0d6963f7d28e17f72';})()`) === true);
+ok("crypto.createHmac sha256 (RFC 4231 case 2)",
+  val(ex, `require('crypto').createHmac('sha256','Jefe').update('what do ya want for nothing?').digest('hex')`) === '5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843');
+ok("zlib gzipSync->gunzipSync round-trip",
+  val(ex, `(function(){var z=require('zlib');var s='node-compat zlib '.repeat(20);return z.gunzipSync(z.gzipSync(s)).toString('utf8')===s;})()`) === true);
+ok("zlib deflateSync->inflateSync round-trip",
+  val(ex, `(function(){var z=require('zlib');var s='deflate '.repeat(16);return z.inflateSync(z.deflateSync(s)).toString('utf8')===s;})()`) === true);
+ok("url.parse host/path/query",
+  val(ex, `(function(){var p=require('url').parse('http://h.com:9/a?b=c', true);return p.hostname+'|'+p.port+'|'+p.pathname+'|'+JSON.stringify(p.query);})()`) === 'h.com|9|/a|{"b":"c"}');
+ok("require('url').URL === globalThis.URL", val(ex, `require('url').URL === globalThis.URL`) === true);
+ok("http/https client modules expose request/get",
+  val(ex, `(function(){var h=require('http'),s=require('https');return [typeof h.request,typeof h.get,typeof s.request,typeof s.get].join(',');})()`) === 'function,function,function,function');
+ok("http.createServer throws (servers excluded)",
+  typeof val(ex, `(function(){try{require('http').createServer();return null;}catch(e){return e.message;}})()`) === 'string');
 
 console.log(`\n${pass}/${pass + fail} PASS`);
 process.exit(fail ? 1 : 0);

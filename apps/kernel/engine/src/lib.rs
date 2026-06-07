@@ -352,12 +352,14 @@ if (typeof globalThis.Headers === 'undefined') {
   HP[Symbol.iterator]=HP.entries;
 }
 
-// ---- crypto.subtle.digest (SHA-256, pure JS; sync-result wrapped in a resolved Promise) ----
+// ---- hash primitives (SHA-256 / SHA-1 / MD5, pure JS) on globalThis.__hashes ----
+// Hoisted to a stable global so BOTH crypto.subtle.digest AND require('crypto').createHash reuse
+// ONE implementation. Each takes a Uint8Array, returns a Uint8Array digest. Snapshot-persisted.
 try {
-  if (typeof globalThis.crypto === 'undefined') globalThis.crypto = {};
-  if (typeof globalThis.crypto.subtle === 'undefined'){
+  if (typeof globalThis.__hashes === 'undefined') {
+    function __rotr(x,n){ return (x>>>n)|(x<<(32-n)); }
+    function __rotl(x,n){ return (x<<n)|(x>>>(32-n)); }
     var __sha256 = function(bytes){
-      function rotr(x,n){ return (x>>>n)|(x<<(32-n)); }
       var K=[0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
       0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
       0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
@@ -376,11 +378,11 @@ try {
       var w=new Array(64);
       for (var i=0;i<total;i+=64){
         for (var t=0;t<16;t++){ w[t]=(m[i+t*4]<<24)|(m[i+t*4+1]<<16)|(m[i+t*4+2]<<8)|(m[i+t*4+3]); }
-        for (var t=16;t<64;t++){ var s0=rotr(w[t-15],7)^rotr(w[t-15],18)^(w[t-15]>>>3); var s1=rotr(w[t-2],17)^rotr(w[t-2],19)^(w[t-2]>>>10); w[t]=(w[t-16]+s0+w[t-7]+s1)|0; }
+        for (var t=16;t<64;t++){ var s0=__rotr(w[t-15],7)^__rotr(w[t-15],18)^(w[t-15]>>>3); var s1=__rotr(w[t-2],17)^__rotr(w[t-2],19)^(w[t-2]>>>10); w[t]=(w[t-16]+s0+w[t-7]+s1)|0; }
         var a=H[0],b=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h=H[7];
         for (var t=0;t<64;t++){
-          var S1=rotr(e,6)^rotr(e,11)^rotr(e,25); var ch=(e&f)^(~e&g); var t1=(h+S1+ch+K[t]+w[t])|0;
-          var S0=rotr(a,2)^rotr(a,13)^rotr(a,22); var maj=(a&b)^(a&c)^(b&c); var t2=(S0+maj)|0;
+          var S1=__rotr(e,6)^__rotr(e,11)^__rotr(e,25); var ch=(e&f)^(~e&g); var t1=(h+S1+ch+K[t]+w[t])|0;
+          var S0=__rotr(a,2)^__rotr(a,13)^__rotr(a,22); var maj=(a&b)^(a&c)^(b&c); var t2=(S0+maj)|0;
           h=g;g=f;f=e;e=(d+t1)|0;d=c;c=b;b=a;a=(t1+t2)|0;
         }
         H[0]=(H[0]+a)|0;H[1]=(H[1]+b)|0;H[2]=(H[2]+c)|0;H[3]=(H[3]+d)|0;H[4]=(H[4]+e)|0;H[5]=(H[5]+f)|0;H[6]=(H[6]+g)|0;H[7]=(H[7]+h)|0;
@@ -389,13 +391,81 @@ try {
       for (var i=0;i<8;i++){ out[i*4]=(H[i]>>>24)&0xff; out[i*4+1]=(H[i]>>>16)&0xff; out[i*4+2]=(H[i]>>>8)&0xff; out[i*4+3]=H[i]&0xff; }
       return out;
     };
+    // SHA-1 (160-bit). Big-endian, same MD-padding as SHA-256.
+    var __sha1 = function(bytes){
+      var H=[0x67452301,0xEFCDAB89,0x98BADCFE,0x10325476,0xC3D2E1F0];
+      var l=bytes.length, bl=l*8, withOne=l+1, k=(56-(withOne%64)+64)%64, total=withOne+k+8;
+      var m=new Uint8Array(total); m.set(bytes); m[l]=0x80;
+      var hi=Math.floor(bl/0x100000000), lo=bl>>>0;
+      m[total-8]=(hi>>>24)&0xff; m[total-7]=(hi>>>16)&0xff; m[total-6]=(hi>>>8)&0xff; m[total-5]=hi&0xff;
+      m[total-4]=(lo>>>24)&0xff; m[total-3]=(lo>>>16)&0xff; m[total-2]=(lo>>>8)&0xff; m[total-1]=lo&0xff;
+      var w=new Array(80);
+      for (var i=0;i<total;i+=64){
+        for (var t=0;t<16;t++){ w[t]=(m[i+t*4]<<24)|(m[i+t*4+1]<<16)|(m[i+t*4+2]<<8)|(m[i+t*4+3]); }
+        for (var t=16;t<80;t++){ w[t]=__rotl(w[t-3]^w[t-8]^w[t-14]^w[t-16],1); }
+        var a=H[0],b=H[1],c=H[2],d=H[3],e=H[4];
+        for (var t=0;t<80;t++){
+          var f,kk;
+          if (t<20){ f=(b&c)|((~b)&d); kk=0x5A827999; }
+          else if (t<40){ f=b^c^d; kk=0x6ED9EBA1; }
+          else if (t<60){ f=(b&c)|(b&d)|(c&d); kk=0x8F1BBCDC; }
+          else { f=b^c^d; kk=0xCA62C1D6; }
+          var tmp=(__rotl(a,5)+f+e+kk+w[t])|0; e=d; d=c; c=__rotl(b,30); b=a; a=tmp;
+        }
+        H[0]=(H[0]+a)|0;H[1]=(H[1]+b)|0;H[2]=(H[2]+c)|0;H[3]=(H[3]+d)|0;H[4]=(H[4]+e)|0;
+      }
+      var out=new Uint8Array(20);
+      for (var i=0;i<5;i++){ out[i*4]=(H[i]>>>24)&0xff; out[i*4+1]=(H[i]>>>16)&0xff; out[i*4+2]=(H[i]>>>8)&0xff; out[i*4+3]=H[i]&0xff; }
+      return out;
+    };
+    // MD5 (128-bit). LITTLE-endian length + word load (RFC 1321).
+    var __md5 = function(bytes){
+      var S=[7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+             4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21];
+      var K=[];
+      for (var ki=0;ki<64;ki++){ K[ki]=(Math.floor(Math.abs(Math.sin(ki+1))*0x100000000))|0; }
+      var a0=0x67452301,b0=0xefcdab89,c0=0x98badcfe,d0=0x10325476;
+      var l=bytes.length, withOne=l+1, k=(56-(withOne%64)+64)%64, total=withOne+k+8;
+      var m=new Uint8Array(total); m.set(bytes); m[l]=0x80;
+      var bl=l*8, hi=Math.floor(bl/0x100000000), lo=bl>>>0;
+      m[total-8]=lo&0xff; m[total-7]=(lo>>>8)&0xff; m[total-6]=(lo>>>16)&0xff; m[total-5]=(lo>>>24)&0xff;
+      m[total-4]=hi&0xff; m[total-3]=(hi>>>8)&0xff; m[total-2]=(hi>>>16)&0xff; m[total-1]=(hi>>>24)&0xff;
+      for (var i=0;i<total;i+=64){
+        var M=new Array(16);
+        for (var j=0;j<16;j++){ M[j]=m[i+j*4]|(m[i+j*4+1]<<8)|(m[i+j*4+2]<<16)|(m[i+j*4+3]<<24); }
+        var A=a0,B=b0,C=c0,D=d0;
+        for (var t=0;t<64;t++){
+          var F,gg;
+          if (t<16){ F=(B&C)|((~B)&D); gg=t; }
+          else if (t<32){ F=(D&B)|((~D)&C); gg=(5*t+1)%16; }
+          else if (t<48){ F=B^C^D; gg=(3*t+5)%16; }
+          else { F=C^(B|(~D)); gg=(7*t)%16; }
+          F=(F+A+K[t]+M[gg])|0; A=D; D=C; C=B; B=(B+__rotl(F,S[t]))|0;
+        }
+        a0=(a0+A)|0; b0=(b0+B)|0; c0=(c0+C)|0; d0=(d0+D)|0;
+      }
+      var out=new Uint8Array(16); var words=[a0,b0,c0,d0];
+      for (var i=0;i<4;i++){ out[i*4]=words[i]&0xff; out[i*4+1]=(words[i]>>>8)&0xff; out[i*4+2]=(words[i]>>>16)&0xff; out[i*4+3]=(words[i]>>>24)&0xff; }
+      return out;
+    };
+    globalThis.__hashes = {
+      sha256: __sha256, 'sha-256': __sha256,
+      sha1: __sha1, 'sha-1': __sha1,
+      md5: __md5,
+      blockSize: { sha256: 64, 'sha-256': 64, sha1: 64, 'sha-1': 64, md5: 64 },
+    };
+  }
+  if (typeof globalThis.crypto === 'undefined') globalThis.crypto = {};
+  if (typeof globalThis.crypto.subtle === 'undefined'){
     globalThis.crypto.subtle = {
       digest: function(algo, data){
         var name = (typeof algo === 'string') ? algo : (algo && algo.name);
         return new Promise(function(res, rej){
-          if (String(name).toUpperCase().replace('-','') !== 'SHA256'){ rej(new Error('NotSupportedError: only SHA-256 digest is supported in this VM')); return; }
+          var key = String(name).toLowerCase();
+          var fn = globalThis.__hashes[key] || (key.replace('-','') === 'sha256' ? globalThis.__hashes.sha256 : (key.replace('-','') === 'sha1' ? globalThis.__hashes.sha1 : null));
+          if (!fn){ rej(new Error('NotSupportedError: unsupported digest ' + name + ' (supported: SHA-256, SHA-1)')); return; }
           var b = (data instanceof Uint8Array) ? data : new Uint8Array(data.buffer || data);
-          res(__sha256(b).buffer);
+          res(fn(b).buffer);
         });
       }
     };
@@ -965,13 +1035,320 @@ var __stream = (function(EventEmitter){
   return api;
 })(__events);
 
+// ===== crypto (node:crypto) — randomBytes/randomFillSync/getRandomValues/randomUUID/randomInt +
+//        createHash(sha256|sha1|md5) + createHmac + scryptSync. Reuses globalThis.__hashes. =====
+// SHADOW-SAFETY (ADR crypto-shadow): the SEEDED entropy primitive is captured ONCE here as
+// `__seededRandom` straight off globalThis.crypto.getRandomValues at bootstrap. Every method below
+// uses that captured ref — NEVER `globalThis.crypto.getRandomValues` at call time. So even if a
+// later cell reassigns globalThis.crypto (e.g. `globalThis.crypto = require('crypto')`), the shim's
+// getRandomValues can never resolve to ITSELF → no infinite recursion / stack overflow. (The REPL
+// transform additionally keeps `const crypto = require('crypto')` cell-local so it doesn't clobber
+// globalThis.crypto at all; this capture is belt-and-suspenders for a manual global reassign.)
+var __crypto = (function(){
+  var __seededRandom = (globalThis.crypto && typeof globalThis.crypto.getRandomValues === 'function')
+    ? globalThis.crypto.getRandomValues.bind(globalThis.crypto)
+    : function(a){ for (var i=0;i<a.length;i++) a[i] = (globalThis.__rand() * 256) & 0xff; return a; };
+  var __seededUUID = (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function')
+    ? globalThis.crypto.randomUUID.bind(globalThis.crypto) : null;
+  function toBytes(v, enc){ return globalThis.Buffer.from(typeof v === 'string' ? globalThis.Buffer.from(v, enc || 'utf8') : v); }
+  function randomBytes(n, cb){ var a = new Uint8Array(n|0); __seededRandom(a); var b = globalThis.Buffer.from(a); if (typeof cb === 'function'){ queueMicrotask(function(){ cb(null, b); }); return; } return b; }
+  function randomFillSync(buf, off, size){ off = off|0; size = (size === undefined) ? buf.length - off : size|0; var tmp = new Uint8Array(size); __seededRandom(tmp); for (var i=0;i<size;i++) buf[off+i] = tmp[i]; return buf; }
+  function randomFill(buf, off, size, cb){ if (typeof off === 'function'){ cb = off; off = 0; size = buf.length; } else if (typeof size === 'function'){ cb = size; size = buf.length - off; } randomFillSync(buf, off, size); queueMicrotask(function(){ cb(null, buf); }); }
+  function getRandomValues(a){ return __seededRandom(a); }
+  function randomUUID(){ if (__seededUUID) return __seededUUID(); var b = randomBytes(16); b[6]=(b[6]&0x0f)|0x40; b[8]=(b[8]&0x3f)|0x80; var h=[]; for (var i=0;i<16;i++) h.push((b[i]+0x100).toString(16).slice(1)); return h[0]+h[1]+h[2]+h[3]+'-'+h[4]+h[5]+'-'+h[6]+h[7]+'-'+h[8]+h[9]+'-'+h[10]+h[11]+h[12]+h[13]+h[14]+h[15]; }
+  // randomInt([min,] max[, cb]) — uniform integer in [min,max). Rejection-sampled off the seeded RNG.
+  function randomInt(min, max, cb){ if (typeof max === 'function' || max === undefined){ cb = max; max = min; min = 0; } min = Math.floor(min); max = Math.floor(max); if (!(max > min)) throw new RangeError('max must be greater than min'); var range = max - min; var bytesNeeded = Math.ceil(Math.log2(range) / 8) || 1; var maxValid = Math.floor(0x100000000 / range) * range; var val; do { var bb = randomBytes(4); val = ((bb[0]<<24)>>>0) + (bb[1]<<16) + (bb[2]<<8) + bb[3]; } while (val >= maxValid && range <= 0x100000000); var out = min + (val % range); if (typeof cb === 'function'){ queueMicrotask(function(){ cb(null, out); }); return; } return out; }
+  // Hash: createHash(algo).update(data).digest([enc]). Buffers chunks, hashes once on digest().
+  function normAlgo(a){ return String(a).toLowerCase().replace(/^rsa-/, ''); }
+  function Hash(algo){ this._algo = normAlgo(algo); this._fn = globalThis.__hashes[this._algo]; if (!this._fn) throw new Error("Digest method not supported: " + algo); this._chunks = []; }
+  Hash.prototype.update = function(data, enc){ this._chunks.push(toBytes(data, enc)); return this; };
+  Hash.prototype.digest = function(enc){ var total = 0, i; for (i=0;i<this._chunks.length;i++) total += this._chunks[i].length; var all = new Uint8Array(total), off = 0; for (i=0;i<this._chunks.length;i++){ all.set(this._chunks[i], off); off += this._chunks[i].length; } var out = globalThis.Buffer.from(this._fn(all)); return enc ? out.toString(enc) : out; };
+  function createHash(algo){ return new Hash(algo); }
+  // HMAC (RFC 2104) over any supported hash. createHmac(algo, key).update(data).digest([enc]).
+  function Hmac(algo, key){ this._algo = normAlgo(algo); this._fn = globalThis.__hashes[this._algo]; if (!this._fn) throw new Error("Digest method not supported: " + algo); var blockSize = (globalThis.__hashes.blockSize && globalThis.__hashes.blockSize[this._algo]) || 64; var k = toBytes(key); if (k.length > blockSize) k = globalThis.Buffer.from(this._fn(k)); if (k.length < blockSize){ var kk = new Uint8Array(blockSize); kk.set(k); k = globalThis.Buffer.from(kk); } this._ipad = new Uint8Array(blockSize); this._opad = new Uint8Array(blockSize); for (var i=0;i<blockSize;i++){ this._ipad[i] = k[i] ^ 0x36; this._opad[i] = k[i] ^ 0x5c; } this._chunks = []; }
+  Hmac.prototype.update = function(data, enc){ this._chunks.push(toBytes(data, enc)); return this; };
+  Hmac.prototype.digest = function(enc){ var total = this._ipad.length, i; for (i=0;i<this._chunks.length;i++) total += this._chunks[i].length; var inner = new Uint8Array(total); inner.set(this._ipad); var off = this._ipad.length; for (i=0;i<this._chunks.length;i++){ inner.set(this._chunks[i], off); off += this._chunks[i].length; } var innerHash = this._fn(inner); var outer = new Uint8Array(this._opad.length + innerHash.length); outer.set(this._opad); outer.set(innerHash, this._opad.length); var out = globalThis.Buffer.from(this._fn(outer)); return enc ? out.toString(enc) : out; };
+  function createHmac(algo, key){ return new Hmac(algo, key); }
+  // scryptSync — pure-JS RFC 7914 (PBKDF2-SHA256 + Salsa20/8 ROMix). Deterministic, no entropy.
+  // Provided per spec (optional); small N only — it is O(N) memory/CPU in-VM. Throws above a cap.
+  function pbkdf2Sha256(pw, salt, iterations, keylen){
+    var hLen = 32, blocks = Math.ceil(keylen / hLen), out = new Uint8Array(blocks * hLen);
+    for (var b=1;b<=blocks;b++){
+      var ib = new Uint8Array(salt.length + 4); ib.set(salt); ib[salt.length]=(b>>>24)&0xff; ib[salt.length+1]=(b>>>16)&0xff; ib[salt.length+2]=(b>>>8)&0xff; ib[salt.length+3]=b&0xff;
+      var u = hmacRaw(pw, ib), t = u.slice();
+      for (var it=1;it<iterations;it++){ u = hmacRaw(pw, u); for (var k=0;k<hLen;k++) t[k] ^= u[k]; }
+      out.set(t, (b-1)*hLen);
+    }
+    return out.subarray(0, keylen);
+  }
+  function hmacRaw(key, msg){ var h = new Hmac('sha256', key); h.update(msg); var total = h._ipad.length + msg.length; var inner = new Uint8Array(total); inner.set(h._ipad); inner.set(msg, h._ipad.length); var ih = globalThis.__hashes.sha256(inner); var outer = new Uint8Array(h._opad.length + ih.length); outer.set(h._opad); outer.set(ih, h._opad.length); return globalThis.__hashes.sha256(outer); }
+  function scryptSync(password, salt, keylen, opts){
+    opts = opts || {}; var N = opts.N || opts.cost || 16384, r = opts.r || opts.blockSize || 8, p = opts.p || opts.parallelization || 1;
+    if (N * r * 128 > (16 << 20)) throw new Error('scryptSync: parameters exceed the in-VM memory cap (N*r*128 <= 16MB)');
+    var pw = toBytes(password), sl = toBytes(salt);
+    var B = pbkdf2Sha256(pw, sl, 1, p * 128 * r);
+    function R(a,b){ return (a<<b)|(a>>>(32-b)); }
+    function salsa(B32){ var x = B32.slice(); for (var i=8;i>0;i-=2){ x[4]^=R(x[0]+x[12],7); x[8]^=R(x[4]+x[0],9); x[12]^=R(x[8]+x[4],13); x[0]^=R(x[12]+x[8],18); x[9]^=R(x[5]+x[1],7); x[13]^=R(x[9]+x[5],9); x[1]^=R(x[13]+x[9],13); x[5]^=R(x[1]+x[13],18); x[14]^=R(x[10]+x[6],7); x[2]^=R(x[14]+x[10],9); x[6]^=R(x[2]+x[14],13); x[10]^=R(x[6]+x[2],18); x[3]^=R(x[15]+x[11],7); x[7]^=R(x[3]+x[15],9); x[11]^=R(x[7]+x[3],13); x[15]^=R(x[11]+x[7],18); x[1]^=R(x[0]+x[3],7); x[2]^=R(x[1]+x[0],9); x[3]^=R(x[2]+x[1],13); x[0]^=R(x[3]+x[2],18); x[6]^=R(x[5]+x[4],7); x[7]^=R(x[6]+x[5],9); x[4]^=R(x[7]+x[6],13); x[5]^=R(x[4]+x[7],18); x[11]^=R(x[10]+x[9],7); x[8]^=R(x[11]+x[10],9); x[9]^=R(x[8]+x[11],13); x[10]^=R(x[9]+x[8],18); x[12]^=R(x[15]+x[14],7); x[13]^=R(x[12]+x[15],9); x[14]^=R(x[13]+x[12],13); x[15]^=R(x[14]+x[13],18); } for (var i=0;i<16;i++) B32[i]=(B32[i]+x[i])|0; }
+    function blockmix(BB){ var X = BB.subarray((2*r-1)*16, (2*r-1)*16+16).slice(); var Y = new Int32Array(BB.length); for (var i=0;i<2*r;i++){ for (var j=0;j<16;j++) X[j]^=BB[i*16+j]; salsa(X); var dst = (i%2===0 ? (i/2) : (r + (i-1)/2)) * 16; for (var j=0;j<16;j++) Y[dst+j]=X[j]; } BB.set(Y); }
+    function toI32(u8){ var dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength); var out = new Int32Array(u8.length/4); for (var i=0;i<out.length;i++) out[i]=dv.getInt32(i*4, true); return out; }
+    function fromI32(i32){ var out = new Uint8Array(i32.length*4); var dv = new DataView(out.buffer); for (var i=0;i<i32.length;i++) dv.setInt32(i*4, i32[i], true); return out; }
+    for (var i=0;i<p;i++){
+      var Bi = toI32(B.subarray(i*128*r, (i+1)*128*r));
+      var V = []; for (var n=0;n<N;n++){ V.push(Bi.slice()); blockmix(Bi); }
+      for (var n=0;n<N;n++){ var jj = (Bi[(2*r-1)*16] >>> 0) % N; for (var k=0;k<Bi.length;k++) Bi[k]^=V[jj][k]; blockmix(Bi); }
+      B.set(fromI32(Bi), i*128*r);
+    }
+    var dk = pbkdf2Sha256(pw, B, 1, keylen);
+    return globalThis.Buffer.from(dk);
+  }
+  return {
+    randomBytes: randomBytes, randomFillSync: randomFillSync, randomFill: randomFill,
+    getRandomValues: getRandomValues, randomUUID: randomUUID, randomInt: randomInt,
+    createHash: createHash, createHmac: createHmac, Hash: Hash, Hmac: Hmac,
+    scryptSync: scryptSync, pbkdf2Sync: function(pw, salt, it, kl, digest){ if (digest && normAlgo(digest).replace('-','') !== 'sha256') throw new Error('pbkdf2Sync: only sha256 supported in-VM'); return globalThis.Buffer.from(pbkdf2Sha256(toBytes(pw), toBytes(salt), it, kl)); },
+    constants: {}, webcrypto: globalThis.crypto,
+    getHashes: function(){ return ['sha256','sha1','md5']; },
+    timingSafeEqual: function(a, b){ if (a.length !== b.length) throw new RangeError('Input buffers must have the same byte length'); var diff = 0; for (var i=0;i<a.length;i++) diff |= a[i] ^ b[i]; return diff === 0; },
+  };
+})();
+
+// ===== zlib (node:zlib) — PURE-JS DEFLATE/INFLATE + gzip/zlib framing. =====
+// rquickjs has no CompressionStream (that is workerd-host-only, used by the snapshot glue), and
+// gzipSync/gunzipSync MUST be synchronous, so this is a self-contained pure-JS codec (snapshot-safe,
+// deterministic, no host round-trip). INFLATE handles all three DEFLATE block types (stored / fixed
+// / DYNAMIC Huffman) so it reads real `content-encoding: gzip` and tar.gz streams from servers.
+// DEFLATE emits standards-compliant FIXED-Huffman + LZ77 blocks (valid for Node/zlib gunzip too).
+// gzip = 10-byte header + DEFLATE + CRC32 + ISIZE; zlib(deflate) = 2-byte header + DEFLATE + Adler32.
+// brotli* is NOT provided (a pure-JS brotli needs the ~120KB static dictionary) — those throw a
+// clear NotSupported. Async variants (gzip/gunzip/…) are the sync codec wrapped in a microtask.
+var __zlib = (function(){
+  var ENC = new TextEncoder();
+  function toU8(x){ if (x instanceof Uint8Array) return x; if (x instanceof ArrayBuffer) return new Uint8Array(x); if (typeof x === 'string') return ENC.encode(x); if (x && x.buffer) return new Uint8Array(x.buffer, x.byteOffset||0, x.byteLength); return new Uint8Array(x); }
+  function crc32(u8){ var c, crc = 0xFFFFFFFF; for (var i=0;i<u8.length;i++){ c = (crc ^ u8[i]) & 0xFF; for (var k=0;k<8;k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); crc = (crc >>> 8) ^ c; } return (crc ^ 0xFFFFFFFF) >>> 0; }
+  function adler32(u8){ var a = 1, b = 0; for (var i=0;i<u8.length;i++){ a = (a + u8[i]) % 65521; b = (b + a) % 65521; } return ((b << 16) | a) >>> 0; }
+
+  // ---- INFLATE (RFC 1951) — bit reader + the three block types ----
+  function inflateRaw(data){
+    var bytes = toU8(data), pos = 0, bitBuf = 0, bitCnt = 0;
+    var out = [], outLen = 0;
+    function ensure(n){ while (bitCnt < n){ bitBuf |= (pos < bytes.length ? bytes[pos++] : 0) << bitCnt; bitCnt += 8; } }
+    function bits(n){ if (n === 0) return 0; ensure(n); var v = bitBuf & ((1 << n) - 1); bitBuf >>>= n; bitCnt -= n; return v; }
+    function alignByte(){ bitBuf = 0; bitCnt = 0; }
+    function pushByte(b){ out.push(b); outLen++; }
+    // build a canonical-Huffman fast decode table from code lengths.
+    function buildTree(lengths){ var maxBits = 0, i; for (i=0;i<lengths.length;i++) if (lengths[i] > maxBits) maxBits = lengths[i]; var blCount = new Array(maxBits+1).fill(0); for (i=0;i<lengths.length;i++) blCount[lengths[i]]++; blCount[0] = 0; var nextCode = new Array(maxBits+1).fill(0), code = 0; for (var b=1;b<=maxBits;b++){ code = (code + blCount[b-1]) << 1; nextCode[b] = code; } var codes = {}; for (i=0;i<lengths.length;i++){ var len = lengths[i]; if (len){ codes[len + ':' + (nextCode[len]++)] = i; } } return { codes: codes, maxBits: maxBits }; }
+    function decodeSym(tree){ var code = 0; for (var len=1; len<=tree.maxBits; len++){ code = (code << 1) | bits(1); var sym = tree.codes[len + ':' + code]; if (sym !== undefined) return sym; } throw new Error('zlib: invalid Huffman code'); }
+    var LBASE = [3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258];
+    var LEXT  = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0];
+    var DBASE = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577];
+    var DEXT  = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13];
+    var fixedLit = null, fixedDist = null;
+    function fixedTrees(){ if (fixedLit) return; var ll = []; for (var i=0;i<=143;i++) ll.push(8); for (;i<=255;i++) ll.push(9); for (;i<=279;i++) ll.push(7); for (;i<=287;i++) ll.push(8); fixedLit = buildTree(ll); var dl = []; for (i=0;i<30;i++) dl.push(5); fixedDist = buildTree(dl); }
+    var bfinal = 0;
+    do {
+      bfinal = bits(1); var btype = bits(2);
+      if (btype === 0){ alignByte(); var len = bytes[pos] | (bytes[pos+1] << 8); pos += 4; for (var i=0;i<len;i++) pushByte(bytes[pos++]); }
+      else {
+        var litTree, distTree;
+        if (btype === 1){ fixedTrees(); litTree = fixedLit; distTree = fixedDist; }
+        else if (btype === 2){
+          var hlit = bits(5) + 257, hdist = bits(5) + 1, hclen = bits(4) + 4;
+          var order = [16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15];
+          var clLens = new Array(19).fill(0); for (var i=0;i<hclen;i++) clLens[order[i]] = bits(3);
+          var clTree = buildTree(clLens);
+          var lens = []; while (lens.length < hlit + hdist){ var s = decodeSym(clTree); if (s < 16) lens.push(s); else if (s === 16){ var r = bits(2) + 3, prev = lens[lens.length-1]; while (r--) lens.push(prev); } else if (s === 17){ var r = bits(3) + 3; while (r--) lens.push(0); } else { var r = bits(7) + 11; while (r--) lens.push(0); } }
+          litTree = buildTree(lens.slice(0, hlit)); distTree = buildTree(lens.slice(hlit));
+        } else throw new Error('zlib: invalid block type ' + btype);
+        while (true){ var sym = decodeSym(litTree); if (sym === 256) break; if (sym < 256){ pushByte(sym); } else { var li = sym - 257; var length = LBASE[li] + bits(LEXT[li]); var dsym = decodeSym(distTree); var dist = DBASE[dsym] + bits(DEXT[dsym]); var start = outLen - dist; for (var k=0;k<length;k++) pushByte(out[start + k]); } }
+      }
+    } while (!bfinal);
+    return Uint8Array.from(out);
+  }
+
+  // ---- DEFLATE (RFC 1951, fixed-Huffman + a greedy hash-chain LZ77 matcher) ----
+  function deflateRaw(data){
+    var src = toU8(data);
+    var bitBuf = 0, bitCnt = 0, ob = [];
+    function putBits(val, n){ bitBuf |= (val << bitCnt); bitCnt += n; while (bitCnt >= 8){ ob.push(bitBuf & 0xFF); bitBuf >>>= 8; bitCnt -= 8; } }
+    function putBitsRev(code, n){ var r = 0; for (var i=0;i<n;i++){ r = (r << 1) | ((code >>> i) & 1); } putBits(r, n); } // Huffman codes are MSB-first
+    // fixed literal/length code: 0-143 ->8b(0x30..),144-255 ->9b(0x190..),256-279 ->7b(0..),280-287 ->8b(0xC0..)
+    function litCode(sym){ if (sym <= 143) return { c: 0x30 + sym, n: 8 }; if (sym <= 255) return { c: 0x190 + (sym - 144), n: 9 }; if (sym <= 279) return { c: (sym - 256), n: 7 }; return { c: 0xC0 + (sym - 280), n: 8 }; }
+    function emitLit(b){ var lc = litCode(b); putBitsRev(lc.c, lc.n); }
+    var LBASE = [3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258];
+    var LEXT  = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0];
+    var DBASE = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577];
+    var DEXT  = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13];
+    function lenSym(len){ for (var i=28;i>=0;i--){ if (len >= LBASE[i]) return i; } return 0; }
+    function distSym(d){ for (var i=29;i>=0;i--){ if (d >= DBASE[i]) return i; } return 0; }
+    putBits(1, 1); putBits(1, 2); // BFINAL=1, BTYPE=01 (fixed Huffman)
+    var head = {}; // hash of 3-byte sequences -> last position
+    function hash(i){ return ((src[i] << 16) ^ (src[i+1] << 8) ^ src[i+2]) & 0x7FFF; }
+    var i = 0, n = src.length;
+    while (i < n){
+      var matchLen = 0, matchDist = 0;
+      if (i + 3 <= n){
+        var h = hash(i), cand = head[h];
+        if (cand !== undefined && (i - cand) <= 32768){
+          var len = 0, maxLen = Math.min(258, n - i);
+          while (len < maxLen && src[cand + len] === src[i + len]) len++;
+          if (len >= 3){ matchLen = len; matchDist = i - cand; }
+        }
+        head[h] = i;
+      }
+      if (matchLen >= 3){
+        var ls = lenSym(matchLen); var lc = litCode(256 + 1 + ls); putBitsRev(lc.c, lc.n); putBits(matchLen - LBASE[ls], LEXT[ls]);
+        var ds = distSym(matchDist); putBitsRev(ds, 5); putBits(matchDist - DBASE[ds], DEXT[ds]);
+        // insert hash entries for the matched run so later matches can reference inside it.
+        for (var j=1;j<matchLen && i+j+3 <= n;j++){ head[hash(i+j)] = i+j; }
+        i += matchLen;
+      } else { emitLit(src[i]); i++; }
+    }
+    emitLit(256); // end-of-block
+    if (bitCnt > 0){ ob.push(bitBuf & 0xFF); bitBuf = 0; bitCnt = 0; }
+    return Uint8Array.from(ob);
+  }
+
+  function gzipSync(data, opts){ var src = toU8(data); var body = deflateRaw(src); var crc = crc32(src), isize = src.length >>> 0; var out = new Uint8Array(10 + body.length + 8); out.set([0x1f,0x8b,8,0,0,0,0,0,0,0xff], 0); out.set(body, 10); var o = 10 + body.length; out[o]=crc&0xff; out[o+1]=(crc>>>8)&0xff; out[o+2]=(crc>>>16)&0xff; out[o+3]=(crc>>>24)&0xff; out[o+4]=isize&0xff; out[o+5]=(isize>>>8)&0xff; out[o+6]=(isize>>>16)&0xff; out[o+7]=(isize>>>24)&0xff; return globalThis.Buffer.from(out); }
+  function gunzipSync(data){ var b = toU8(data); if (b.length < 18 || b[0] !== 0x1f || b[1] !== 0x8b) throw new Error('zlib: not a gzip stream'); if (b[2] !== 8) throw new Error('zlib: unsupported gzip compression method'); var flg = b[3], off = 10; if (flg & 4){ var xlen = b[off] | (b[off+1] << 8); off += 2 + xlen; } if (flg & 8){ while (b[off] !== 0) off++; off++; } if (flg & 16){ while (b[off] !== 0) off++; off++; } if (flg & 2){ off += 2; } var body = b.subarray(off, b.length - 8); return globalThis.Buffer.from(inflateRaw(body)); }
+  function deflateSync(data, opts){ var src = toU8(data); var body = deflateRaw(src); var ad = adler32(src); var out = new Uint8Array(2 + body.length + 4); out[0] = 0x78; out[1] = 0x9c; out.set(body, 2); var o = 2 + body.length; out[o]=(ad>>>24)&0xff; out[o+1]=(ad>>>16)&0xff; out[o+2]=(ad>>>8)&0xff; out[o+3]=ad&0xff; return globalThis.Buffer.from(out); }
+  function inflateSync(data){ var b = toU8(data); var off = 0; if (b.length >= 2 && (b[0] & 0x0f) === 8 && ((b[0] << 8 | b[1]) % 31) === 0){ off = 2; if (b[1] & 0x20) off += 4; } var end = off === 0 ? b.length : b.length - 4; return globalThis.Buffer.from(inflateRaw(b.subarray(off, end))); }
+  function deflateRawSync(data){ return globalThis.Buffer.from(deflateRaw(toU8(data))); }
+  function inflateRawSync(data){ return globalThis.Buffer.from(inflateRaw(toU8(data))); }
+  function unzipSync(data){ var b = toU8(data); if (b.length >= 2 && b[0] === 0x1f && b[1] === 0x8b) return gunzipSync(b); return inflateSync(b); }
+  // async = sync wrapped in a microtask-resolved callback/Promise (deterministic; the VM has no
+  // background thread, so "async" just defers to the job queue). cb(err,result) Node-style.
+  function mkAsync(syncFn){ return function(data, opts, cb){ if (typeof opts === 'function'){ cb = opts; opts = undefined; } if (typeof cb === 'function'){ queueMicrotask(function(){ var r, e=null; try { r = syncFn(data, opts); } catch(err){ e = err; } cb(e, r); }); return; } return new Promise(function(res, rej){ queueMicrotask(function(){ try { res(syncFn(data, opts)); } catch(err){ rej(err); } }); }); }; }
+  function brotliUnsupported(){ throw new Error('NotSupportedError: brotli is not available in this VM (pure-JS brotli needs the static dictionary). Use gzip/deflate, or fetch with accept-encoding: gzip.'); }
+  return {
+    gzipSync: gzipSync, gunzipSync: gunzipSync, deflateSync: deflateSync, inflateSync: inflateSync,
+    deflateRawSync: deflateRawSync, inflateRawSync: inflateRawSync, unzipSync: unzipSync,
+    gzip: mkAsync(gzipSync), gunzip: mkAsync(gunzipSync), deflate: mkAsync(deflateSync), inflate: mkAsync(inflateSync),
+    deflateRaw: mkAsync(deflateRawSync), inflateRaw: mkAsync(inflateRawSync), unzip: mkAsync(unzipSync),
+    brotliCompressSync: brotliUnsupported, brotliDecompressSync: brotliUnsupported,
+    brotliCompress: function(d,o,cb){ var c = typeof o === 'function' ? o : cb; if (c) queueMicrotask(function(){ c(new Error('NotSupportedError: brotli unavailable in this VM')); }); else return Promise.reject(new Error('NotSupportedError: brotli unavailable in this VM')); },
+    brotliDecompress: function(d,o,cb){ var c = typeof o === 'function' ? o : cb; if (c) queueMicrotask(function(){ c(new Error('NotSupportedError: brotli unavailable in this VM')); }); else return Promise.reject(new Error('NotSupportedError: brotli unavailable in this VM')); },
+    crc32: crc32, adler32: adler32,
+    constants: { Z_NO_FLUSH:0, Z_SYNC_FLUSH:2, Z_FULL_FLUSH:3, Z_FINISH:4, Z_OK:0, Z_STREAM_END:1, Z_BEST_SPEED:1, Z_BEST_COMPRESSION:9, Z_DEFAULT_COMPRESSION:-1 },
+  };
+})();
+
+// ===== url (node:url) — the LEGACY url module (parse/format/resolve/Url) + the WHATWG
+//       URL/URLSearchParams (re-exported from the BOOTSTRAP globals). =====
+var __url = (function(){
+  function Url(){ this.protocol=null; this.slashes=null; this.auth=null; this.host=null; this.port=null; this.hostname=null; this.hash=null; this.search=null; this.query=null; this.pathname=null; this.path=null; this.href=null; }
+  function parse(urlStr, parseQueryString, slashesDenoteHost){
+    var u = new Url(); urlStr = String(urlStr); u.href = urlStr;
+    var rest = urlStr, hashIdx = rest.indexOf('#'); if (hashIdx >= 0){ u.hash = rest.slice(hashIdx); rest = rest.slice(0, hashIdx); }
+    var protoMatch = /^([a-zA-Z][a-zA-Z0-9+.\-]*:)/.exec(rest); if (protoMatch){ u.protocol = protoMatch[1].toLowerCase(); rest = rest.slice(protoMatch[1].length); }
+    var hasSlashes = false; if (rest.slice(0,2) === '//'){ hasSlashes = true; u.slashes = true; rest = rest.slice(2); }
+    if (hasSlashes || (slashesDenoteHost && rest.slice(0,2) === '//')){
+      var pathStart = rest.search(/[\/?#]/); var authority = pathStart < 0 ? rest : rest.slice(0, pathStart); rest = pathStart < 0 ? '' : rest.slice(pathStart);
+      var atIdx = authority.lastIndexOf('@'); if (atIdx >= 0){ u.auth = authority.slice(0, atIdx); authority = authority.slice(atIdx + 1); }
+      u.host = authority.toLowerCase();
+      var portMatch = /:(\d+)$/.exec(authority); if (portMatch){ u.port = portMatch[1]; u.hostname = authority.slice(0, authority.length - portMatch[0].length).toLowerCase(); } else { u.hostname = authority.toLowerCase(); }
+    }
+    var searchIdx = rest.indexOf('?'); if (searchIdx >= 0){ u.search = rest.slice(searchIdx); u.query = parseQueryString ? globalThis.__builtins.querystring.parse(u.search.slice(1)) : u.search.slice(1); rest = rest.slice(0, searchIdx); } else if (parseQueryString){ u.query = {}; }
+    u.pathname = rest || (u.host !== null ? '/' : null);
+    u.path = (u.pathname || '') + (u.search || '') || null;
+    return u;
+  }
+  function format(obj){
+    if (typeof obj === 'string') return obj;
+    if (obj instanceof globalThis.URL) return obj.toString();
+    var proto = obj.protocol || ''; if (proto && proto.slice(-1) !== ':') proto += ':';
+    var host = obj.host || ((obj.hostname || '') + (obj.port ? ':' + obj.port : ''));
+    var auth = obj.auth ? obj.auth + '@' : '';
+    var slashes = (obj.slashes || (host && proto)) ? '//' : '';
+    var pathname = obj.pathname || '';
+    var search = obj.search || (obj.query ? '?' + (typeof obj.query === 'string' ? obj.query : globalThis.__builtins.querystring.stringify(obj.query)) : '');
+    if (search && search[0] !== '?') search = '?' + search;
+    var hash = obj.hash || ''; if (hash && hash[0] !== '#') hash = '#' + hash;
+    return proto + slashes + auth + host + pathname + search + hash;
+  }
+  function resolve(from, to){ try { return new globalThis.URL(to, from).toString(); } catch(e){ if (/^[a-zA-Z][a-zA-Z0-9+.\-]*:/.test(to)) return to; return to; } }
+  function fileURLToPath(u){ var s = (u instanceof globalThis.URL) ? u.toString() : String(u); return s.replace(/^file:\/\//, '') || '/'; }
+  function pathToFileURL(p){ return new globalThis.URL('file://' + (String(p)[0] === '/' ? '' : '/') + String(p)); }
+  function urlToHttpOptions(u){ return { protocol: u.protocol, hostname: typeof u.hostname === 'string' ? u.hostname.replace(/^\[|\]$/g,'') : u.hostname, port: u.port, path: (u.pathname||'') + (u.search||''), hash: u.hash, search: u.search, href: u.href, auth: u.username ? u.username + (u.password ? ':' + u.password : '') : undefined }; }
+  return { parse: parse, format: format, resolve: resolve, Url: Url, URL: globalThis.URL, URLSearchParams: globalThis.URLSearchParams, fileURLToPath: fileURLToPath, pathToFileURL: pathToFileURL, urlToHttpOptions: urlToHttpOptions, domainToASCII: function(d){ return String(d); }, domainToUnicode: function(d){ return String(d); } };
+})();
+
+// ===== http / https (node:http, node:https) — CLIENT ONLY over the binary-safe host.fetch. =====
+// request()/get() return a ClientRequest (a Writable-ish EventEmitter); the response callback gets
+// an IncomingMessage (a Readable EventEmitter) carrying {statusCode, statusMessage, headers} and the
+// body via 'data'/'end' + async-iteration. NO server (createServer throws — servers are EXCLUDED).
+// Backed by globalThis.fetch (the only host effect), so it honours the fetch allowlist + bytes.
+var __http = (function(EventEmitter, defaultProtocol){
+  function normalizeArgs(urlOrOpts, optsOrCb, cb){
+    var opts = {}, callback;
+    if (typeof urlOrOpts === 'string'){ var pu = __url.parse(urlOrOpts); opts.protocol = pu.protocol; opts.hostname = pu.hostname; opts.port = pu.port; opts.path = pu.path || '/'; opts.auth = pu.auth; }
+    else if (urlOrOpts instanceof globalThis.URL){ opts.protocol = urlOrOpts.protocol; opts.hostname = urlOrOpts.hostname; opts.port = urlOrOpts.port; opts.path = (urlOrOpts.pathname||'/') + (urlOrOpts.search||''); opts.auth = urlOrOpts.username ? urlOrOpts.username + (urlOrOpts.password ? ':' + urlOrOpts.password : '') : undefined; }
+    else if (urlOrOpts && typeof urlOrOpts === 'object'){ for (var k in urlOrOpts) opts[k] = urlOrOpts[k]; }
+    if (typeof optsOrCb === 'function'){ callback = optsOrCb; }
+    else if (optsOrCb && typeof optsOrCb === 'object'){ for (var k2 in optsOrCb) opts[k2] = optsOrCb[k2]; if (typeof cb === 'function') callback = cb; }
+    return { opts: opts, callback: callback };
+  }
+  function buildUrl(opts){ var proto = opts.protocol || defaultProtocol; var host = opts.hostname || opts.host || 'localhost'; var port = opts.port ? ':' + opts.port : ''; var path = opts.path || '/'; if (path[0] !== '/') path = '/' + path; return proto + '//' + host + port + path; }
+  function IncomingMessage(){ EventEmitter.call(this); this.statusCode = 0; this.statusMessage = ''; this.headers = {}; this.complete = false; this._body = null; this.aborted = false; this.url = ''; this.method = null; this.socket = {}; }
+  Object.setPrototypeOf(IncomingMessage.prototype, EventEmitter.prototype);
+  IncomingMessage.prototype.setEncoding = function(enc){ this._encoding = enc; return this; };
+  IncomingMessage.prototype.pause = function(){ return this; };
+  IncomingMessage.prototype.resume = function(){ return this; };
+  IncomingMessage.prototype.setTimeout = function(){ return this; };
+  IncomingMessage.prototype.destroy = function(){ this.destroyed = true; return this; };
+  IncomingMessage.prototype[Symbol.asyncIterator] = function(){ var self = this; var done = false, chunk = self._body; return { next: function(){ if (done) return Promise.resolve({ done:true, value:undefined }); done = true; return Promise.resolve({ done:false, value: chunk }); }, return: function(){ done = true; return Promise.resolve({ done:true, value:undefined }); }, [Symbol.asyncIterator]: function(){ return this; } }; };
+  function ClientRequest(opts, callback){ EventEmitter.call(this); this._opts = opts; this._chunks = []; this._ended = false; this._aborted = false; if (callback) this.once('response', callback); }
+  Object.setPrototypeOf(ClientRequest.prototype, EventEmitter.prototype);
+  ClientRequest.prototype.setHeader = function(k, v){ this._opts.headers = this._opts.headers || {}; this._opts.headers[k] = v; return this; };
+  ClientRequest.prototype.getHeader = function(k){ return this._opts.headers && this._opts.headers[k]; };
+  ClientRequest.prototype.removeHeader = function(k){ if (this._opts.headers) delete this._opts.headers[k]; };
+  ClientRequest.prototype.setTimeout = function(){ return this; };
+  ClientRequest.prototype.write = function(chunk){ if (chunk != null) this._chunks.push(typeof chunk === 'string' ? new TextEncoder().encode(chunk) : (chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk))); return true; };
+  ClientRequest.prototype.abort = function(){ this._aborted = true; this.emit('abort'); };
+  ClientRequest.prototype.destroy = function(e){ this._aborted = true; if (e) this.emit('error', e); return this; };
+  ClientRequest.prototype.end = function(chunk){
+    if (this._ended) return this; this._ended = true; var self = this;
+    if (chunk != null) this.write(chunk);
+    var method = (this._opts.method || 'GET').toUpperCase();
+    var init = { method: method, headers: this._opts.headers || {} };
+    if (this._chunks.length){ var total = 0, i; for (i=0;i<this._chunks.length;i++) total += this._chunks[i].length; var body = new Uint8Array(total), off = 0; for (i=0;i<this._chunks.length;i++){ body.set(this._chunks[i], off); off += this._chunks[i].length; } init.body = body; }
+    var url = buildUrl(this._opts);
+    Promise.resolve().then(function(){ return globalThis.fetch(url, init); }).then(function(r){
+      var im = new IncomingMessage(); im.statusCode = r.status; im.statusMessage = r.statusText || ''; im.url = url; im.method = method;
+      var hdrs = {}; if (r.headers && typeof r.headers.forEach === 'function'){ r.headers.forEach(function(v, k){ hdrs[String(k).toLowerCase()] = v; }); } else if (r.headers){ for (var hk in r.headers) hdrs[String(hk).toLowerCase()] = r.headers[hk]; }
+      im.headers = hdrs;
+      self.emit('response', im);
+      return r.arrayBuffer().then(function(ab){ return { im: im, bytes: new Uint8Array(ab) }; });
+    }).then(function(res){
+      var im = res.im; im._body = im._encoding ? globalThis.Buffer.from(res.bytes).toString(im._encoding) : globalThis.Buffer.from(res.bytes);
+      queueMicrotask(function(){ if (im._body != null && im._body.length !== 0) im.emit('data', im._body); im.complete = true; im.emit('end'); im.emit('close'); });
+    }).catch(function(e){ self.emit('error', e instanceof Error ? e : new Error(String(e))); });
+    return this;
+  };
+  function request(a, b, c){ var na = normalizeArgs(a, b, c); na.opts.protocol = na.opts.protocol || defaultProtocol; return new ClientRequest(na.opts, na.callback); }
+  function get(a, b, c){ var req = request(a, b, c); req.end(); return req; }
+  function createServer(){ throw new Error('NotSupportedError: http/https servers are EXCLUDED in this VM (no networking listen). This is a client-only http over the mediated host.fetch.'); }
+  var Agent = function(o){ this.options = o || {}; };
+  return { request: request, get: get, createServer: createServer, IncomingMessage: IncomingMessage, ClientRequest: ClientRequest, Agent: Agent, globalAgent: new Agent(), METHODS: ['GET','POST','PUT','DELETE','HEAD','OPTIONS','PATCH'], STATUS_CODES: { 200:'OK', 201:'Created', 204:'No Content', 301:'Moved Permanently', 302:'Found', 304:'Not Modified', 400:'Bad Request', 401:'Unauthorized', 403:'Forbidden', 404:'Not Found', 500:'Internal Server Error', 502:'Bad Gateway', 503:'Service Unavailable' } };
+})(__events, 'http:');
+// https.request/get must default to https:; a thin variant whose default protocol is https:.
+var __httpsClient = (function(EventEmitter){
+  function req(a, b, c){
+    // reuse the http machinery but force protocol https: when not explicitly set.
+    var url = a, opts = b, cb = c;
+    if (typeof a === 'string'){ var r = __http.request(a, b, c); return r; }
+    if (a instanceof globalThis.URL){ return __http.request(a, b, c); }
+    var o = {}; if (a && typeof a === 'object'){ for (var k in a) o[k] = a[k]; } if (!o.protocol) o.protocol = 'https:'; return __http.request(o, b, c);
+  }
+  function get(a, b, c){ var r = req(a, b, c); r.end(); return r; }
+  var out = {}; for (var k in __http) out[k] = __http[k]; out.request = req; out.get = get; return out;
+})(__events);
+
 globalThis.__builtins = {
-  crypto: {
-    randomBytes: function(n){ var a = new Uint8Array(n); (globalThis.crypto && globalThis.crypto.getRandomValues) ? globalThis.crypto.getRandomValues(a) : a; return a; },
-    randomFillSync: function(buf){ if (globalThis.crypto && globalThis.crypto.getRandomValues) globalThis.crypto.getRandomValues(buf); return buf; },
-    getRandomValues: function(a){ return globalThis.crypto.getRandomValues(a); },
-    randomUUID: function(){ return globalThis.crypto.randomUUID ? globalThis.crypto.randomUUID() : undefined; },
-  },
+  crypto: __crypto,
+  zlib: __zlib,
+  url: __url,
+  http: __http,
+  https: __httpsClient,
   events: __events,
   util: __util,
   path: __path,
@@ -998,16 +1375,19 @@ globalThis.__builtins = {
 // npm packages it must `await use('x')` instead, and the determinism caveats — so it stops
 // hallucinating net/child_process/real-timers. Surfaced to the actor guide in ouru/ax-turn.ts.
 globalThis.__nodeCompat = {
-  builtins: ['assert','buffer','crypto','events','fs','fs/promises','os','path','querystring','stream','stream/promises','string_decoder','string_decoder','util','util/types'].filter(function(v,i,a){ return a.indexOf(v) === i; }),
+  builtins: ['assert','buffer','crypto','events','fs','fs/promises','http','https','os','path','querystring','stream','stream/promises','string_decoder','url','util','util/types','zlib'].filter(function(v,i,a){ return a.indexOf(v) === i; }),
   globals: ['Buffer','TextEncoder','TextDecoder','URL','URLSearchParams','Headers','structuredClone','crypto','fetch','queueMicrotask','setTimeout','setImmediate','process','console','performance'],
-  stdlib: ['fs (in-heap VFS, sync + promises)', 'path (full posix)', 'stream (Readable/Writable/Duplex/Transform/PassThrough + pipeline/finished)', 'util.inspect/format/types/promisify', 'assert (structural deepStrictEqual)', 'Buffer (full read/write matrix)'],
+  stdlib: ['fs (in-heap VFS, sync + promises)', 'path (full posix)', 'stream (Readable/Writable/Duplex/Transform/PassThrough + pipeline/finished)', 'util.inspect/format/types/promisify', 'assert (structural deepStrictEqual)', 'Buffer (full read/write matrix)', 'crypto (randomBytes/randomUUID/randomInt + createHash sha256|sha1|md5 + createHmac + scryptSync)', 'zlib (gzip/gunzip/deflate/inflate sync+async; pure-JS DEFLATE; NO brotli)', 'url (legacy parse/format/resolve + WHATWG URL/URLSearchParams)', 'http/https (CLIENT request/get over host.fetch; NO server)'],
   use: "await use('pkgname') — fetch+eval a self-contained CJS/UMD npm bundle from a CDN (jsDelivr). Async; pin a version with use('pkg@1.2.3'). Use this for any npm package not in builtins.",
-  excluded: ['net','dns','tls','http (server)','https (server)','child_process','cluster','worker_threads','dgram','v8','vm','repl'],
+  excluded: ['net','dns','tls','http-server','https-server','child_process','cluster','worker_threads','dgram','v8','vm','repl'],
   caveats: [
     'Deterministic sandbox: Date.now()/Math.random() are SEEDED (reproducible across restore), not wall-clock/entropy.',
     'Timers are IMMEDIATE: setTimeout/setImmediate fire on the microtask queue ignoring the delay; setInterval is a no-op. No wall-clock timers.',
     'fs is an in-heap virtual filesystem (durable across hibernate), NOT the host disk; sync methods work under the default vfs provider.',
     'fetch() returns a Response-LIKE object (ok/status/headers/text/json/arrayBuffer/bytes), not a true Response instance; it is the only host effect.',
+    'http/https are CLIENT-ONLY over the mediated host.fetch (createServer throws); the response is a Readable IncomingMessage with statusCode/headers + data/end events.',
+    'zlib is pure-JS DEFLATE/INFLATE (gzip/deflate/raw, sync + microtask-async); brotli* is NOT available (no static dictionary).',
+    'crypto.createHash supports sha256/sha1/md5 only; randomBytes/randomUUID/randomInt are SEEDED (deterministic); host crypto global is NOT clobbered by `const crypto = require("crypto")` (it stays cell-local).',
     'No server/networking modules (net/tls/dns/http-server) — this is a compute + mediated-fetch + durable-fs sandbox, not a server runtime.',
     'stream backpressure settles on microtasks (deterministic), so pipe/pipeline complete within the cell drain.',
   ],
