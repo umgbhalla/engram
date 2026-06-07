@@ -507,15 +507,87 @@ globalThis.host = new Proxy({}, {
 // host capability (no fs/process/net identity) and NO non-determinism — they are convenience
 // globals many libraries probe for. All survive hibernation (they live in the heap).
 globalThis.global = globalThis;
-if (typeof globalThis.process === 'undefined') {
-  globalThis.process = {
-    env: {}, argv: [], argv0: 'engram', execPath: '/engram', pid: 1, platform: 'engram',
-    arch: 'wasm', version: 'v0.0.0-engram', versions: { quickjs: '1', engram: '1' },
-    cwd: function(){ return '/'; },
-    nextTick: function(f){ var a = Array.prototype.slice.call(arguments, 1); queueMicrotask(function(){ f.apply(null, a); }); },
-    // no exit/stdin/kill/binding — the sandbox has no process identity.
-  };
-}
+// process — a Node-shaped object so libraries that gate on process.platform / versions.node /
+// process.env / nextTick / hrtime work. WAVE 4 completion: this presents as Node v20 on
+// linux/x64 (the common feature-detect target) instead of the engram/wasm placeholder, populates
+// env from globalThis.__processEnv (the glue MAY seed it from config/ctx; defaults to {}), and adds
+// hrtime/uptime, a CATCHABLE exit (throws ProcessExit — it does NOT kill the kernel), chdir,
+// nextTick, on/once (no-op-ish for 'exit'/'uncaughtException'), and stdout/stderr.write -> console.
+// CAVEATS (determinism): hrtime/uptime are derived from the SEEDED clock (Date.now), NOT a real
+// monotonic clock; argv/pid/platform are fixed; there is no real process to signal or kill.
+// Snapshot-safe (pure heap). RE-SEED on resume: a cold-restored snapshot keeps this object, but the
+// glue may re-eval the env line; process.env stays a plain mutable object across hibernate.
+(function(){
+  var p = globalThis.process;
+  if (!p || typeof p !== 'object') { p = {}; globalThis.process = p; }
+  // env: plain object; seed from the glue-provided __processEnv (config/ctx) when present.
+  if (!p.env || typeof p.env !== 'object') {
+    p.env = (globalThis.__processEnv && typeof globalThis.__processEnv === 'object') ? globalThis.__processEnv : {};
+  }
+  p.argv = ['node', 'repl'];
+  p.argv0 = 'node';
+  p.execPath = '/usr/local/bin/node';
+  p.execArgv = [];
+  p.pid = 1; p.ppid = 0;
+  p.platform = 'linux';
+  p.arch = 'x64';
+  p.version = 'v20.11.1';
+  p.versions = { node: '20.11.1', v8: '11.3.244.8-node.17', uv: '1.46.0', zlib: '1.2.13.1-motley', quickjs: '1', engram: '1', modules: '115', openssl: '3.0.12+quic' };
+  p.release = { name: 'node', sourceUrl: '', headersUrl: '', lts: 'Iron' };
+  p.title = 'node';
+  p.allowedNodeEnvironmentFlags = (typeof Set !== 'undefined') ? new Set() : { has: function(){ return false; } };
+  p.config = { target_defaults: {}, variables: {} };
+  p.features = { inspector: false, debug: false, uv: true, ipv6: true, tls: false, cached_builtins: true };
+  p.cwd = function(){ return globalThis.__cwd || '/'; };
+  p.chdir = function(d){ globalThis.__cwd = (typeof d === 'string' && d) ? d : '/'; };
+  p.umask = function(){ return 0; };
+  p.getuid = function(){ return 0; }; p.getgid = function(){ return 0; };
+  p.geteuid = function(){ return 0; }; p.getegid = function(){ return 0; };
+  p.memoryUsage = function(){ return { rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }; };
+  p.memoryUsage.rss = function(){ return 0; };
+  p.cpuUsage = function(){ return { user: 0, system: 0 }; };
+  p.resourceUsage = function(){ return {}; };
+  p.nextTick = function(f){ var a = Array.prototype.slice.call(arguments, 1); queueMicrotask(function(){ if (typeof f === 'function') f.apply(null, a); }); };
+  // hrtime: [seconds, nanoseconds] from the SEEDED clock (ms granularity → ns is zero-padded).
+  // hrtime(prev) returns the delta. hrtime.bigint() returns nanoseconds as a BigInt.
+  function __nowMs(){ try { return Date.now(); } catch(e){ return 0; } }
+  p.hrtime = function(prev){ var ms = __nowMs(); var s = Math.floor(ms / 1000); var ns = (ms % 1000) * 1e6; if (prev && prev.length === 2){ var ds = s - prev[0], dn = ns - prev[1]; if (dn < 0){ ds -= 1; dn += 1e9; } return [ds, dn]; } return [s, ns]; };
+  p.hrtime.bigint = function(){ try { return BigInt(__nowMs()) * 1000000n; } catch(e){ return 0n; } };
+  // uptime: seconds since the FIRST hrtime/uptime observation (seeded clock).
+  globalThis.__procT0 = (globalThis.__procT0 === undefined) ? __nowMs() : globalThis.__procT0;
+  p.uptime = function(){ return (__nowMs() - globalThis.__procT0) / 1000; };
+  // exit(code): throws a CATCHABLE ProcessExit (does NOT terminate the kernel — there is no real
+  // process). The cell sees an Error with .code; outer harness logic that relied on a hard exit
+  // instead gets a recoverable throw. exitCode is recorded for libraries that read it.
+  function ProcessExit(code){ var e = new Error('process.exit(' + (code|0) + ') called'); e.name = 'ProcessExit'; e.code = code|0; e.processExit = true; return e; }
+  p.exit = function(code){ if (code !== undefined) p.exitCode = code|0; throw ProcessExit(code === undefined ? (p.exitCode|0) : code); };
+  p.exitCode = 0;
+  p.abort = function(){ throw ProcessExit(134); };
+  p.kill = function(){ return true; }; // no real process to signal; report success.
+  // EventEmitter-ish on/once/off for 'exit'/'uncaughtException'/'warning'/'beforeExit' etc.
+  // These are stored but, by the determinism/snapshot model, NOT auto-fired by the runtime (there
+  // is no real process lifecycle). A cell may emit() them manually. Listeners are kept on the heap.
+  p._ev = p._ev || {};
+  p.on = function(ev, fn){ (p._ev[ev] = p._ev[ev] || []).push(fn); return p; };
+  p.addListener = p.on;
+  p.once = function(ev, fn){ var g = function(){ p.off(ev, g); return fn.apply(this, arguments); }; g.listener = fn; return p.on(ev, g); };
+  p.off = function(ev, fn){ if (p._ev[ev]) p._ev[ev] = p._ev[ev].filter(function(g){ return g !== fn && g.listener !== fn; }); return p; };
+  p.removeListener = p.off;
+  p.removeAllListeners = function(ev){ if (ev === undefined) p._ev = {}; else delete p._ev[ev]; return p; };
+  p.listeners = function(ev){ return (p._ev[ev] || []).slice(); };
+  p.listenerCount = function(ev){ return (p._ev[ev] || []).length; };
+  p.emit = function(ev){ var a = Array.prototype.slice.call(arguments, 1); var ls = p._ev[ev]; if (!ls || !ls.length) return false; ls.slice().forEach(function(f){ try { f.apply(p, a); } catch(e){} }); return true; };
+  p.prependListener = p.on; p.eventNames = function(){ return Object.keys(p._ev); };
+  p.setMaxListeners = function(){ return p; }; p.getMaxListeners = function(){ return 10; };
+  p.emitWarning = function(w){ try { console.warn('Warning: ' + (w && w.message ? w.message : w)); } catch(e){} };
+  // stdout/stderr: write-only sinks routed to console (the only output channel). isTTY=false.
+  function mkStream(level){ return { write: function(chunk){ try { var s = (chunk instanceof Uint8Array) ? new TextDecoder().decode(chunk) : String(chunk); s = s.replace(/\n$/, ''); if (s.length) console[level](s); } catch(e){} return true; }, end: function(){}, on: function(){ return this; }, once: function(){ return this; }, isTTY: false, fd: level === 'error' ? 2 : 1, columns: 80, rows: 24, cork: function(){}, uncork: function(){}, setDefaultEncoding: function(){ return this; } }; }
+  p.stdout = mkStream('log');
+  p.stderr = mkStream('error');
+  p.stdin = { read: function(){ return null; }, on: function(){ return this; }, once: function(){ return this; }, resume: function(){ return this; }, pause: function(){ return this; }, setEncoding: function(){ return this; }, pipe: function(d){ return d; }, isTTY: false, fd: 0 };
+  p.binding = function(){ throw new Error("process.binding is not supported in this sandbox"); };
+  p.hasUncaughtExceptionCaptureCallback = function(){ return false; };
+})();
 // Timers — IMMEDIATE semantics. setTimeout/setImmediate fire on the microtask queue and IGNORE
 // the delay, so they complete WITHIN the cell's settle drain — deterministic and hibernation-safe
 // (no timer ever spans a snapshot). setInterval is a NO-OP (a real repeating timer can't survive
@@ -531,48 +603,209 @@ if (typeof globalThis.setTimeout === 'undefined') {
   globalThis.setInterval = function(){ return __tid++; };   // no-op: no repeating timers
   globalThis.clearInterval = function(){};
 }
-// fetch() as a BINARY-SAFE Response-like wrapper over the mediated, allowlisted host.fetch bridge.
-// ADR-0012: the host carries RAW BYTES across the JSON boundary as base64 (`bodyB64`), the same
-// pattern the R2 fs op uses. `.arrayBuffer()` base64-decodes to EXACT bytes (git packfiles work);
-// `.text()`/`.json()` use the utf8 view; a binary REQUEST body (Uint8Array/ArrayBuffer) is base64-
-// encoded into `init.bodyB64` before the host call. The legacy string `r.body` still works.
+// base64<->bytes helpers shared by fetch, Response/Request/Blob bodies, and FormData.
 (function(){
   function __b64ToBytes(b64){ var bin = atob(b64 || ''); var out = new Uint8Array(bin.length); for (var i=0;i<bin.length;i++) out[i] = bin.charCodeAt(i); return out; }
   function __bytesToB64(u8){ var s = '', CH = 0x8000; for (var i=0;i<u8.length;i+=CH){ s += String.fromCharCode.apply(null, u8.subarray(i, i+CH)); } return btoa(s); }
   globalThis.__fetchB64 = { enc: __bytesToB64, dec: __b64ToBytes };
 })();
-if (typeof globalThis.fetch === 'undefined') {
-  globalThis.fetch = async function(url, init){
-    var u = typeof url === 'string' ? url : String(url);
-    // Binary REQUEST body: convert a Uint8Array/ArrayBuffer/typed-array body to base64 (`bodyB64`)
-    // so it survives the JSON host boundary as exact bytes. A string body passes through unchanged.
-    var sendInit = init;
-    if (init && init.body != null && typeof init.body !== 'string') {
-      var rb = init.body, reqBytes = null;
-      if (rb instanceof Uint8Array) reqBytes = rb;
-      else if (rb instanceof ArrayBuffer) reqBytes = new Uint8Array(rb);
-      else if (rb && rb.buffer instanceof ArrayBuffer) reqBytes = new Uint8Array(rb.buffer, rb.byteOffset||0, rb.byteLength);
-      if (reqBytes) { sendInit = {}; for (var k in init) if (k !== 'body') sendInit[k] = init[k]; sendInit.bodyB64 = globalThis.__fetchB64.enc(reqBytes); }
+
+// ===== WAVE 4 — REAL WHATWG fetch types (Blob/FormData/AbortController/AbortSignal/Request/
+//        Response) + fetch() resolving to a real Response over the binary-safe host.fetch. =====
+// The fetch idiom `const r = await fetch(u); if (r.ok) return r.json()` now works against a true
+// Response instance (instanceof Response, .clone(), .blob(), Headers, AbortController). Bytes still
+// cross the JSON host boundary as base64 (`bodyB64`) exactly as before, so git packfiles / PDFs are
+// byte-exact. BACKWARD-COMPAT: the prior plain-object shape (ok/status/statusText/url/headers +
+// .arrayBuffer()/.bytes()/.text()/.json()) is a strict subset of the Response surface, so existing
+// code doing `await (await fetch(u)).arrayBuffer()` / `.json()` is unchanged. Pure in-VM,
+// snapshot-persisted, deterministic (no host entropy; abort uses the same microtask model).
+(function(){
+  var ENC = new TextEncoder(), DEC = new TextDecoder(), B64 = globalThis.__fetchB64;
+
+  // ---- Blob ----
+  function Blob(parts, opts){
+    opts = opts || {};
+    var chunks = [];
+    if (parts && typeof parts[Symbol.iterator] === 'function'){
+      for (var part of parts){
+        if (part instanceof Blob) chunks.push(part._bytes());
+        else if (part instanceof Uint8Array) chunks.push(part.slice());
+        else if (part instanceof ArrayBuffer) chunks.push(new Uint8Array(part.slice(0)));
+        else if (part && part.buffer instanceof ArrayBuffer) chunks.push(new Uint8Array(part.buffer.slice(part.byteOffset||0, (part.byteOffset||0)+part.byteLength)));
+        else chunks.push(ENC.encode(String(part)));
+      }
     }
-    var r = await globalThis.host.fetch(u, sendInit);
-    var _bytes = null;
-    function bytes(){ if (_bytes) return _bytes; _bytes = (typeof r.bodyB64 === 'string') ? globalThis.__fetchB64.dec(r.bodyB64) : new TextEncoder().encode(r.body || ''); return _bytes; }
-    // r.body is a CAPPED utf8 PREVIEW (the host truncates big bodies — see FETCH_BODY_UTF8_PREVIEW_BYTES).
-    // Use it directly ONLY when it is the WHOLE body (!r.bodyTruncated); otherwise decode the exact,
-    // full bytes from bodyB64 so .text()/.json() never return a truncated string.
-    function fullText(){ return (typeof r.body === 'string' && !r.bodyTruncated) ? r.body : new TextDecoder().decode(bytes()); }
-    return {
-      ok: !!r.ok, status: r.status|0, statusText: r.statusText || '', url: u,
-      headers: (typeof Headers !== 'undefined') ? new Headers(r.headers || {}) : (r.headers || {}),
-      // exact bytes (base64-decoded) — the binary path git transfers need.
-      arrayBuffer: async function(){ var b = bytes(); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); },
-      bytes: async function(){ return bytes().slice(); },
-      // text/json: full body (preview when complete, else exact bytes from bodyB64).
-      text: async function(){ return fullText(); },
-      json: async function(){ return JSON.parse(fullText()); },
+    var total = 0, i; for (i=0;i<chunks.length;i++) total += chunks[i].length;
+    var all = new Uint8Array(total), off = 0; for (i=0;i<chunks.length;i++){ all.set(chunks[i], off); off += chunks[i].length; }
+    this._buf = all;
+    this.size = all.length;
+    this.type = opts.type ? String(opts.type).toLowerCase() : '';
+  }
+  Blob.prototype._bytes = function(){ return this._buf; };
+  Blob.prototype.arrayBuffer = function(){ var b = this._buf; return Promise.resolve(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength)); };
+  Blob.prototype.bytes = function(){ return Promise.resolve(this._buf.slice()); };
+  Blob.prototype.text = function(){ var self = this; return Promise.resolve(DEC.decode(self._buf)); };
+  Blob.prototype.slice = function(start, end, type){ var len = this.size; var s = start === undefined ? 0 : (start < 0 ? Math.max(len + start, 0) : Math.min(start, len)); var e = end === undefined ? len : (end < 0 ? Math.max(len + end, 0) : Math.min(end, len)); var sub = this._buf.subarray(s, Math.max(s, e)); var b = new Blob([], { type: type || '' }); b._buf = sub.slice(); b.size = b._buf.length; return b; };
+  Blob.prototype.stream = function(){ var self = this; if (globalThis.__builtins && globalThis.__builtins.stream){ var rd = new globalThis.__builtins.stream.Readable({ read: function(){} }); queueMicrotask(function(){ rd.push(self._buf.slice()); rd.push(null); }); return rd; } throw new Error('Blob.stream requires the stream module'); };
+  globalThis.Blob = globalThis.Blob || Blob;
+  function File(parts, name, opts){ Blob.call(this, parts, opts); this.name = String(name); this.lastModified = (opts && opts.lastModified) || 0; }
+  File.prototype = Object.create(Blob.prototype); File.prototype.constructor = File;
+  globalThis.File = globalThis.File || File;
+
+  // ---- FormData ----
+  function FormData(){ this._l = []; }
+  function toEntryVal(v, filename){ if (v instanceof Blob) { if (filename !== undefined && !(v instanceof File)){ var f = new File([v._bytes()], filename, { type: v.type }); return f; } return v; } return String(v); }
+  FormData.prototype.append = function(name, value, filename){ this._l.push([String(name), toEntryVal(value, filename)]); };
+  FormData.prototype.set = function(name, value, filename){ name = String(name); var done = false; this._l = this._l.filter(function(p){ if (p[0] === name){ if (!done){ p[1] = toEntryVal(value, filename); done = true; return true; } return false; } return true; }); if (!done) this._l.push([name, toEntryVal(value, filename)]); };
+  FormData.prototype.get = function(name){ name = String(name); for (var i=0;i<this._l.length;i++) if (this._l[i][0] === name) return this._l[i][1]; return null; };
+  FormData.prototype.getAll = function(name){ name = String(name); return this._l.filter(function(p){ return p[0] === name; }).map(function(p){ return p[1]; }); };
+  FormData.prototype.has = function(name){ name = String(name); return this._l.some(function(p){ return p[0] === name; }); };
+  FormData.prototype.delete = function(name){ name = String(name); this._l = this._l.filter(function(p){ return p[0] !== name; }); };
+  FormData.prototype.forEach = function(cb, t){ this._l.forEach(function(p){ cb.call(t, p[1], p[0], this); }, this); };
+  FormData.prototype.keys = function(){ return this._l.map(function(p){ return p[0]; })[Symbol.iterator](); };
+  FormData.prototype.values = function(){ return this._l.map(function(p){ return p[1]; })[Symbol.iterator](); };
+  FormData.prototype.entries = function(){ return this._l.map(function(p){ return [p[0], p[1]]; })[Symbol.iterator](); };
+  FormData.prototype[Symbol.iterator] = FormData.prototype.entries;
+  globalThis.FormData = globalThis.FormData || FormData;
+
+  // ---- AbortSignal / AbortController ----
+  // Determinism: timeout() fires on the microtask queue (immediate, like setTimeout in this VM) —
+  // there is no wall clock, so AbortSignal.timeout(ms) aborts ~now, not after ms. aborted/reason
+  // and the 'abort' event work so fetch({signal}) rejects with the reason.
+  function AbortSignal(){ this.aborted = false; this.reason = undefined; this._cbs = []; this.onabort = null; }
+  AbortSignal.prototype.addEventListener = function(type, cb){ if (type === 'abort' && typeof cb === 'function') this._cbs.push(cb); };
+  AbortSignal.prototype.removeEventListener = function(type, cb){ if (type === 'abort') this._cbs = this._cbs.filter(function(f){ return f !== cb; }); };
+  AbortSignal.prototype.dispatchEvent = function(ev){ var self = this; this._cbs.slice().forEach(function(f){ try { f.call(self, ev); } catch(e){} }); if (typeof this.onabort === 'function'){ try { this.onabort.call(this, ev); } catch(e){} } return true; };
+  AbortSignal.prototype.throwIfAborted = function(){ if (this.aborted) throw this.reason; };
+  function __abort(sig, reason){ if (sig.aborted) return; sig.aborted = true; sig.reason = (reason !== undefined) ? reason : (function(){ var e = new Error('The operation was aborted.'); e.name = 'AbortError'; return e; })(); sig.dispatchEvent({ type: 'abort', target: sig }); }
+  AbortSignal.abort = function(reason){ var s = new AbortSignal(); s.aborted = true; s.reason = (reason !== undefined) ? reason : (function(){ var e = new Error('The operation was aborted.'); e.name = 'AbortError'; return e; })(); return s; };
+  AbortSignal.timeout = function(){ var s = new AbortSignal(); queueMicrotask(function(){ var e = new Error('The operation timed out.'); e.name = 'TimeoutError'; __abort(s, e); }); return s; };
+  AbortSignal.any = function(signals){ var out = new AbortSignal(); var arr = Array.from(signals || []); for (var i=0;i<arr.length;i++){ var s = arr[i]; if (s && s.aborted){ out.aborted = true; out.reason = s.reason; return out; } } arr.forEach(function(s){ if (s && typeof s.addEventListener === 'function') s.addEventListener('abort', function(){ __abort(out, s.reason); }); }); return out; };
+  globalThis.AbortSignal = globalThis.AbortSignal || AbortSignal;
+  function AbortController(){ this.signal = new (globalThis.AbortSignal || AbortSignal)(); }
+  AbortController.prototype.abort = function(reason){ __abort(this.signal, reason); };
+  globalThis.AbortController = globalThis.AbortController || AbortController;
+  globalThis.__abortSignal = __abort; // internal: used by fetch to honour an aborting signal.
+
+  // ---- Body mixin (shared by Request + Response): bytes/arrayBuffer/text/json/blob/formData ----
+  function bodyToBytes(body){
+    if (body == null) return new Uint8Array(0);
+    if (typeof body === 'string') return ENC.encode(body);
+    if (body instanceof Uint8Array) return body.slice();
+    if (body instanceof ArrayBuffer) return new Uint8Array(body.slice(0));
+    if (body && body.buffer instanceof ArrayBuffer && typeof body.byteLength === 'number') return new Uint8Array(body.buffer.slice(body.byteOffset||0, (body.byteOffset||0)+body.byteLength));
+    if (globalThis.Blob && body instanceof globalThis.Blob) return body._bytes().slice();
+    if (globalThis.URLSearchParams && body instanceof globalThis.URLSearchParams) return ENC.encode(body.toString());
+    if (globalThis.FormData && body instanceof globalThis.FormData){
+      // multipart-ish flattening to urlencoded for the common JSON-API case (no real boundary).
+      var usp = new globalThis.URLSearchParams(); body.forEach(function(v, k){ usp.append(k, (v instanceof Blob) ? '[blob]' : v); }); return ENC.encode(usp.toString());
+    }
+    return ENC.encode(String(body));
+  }
+  // contentType inferred from a body when the caller did not set one (WHATWG default).
+  function inferContentType(body){
+    if (typeof body === 'string') return 'text/plain;charset=UTF-8';
+    if (globalThis.URLSearchParams && body instanceof globalThis.URLSearchParams) return 'application/x-www-form-urlencoded;charset=UTF-8';
+    if (globalThis.Blob && body instanceof globalThis.Blob && body.type) return body.type;
+    if (globalThis.FormData && body instanceof globalThis.FormData) return 'application/x-www-form-urlencoded;charset=UTF-8';
+    return null;
+  }
+  function installBody(proto){
+    proto.arrayBuffer = function(){ if (this.bodyUsed) return Promise.reject(new TypeError('Body has already been consumed.')); this.bodyUsed = true; var b = this._buf; return Promise.resolve(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength)); };
+    proto.bytes = function(){ if (this.bodyUsed) return Promise.reject(new TypeError('Body has already been consumed.')); this.bodyUsed = true; return Promise.resolve(this._buf.slice()); };
+    proto.text = function(){ if (this.bodyUsed) return Promise.reject(new TypeError('Body has already been consumed.')); this.bodyUsed = true; var self = this; return Promise.resolve(self._fullText ? self._fullText() : DEC.decode(self._buf)); };
+    proto.json = function(){ return this.text().then(function(t){ return JSON.parse(t); }); };
+    proto.blob = function(){ if (this.bodyUsed) return Promise.reject(new TypeError('Body has already been consumed.')); this.bodyUsed = true; var ct = (this.headers && this.headers.get && this.headers.get('content-type')) || ''; return Promise.resolve(new globalThis.Blob([this._buf.slice()], { type: ct })); };
+    proto.formData = function(){ return this.text().then(function(t){ var fd = new globalThis.FormData(); var usp = new globalThis.URLSearchParams(t); usp.forEach(function(v, k){ fd.append(k, v); }); return fd; }); };
+  }
+
+  // ---- Request ----
+  function Request(input, init){
+    init = init || {};
+    if (input instanceof Request){ this.url = input.url; this.method = init.method ? String(init.method).toUpperCase() : input.method; this._buf = (init.body != null) ? bodyToBytes(init.body) : input._buf.slice(); this.headers = new globalThis.Headers(init.headers || input.headers); this.signal = init.signal || input.signal || null; }
+    else { this.url = String(input); this.method = init.method ? String(init.method).toUpperCase() : 'GET'; this._buf = bodyToBytes(init.body); this.headers = new globalThis.Headers(init.headers || {}); this.signal = init.signal || null; }
+    this.bodyUsed = false;
+    this.redirect = init.redirect || 'follow';
+    this.credentials = init.credentials || 'same-origin';
+    this.mode = init.mode || 'cors';
+    this.cache = init.cache || 'default';
+    this.referrer = init.referrer || 'about:client';
+    this.integrity = init.integrity || '';
+    if ((init.body != null || (input instanceof Request && input._buf.length)) && !this.headers.has('content-type')){ var ct = inferContentType(init.body != null ? init.body : null); if (ct) this.headers.set('content-type', ct); }
+  }
+  installBody(Request.prototype);
+  Request.prototype.clone = function(){ var r = new Request(this.url, { method: this.method, headers: this.headers, signal: this.signal }); r._buf = this._buf.slice(); r.bodyUsed = false; return r; };
+  globalThis.Request = globalThis.Request || Request;
+
+  // ---- Response ----
+  function Response(body, init){
+    init = init || {};
+    this.status = (init.status === undefined) ? 200 : (init.status|0);
+    this.statusText = init.statusText !== undefined ? String(init.statusText) : '';
+    this.headers = new globalThis.Headers(init.headers || {});
+    this.ok = this.status >= 200 && this.status < 300;
+    this.url = init.url || '';
+    this.redirected = !!init.redirected;
+    this.type = init.type || 'default';
+    this.bodyUsed = false;
+    // null body for 204/205/304 (per spec) — but accept any body otherwise.
+    this._buf = (body == null) ? new Uint8Array(0) : bodyToBytes(body);
+    if (body != null && !this.headers.has('content-type')){ var ct = inferContentType(body); if (ct) this.headers.set('content-type', ct); }
+    // _fullText hook lets fetch() supply the host's utf8 preview when the body is complete.
+    this._fullText = null;
+  }
+  installBody(Response.prototype);
+  Object.defineProperty(Response.prototype, 'body', { get: function(){ var self = this; if (globalThis.__builtins && globalThis.__builtins.stream){ var rd = new globalThis.__builtins.stream.Readable({ read: function(){} }); queueMicrotask(function(){ rd.push(self._buf.slice()); rd.push(null); }); return rd; } return null; }, configurable: true });
+  Response.prototype.clone = function(){ var r = new Response(this._buf.slice(), { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url, redirected: this.redirected, type: this.type }); r.bodyUsed = false; r._fullText = this._fullText; return r; };
+  Response.json = function(data, init){ init = init || {}; var h = new globalThis.Headers(init.headers || {}); if (!h.has('content-type')) h.set('content-type', 'application/json'); var r = new Response(JSON.stringify(data), { status: init.status, statusText: init.statusText, headers: h }); return r; };
+  Response.error = function(){ var r = new Response(null, { status: 0 }); r.type = 'error'; r.ok = false; return r; };
+  Response.redirect = function(url, status){ status = status || 302; var r = new Response(null, { status: status }); r.headers.set('location', String(url)); return r; };
+  globalThis.Response = globalThis.Response || Response;
+
+  // ---- fetch(): resolve to a real Response over the binary-safe host.fetch bytes ----
+  if (typeof globalThis.fetch === 'undefined' || !globalThis.__realFetch) {
+    globalThis.fetch = function(input, init){
+      // Accept a Request as the first arg (input.url + its method/headers/body/signal).
+      var req = (input instanceof globalThis.Request) ? input : new globalThis.Request(input, init || {});
+      var u = req.url;
+      var signal = req.signal;
+      // If already aborted, reject immediately with the reason.
+      if (signal && signal.aborted) return Promise.reject(signal.reason || (function(){ var e = new Error('The operation was aborted.'); e.name = 'AbortError'; return e; })());
+      // Build the host init: method, headers (plain object), and a binary-safe body (bodyB64).
+      var hdrObj = {}; req.headers.forEach(function(v, k){ hdrObj[k] = v; });
+      var sendInit = { method: req.method, headers: hdrObj };
+      if (req._buf && req._buf.length){ sendInit.bodyB64 = B64.enc(req._buf); }
+      else if (init && init.body != null && typeof init.body === 'string'){ sendInit.body = init.body; }
+      var hostPromise = globalThis.host.fetch(u, sendInit).then(function(r){
+        var _bytes = null;
+        function bytes(){ if (_bytes) return _bytes; _bytes = (typeof r.bodyB64 === 'string') ? B64.dec(r.bodyB64) : ENC.encode(r.body || ''); return _bytes; }
+        // r.body is a CAPPED utf8 PREVIEW (host truncates big bodies). Use it ONLY when it is the
+        // WHOLE body (!r.bodyTruncated); else decode exact bytes from bodyB64 (so .text()/.json()
+        // are never truncated). This preserves the prior fullText() semantics on the new Response.
+        var resp = new globalThis.Response(bytes(), {
+          status: r.status|0,
+          statusText: r.statusText || '',
+          headers: r.headers || {},
+          url: r.url || u,
+          redirected: !!r.redirected,
+        });
+        resp._fullText = function(){ return (typeof r.body === 'string' && !r.bodyTruncated) ? r.body : DEC.decode(bytes()); };
+        return resp;
+      });
+      // Wire the signal: reject the fetch promise on abort (the host call resolves independently;
+      // the abort just wins the race for the caller). Deterministic — abort fires on a microtask.
+      if (signal){
+        return new Promise(function(resolve, reject){
+          var settled = false;
+          signal.addEventListener('abort', function(){ if (!settled){ settled = true; reject(signal.reason || (function(){ var e = new Error('The operation was aborted.'); e.name = 'AbortError'; return e; })()); } });
+          hostPromise.then(function(v){ if (!settled){ settled = true; resolve(v); } }, function(e){ if (!settled){ settled = true; reject(e); } });
+        });
+      }
+      return hostPromise;
     };
-  };
-}
+    globalThis.__realFetch = true;
+  }
+})();
 // console.dir/group/table over the existing capture + __preview.
 globalThis.console.dir      = function(x, o){ globalThis.console.log(globalThis.__preview(x, (o && o.depth) || 4)); };
 globalThis.console.group    = function(){ globalThis.console.log.apply(null, arguments); };
@@ -1376,18 +1609,21 @@ globalThis.__builtins = {
 // hallucinating net/child_process/real-timers. Surfaced to the actor guide in ouru/ax-turn.ts.
 globalThis.__nodeCompat = {
   builtins: ['assert','buffer','crypto','events','fs','fs/promises','http','https','os','path','querystring','stream','stream/promises','string_decoder','url','util','util/types','zlib'].filter(function(v,i,a){ return a.indexOf(v) === i; }),
-  globals: ['Buffer','TextEncoder','TextDecoder','URL','URLSearchParams','Headers','structuredClone','crypto','fetch','queueMicrotask','setTimeout','setImmediate','process','console','performance'],
-  stdlib: ['fs (in-heap VFS, sync + promises)', 'path (full posix)', 'stream (Readable/Writable/Duplex/Transform/PassThrough + pipeline/finished)', 'util.inspect/format/types/promisify', 'assert (structural deepStrictEqual)', 'Buffer (full read/write matrix)', 'crypto (randomBytes/randomUUID/randomInt + createHash sha256|sha1|md5 + createHmac + scryptSync)', 'zlib (gzip/gunzip/deflate/inflate sync+async; pure-JS DEFLATE; NO brotli)', 'url (legacy parse/format/resolve + WHATWG URL/URLSearchParams)', 'http/https (CLIENT request/get over host.fetch; NO server)'],
-  use: "await use('pkgname') — fetch+eval a self-contained CJS/UMD npm bundle from a CDN (jsDelivr). Async; pin a version with use('pkg@1.2.3'). Use this for any npm package not in builtins.",
+  globals: ['Buffer','TextEncoder','TextDecoder','URL','URLSearchParams','Headers','Request','Response','Blob','File','FormData','AbortController','AbortSignal','structuredClone','crypto','fetch','queueMicrotask','setTimeout','setImmediate','process','console','performance'],
+  stdlib: ['fs (in-heap VFS, sync + promises + createReadStream/createWriteStream + readdir withFileTypes Dirent)', 'path (full posix)', 'stream (Readable/Writable/Duplex/Transform/PassThrough + pipeline/finished)', 'util.inspect/format/types/promisify', 'assert (structural deepStrictEqual)', 'Buffer (full read/write matrix)', 'crypto (randomBytes/randomUUID/randomInt + createHash sha256|sha1|md5 + createHmac + scryptSync)', 'zlib (gzip/gunzip/deflate/inflate sync+async; pure-JS DEFLATE; NO brotli)', 'url (legacy parse/format/resolve + WHATWG URL/URLSearchParams)', 'http/https (CLIENT request/get over host.fetch; NO server)', 'WHATWG fetch: fetch()->Response + Request/Response/Headers/Blob/File/FormData/AbortController'],
+  use: "await use('pkgname') — fetch+eval a self-contained CJS/UMD npm bundle from a CDN (esm.sh ?bundle&cjs, then jsDelivr). Async; pin a version with use('pkg@1.2.3'); override the URL with use('pkg', {url}). ESM-only packages surface an actionable error suggesting the esm.sh ?bundle CJS build. Use this for any npm package not in builtins.",
   excluded: ['net','dns','tls','http-server','https-server','child_process','cluster','worker_threads','dgram','v8','vm','repl'],
   caveats: [
     'Deterministic sandbox: Date.now()/Math.random() are SEEDED (reproducible across restore), not wall-clock/entropy.',
     'Timers are IMMEDIATE: setTimeout/setImmediate fire on the microtask queue ignoring the delay; setInterval is a no-op. No wall-clock timers.',
-    'fs is an in-heap virtual filesystem (durable across hibernate), NOT the host disk; sync methods work under the default vfs provider.',
-    'fetch() returns a Response-LIKE object (ok/status/headers/text/json/arrayBuffer/bytes), not a true Response instance; it is the only host effect.',
+    'fs is an in-heap virtual filesystem (durable across hibernate), NOT the host disk; sync methods work under the default vfs provider. createReadStream/createWriteStream stream over the VFS bytes; readdirSync(dir,{withFileTypes:true}) returns Dirent[].',
+    'fetch() resolves to a REAL Response (ok/status/statusText/headers:Headers/url/redirected/.json()/.text()/.arrayBuffer()/.bytes()/.blob()/.clone()); new Request/Response/Headers/Blob/FormData and AbortController all work; bytes cross the host boundary base64-exact. It is the only host effect.',
+    'AbortSignal.timeout(ms) aborts on the microtask queue (~immediately), not after ms — there is no wall clock; fetch({signal}) rejects with an AbortError/TimeoutError when the signal aborts.',
     'http/https are CLIENT-ONLY over the mediated host.fetch (createServer throws); the response is a Readable IncomingMessage with statusCode/headers + data/end events.',
     'zlib is pure-JS DEFLATE/INFLATE (gzip/deflate/raw, sync + microtask-async); brotli* is NOT available (no static dictionary).',
     'crypto.createHash supports sha256/sha1/md5 only; randomBytes/randomUUID/randomInt are SEEDED (deterministic); host crypto global is NOT clobbered by `const crypto = require("crypto")` (it stays cell-local).',
+    'process presents as Node v20 on linux/x64 (process.platform/arch/versions.node/env/nextTick/hrtime); process.exit(code) throws a CATCHABLE ProcessExit and does NOT kill the kernel.',
+    'A cell may end with a top-level `return <expr>` (its completion value) OR a trailing expression — both work.',
     'No server/networking modules (net/tls/dns/http-server) — this is a compute + mediated-fetch + durable-fs sandbox, not a server runtime.',
     'stream backpressure settles on microtasks (deterministic), so pipe/pipeline complete within the cell drain.',
   ],
@@ -1456,7 +1692,17 @@ globalThis.__vfs = globalThis.__vfs || { files: {}, dirs: { '/': true } };
   function readFileSync(p, enc){ p = norm(p); var f = V.files[p]; if (!f){ if (V.dirs[p]) throw EISDIR(p); throw ENOENT(p); } return decode(f.data, enc && enc.encoding ? enc.encoding : enc); }
   function unlinkSync(p){ p = norm(p); if (!V.files[p]) throw ENOENT(p); delete V.files[p]; }
   function rmSync(p, opts){ p = norm(p); var rec = opts && opts.recursive, force = opts && opts.force; if (V.files[p]) { delete V.files[p]; return; } if (V.dirs[p]) { if (rec){ Object.keys(V.files).forEach(function(k){ if (k === p || k.indexOf(p + '/') === 0) delete V.files[k]; }); Object.keys(V.dirs).forEach(function(k){ if (k === p || k.indexOf(p + '/') === 0) delete V.dirs[k]; }); } else { delete V.dirs[p]; } return; } if (!force) throw ENOENT(p); }
-  function readdirSync(p){ p = norm(p); if (!V.dirs[p] && p !== '/') throw ENOENT(p); var set = {}, pre = p === '/' ? '/' : p + '/'; function add(k){ if (k.indexOf(pre) === 0){ var rest = k.slice(pre.length); if (rest){ var name = rest.split('/')[0]; if (name) set[name] = true; } } } Object.keys(V.files).forEach(add); Object.keys(V.dirs).forEach(function(k){ if (k !== p) add(k); }); return Object.keys(set); }
+  // Dirent (fs.Dirent): name + type predicates. Returned by readdirSync(dir,{withFileTypes:true})
+  // — many tools (bundlers, test runners, recursive walkers) iterate entries by isDirectory()/isFile().
+  function Dirent(name, isDir, parentPath){ this.name = name; this._d = isDir; this.path = parentPath; this.parentPath = parentPath; }
+  Dirent.prototype.isFile = function(){ return !this._d; };
+  Dirent.prototype.isDirectory = function(){ return this._d; };
+  Dirent.prototype.isSymbolicLink = function(){ return false; };
+  Dirent.prototype.isBlockDevice = function(){ return false; };
+  Dirent.prototype.isCharacterDevice = function(){ return false; };
+  Dirent.prototype.isFIFO = function(){ return false; };
+  Dirent.prototype.isSocket = function(){ return false; };
+  function readdirSync(p, opts){ p = norm(p); if (!V.dirs[p] && p !== '/') throw ENOENT(p); var set = {}, pre = p === '/' ? '/' : p + '/'; function add(k){ if (k.indexOf(pre) === 0){ var rest = k.slice(pre.length); if (rest){ var name = rest.split('/')[0]; if (name) set[name] = true; } } } Object.keys(V.files).forEach(add); Object.keys(V.dirs).forEach(function(k){ if (k !== p) add(k); }); var names = Object.keys(set); var withFileTypes = opts && typeof opts === 'object' && opts.withFileTypes; if (!withFileTypes) return names; return names.map(function(name){ var full = (p === '/' ? '/' : p + '/') + name; return new Dirent(name, !!V.dirs[full], p); }); }
   function renameSync(a, b){ a = norm(a); b = norm(b); if (V.files[a]){ ensureParent(b); V.files[b] = V.files[a]; delete V.files[a]; } else if (V.dirs[a]){ V.dirs[b] = true; delete V.dirs[a]; } else throw ENOENT(a); }
   function copyFileSync(a, b){ a = norm(a); b = norm(b); var f = V.files[a]; if (!f) throw ENOENT(a); ensureParent(b); V.files[b] = { data: f.data.slice(), mtime: 0 }; }
   function statSync(p){ p = norm(p); var isF = !!V.files[p], isD = !!V.dirs[p]; if (!isF && !isD) throw ENOENT(p); var size = isF ? V.files[p].data.length : 0; return { size: size, mtimeMs: 0, mode: isD ? 16877 : 33188, isFile: function(){ return isF; }, isDirectory: function(){ return isD; }, isSymbolicLink: function(){ return false; } }; }
@@ -1485,6 +1731,67 @@ globalThis.__vfs = globalThis.__vfs || { files: {}, dirs: { '/': true } };
   async function hStat(p){ var r = hostThrow(await hostFs('stat', { path: norm(p) }), p); return { size: r.size || 0, mtimeMs: r.mtimeMs || 0, isFile: function(){ return !!r.isFile; }, isDirectory: function(){ return !!r.isDirectory; }, isSymbolicLink: function(){ return false; } }; }
   async function hExists(p){ var r = await hostFs('stat', { path: norm(p) }); return !(r && r.error); }
 
+  // realpathSync: the VFS has no symlinks, so the canonical path is just the normalized path —
+  // but it must EXIST (Node throws ENOENT for a missing path). promises.realpath mirrors it.
+  function realpathSync(p, opts){ p = norm(p); if (!V.files[p] && !V.dirs[p] && p !== '/') throw ENOENT(p); return p; }
+
+  // ----- fs STREAMS (WAVE 4) — createReadStream/createWriteStream over the VFS bytes -----------
+  // Built on the in-VM `stream` module (Wave 1). createReadStream reads the file's bytes and pushes
+  // them (honouring {encoding, start, end} — a byte slice + optional decode); 'data'/'end'/'error'/
+  // 'close' fire on microtasks (deterministic). createWriteStream buffers writes and commits the
+  // whole buffer to the VFS on end()/finish (the VFS is a flat byte store; there is no incremental
+  // file handle), with flags 'w' (truncate, default) / 'a' (append). Both are vfs-only (sync core);
+  // under a host-backed provider they throw the same async-only error as the sync methods.
+  function createReadStream(p, opts){
+    if (provider() !== 'vfs') throw asyncOnly('createReadStream');
+    if (typeof opts === 'string') opts = { encoding: opts };
+    opts = opts || {};
+    // With an encoding set, Node emits STRING chunks; the base Readable re-encodes a pushed string
+    // to bytes UNLESS objectMode — so use objectMode for the encoded case and push the decoded
+    // string verbatim. No encoding → push raw bytes (the binary path PDFs/packfiles need).
+    var hasEnc = !!opts.encoding;
+    var rd = new __stream.Readable({ read: function(){}, objectMode: hasEnc });
+    rd.path = norm(p);
+    if (hasEnc && rd.setEncoding) rd.setEncoding(opts.encoding);
+    queueMicrotask(function(){
+      try {
+        var f = V.files[norm(p)];
+        if (!f){ rd.destroy(V.dirs[norm(p)] ? EISDIR(norm(p)) : ENOENT(norm(p))); return; }
+        var bytes = f.data;
+        var start = opts.start|0; var end = (opts.end === undefined) ? bytes.length : (opts.end|0) + 1; // Node `end` is INCLUSIVE
+        var sliced = bytes.subarray(Math.max(0, start), Math.min(bytes.length, Math.max(start, end)));
+        var chunk = hasEnc ? decode(sliced.slice(), opts.encoding) : sliced.slice();
+        rd.push(chunk);
+        rd.push(null);
+        rd.emit('open', 0); rd.emit('ready');
+      } catch(e){ rd.destroy(e instanceof Error ? e : new Error(String(e))); }
+    });
+    return rd;
+  }
+  function createWriteStream(p, opts){
+    if (provider() !== 'vfs') throw asyncOnly('createWriteStream');
+    if (typeof opts === 'string') opts = { encoding: opts };
+    opts = opts || {};
+    var flags = opts.flags || 'w';
+    var path = norm(p);
+    var parts = [];
+    var w = new __stream.Writable({
+      write: function(chunk, enc, cb){ parts.push((chunk instanceof Uint8Array) ? chunk : toBytes(chunk, opts.encoding)); cb(); },
+      final: function(cb){
+        try {
+          var total = 0, i; for (i=0;i<parts.length;i++) total += parts[i].length;
+          var all = new Uint8Array(total), off = 0; for (i=0;i<parts.length;i++){ all.set(parts[i], off); off += parts[i].length; }
+          if (flags.indexOf('a') >= 0){ appendFileSync(path, all); } else { writeFileSync(path, all); }
+          w.bytesWritten = total;
+          cb();
+        } catch(e){ cb(e instanceof Error ? e : new Error(String(e))); }
+      },
+    });
+    w.path = path; w.bytesWritten = 0;
+    queueMicrotask(function(){ w.emit('open', 0); w.emit('ready'); });
+    return w;
+  }
+
   // sync method: in-heap for vfs, THROW for host-backed providers.
   function S(name, vfsFn){ return function(){ if (provider() !== 'vfs') throw asyncOnly(name); return vfsFn.apply(null, arguments); }; }
   // promises method: in-heap (wrapped) for vfs, host round-trip otherwise.
@@ -1498,6 +1805,11 @@ globalThis.__vfs = globalThis.__vfs || { files: {}, dirs: { '/': true } };
     renameSync: S('renameSync', renameSync), copyFileSync: S('copyFileSync', copyFileSync),
     statSync: S('statSync', statSync), lstatSync: S('lstatSync', statSync),
     readlinkSync: S('readlinkSync', readlinkSync), symlinkSync: S('symlinkSync', symlinkSync),
+    realpathSync: S('realpathSync', realpathSync),
+    // fs STREAMS (Wave 4): Readable/Writable over the VFS bytes.
+    createReadStream: createReadStream, createWriteStream: createWriteStream,
+    // Dirent constructor exposed for `instanceof` checks (fs.Dirent).
+    Dirent: Dirent,
     promises: {
       readFile: A(readFileSync, hReadFile), writeFile: A(writeFileSync, hWriteFile),
       appendFile: A(appendFileSync, hAppendFile), mkdir: A(mkdirSync, async function(){ /* r2 has no dirs */ }),
@@ -1507,9 +1819,11 @@ globalThis.__vfs = globalThis.__vfs || { files: {}, dirs: { '/': true } };
       stat: A(statSync, hStat), lstat: A(statSync, hStat),
       readlink: A(readlinkSync, async function(p){ return readlinkSync(p); }),
       symlink: A(symlinkSync, async function(t,p){ await hWriteFile(p, String(t)); }),
+      realpath: A(realpathSync, async function(p){ if (!(await hExists(p))) throw ENOENT(norm(p)); return norm(p); }),
       access: A(function(p){ if (!existsSync(p)) throw ENOENT(norm(p)); }, async function(p){ if (!(await hExists(p))) throw ENOENT(norm(p)); }),
     },
-    constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1 },
+    constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1, O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2, O_CREAT: 64, O_TRUNC: 512, O_APPEND: 1024, COPYFILE_EXCL: 1 },
+    Stats: function(){},
   };
   globalThis.__builtins.fs = fs;
   globalThis.__builtins['node:fs'] = fs;
@@ -1531,16 +1845,46 @@ globalThis.__vfs = globalThis.__vfs || { files: {}, dirs: { '/': true } };
 globalThis.use = async function(name, opts){
   opts = opts || {};
   if (globalThis.__mods[name] !== undefined) return globalThis.__mods[name];
-  var url = opts.url || ('https://cdn.jsdelivr.net/npm/' + name);
-  var r = await globalThis.host.fetch(url);
-  if (!r || !r.ok) throw new Error('use("' + name + '"): fetch failed (' + (r && r.status) + ') from ' + url);
+  // CANDIDATE URL CHAIN (WAVE 4 hardening): try CDNs that emit SELF-CONTAINED CJS so an ESM-only
+  // npm package does not SyntaxError in the CJS frame. esm.sh `?bundle&cjs` inlines deps + emits a
+  // CommonJS module; jsDelivr serves the package's own `main` (usually UMD/CJS). An explicit
+  // opts.url overrides the chain. We read the FULL bytes (bodyB64), NOT the capped utf8 `body`
+  // preview — a real bundle is far larger than the 64KB preview, so reading `body` truncated it.
+  function decodeFull(r){ if (typeof r.bodyB64 === 'string'){ var bin = atob(r.bodyB64); var u8 = new Uint8Array(bin.length); for (var i=0;i<bin.length;i++) u8[i] = bin.charCodeAt(i); return new TextDecoder().decode(u8); } return r.body || ''; }
+  var urls = opts.url ? [opts.url] : [
+    'https://esm.sh/' + name + '?bundle&cjs&target=es2022',
+    'https://cdn.jsdelivr.net/npm/' + name,
+  ];
+  var src = null, usedUrl = null, lastErr = null, lastStatus = 0;
+  for (var ui=0; ui<urls.length; ui++){
+    try {
+      var r = await globalThis.host.fetch(urls[ui]);
+      if (r && r.ok){ src = decodeFull(r); usedUrl = urls[ui]; break; }
+      lastStatus = (r && r.status) || 0;
+    } catch(e){ lastErr = e; }
+  }
+  if (src === null) throw new Error('use("' + name + '"): fetch failed (status ' + lastStatus + (lastErr ? ', ' + (lastErr.message || lastErr) : '') + ') from ' + JSON.stringify(urls) + '. Check the package name + that the CDN host is on the fetch allowlist.');
   var before = new Set(Object.getOwnPropertyNames(globalThis));
   var module = { exports: {} };
-  // CJS frame (with require + Buffer + process in scope); a UMD bundle with no module system
-  // attaches a global instead, which we detect by diffing globalThis.
-  (0, eval)('(function(module, exports, require, Buffer, process, global){\n' + r.body + '\n})')(
-    module, module.exports, globalThis.require, globalThis.Buffer, globalThis.process, globalThis
-  );
+  // CJS frame (with require + Buffer + process + __dirname/__filename in scope); a UMD bundle with
+  // no module system attaches a global instead, which we detect by diffing globalThis.
+  var frame;
+  try {
+    frame = (0, eval)('(function(module, exports, require, Buffer, process, global, __dirname, __filename){\n' + src + '\n})');
+  } catch(e){
+    // A compile error here is almost always raw ESM (`export`/`import` at top level) that the CJS
+    // frame cannot parse. Surface an ACTIONABLE error naming the cause + the esm.sh ?bundle fix.
+    var isEsm = /\b(export\s+(default|const|function|class|\{|\*)|import\s+[\s\S]*?from|import\s*\()/.test(src);
+    if (isEsm) throw new Error('use("' + name + '"): the bundle from ' + usedUrl + ' is ES MODULE syntax (export/import), which this CJS loader cannot eval. Retry with a CJS build: use("' + name + '", { url: "https://esm.sh/' + name + '?bundle&cjs" }), or pick a package that ships a UMD/CJS bundle. (The async ESM module loader is not yet wired — see __nodeCompat.caveats.)');
+    throw new Error('use("' + name + '"): bundle from ' + usedUrl + ' failed to compile: ' + (e && e.message || e));
+  }
+  try {
+    frame(module, module.exports, globalThis.require, globalThis.Buffer, globalThis.process, globalThis, '/', '/index.js');
+  } catch(e){
+    // A RUNTIME error inside the bundle frame: most often a missing builtin the CJS frame needs.
+    // require() already throws an ENUMERATED message listing builtins; re-surface with use() context.
+    throw new Error('use("' + name + '"): bundle from ' + usedUrl + ' threw while initialising: ' + (e && e.message || e));
+  }
   var val;
   if (module.exports && (typeof module.exports === 'function' || Object.keys(module.exports).length)) {
     val = module.exports;
@@ -1608,6 +1952,51 @@ globalThis.__preview = function(v, depth){
     return String(v);
   }
   try { return go(v, depth); } catch(e){ return '[preview-error]'; }
+};
+
+// __hasTopLevelReturn(src): true iff `src` contains a `return` KEYWORD at brace-depth 0 (a
+// top-level return statement). A depth-0, string/template/regex/line+block-comment-aware token
+// scan — so `return` inside a nested function, a string, or a regex is IGNORED. Used by the cell
+// driver to route a top-level-`return` cell to the async-function-BODY form (which yields the
+// return value) instead of the global-eval form (which SyntaxErrors on a top-level return).
+// Conservative: on any scan ambiguity it returns false (cell falls through to the existing paths,
+// preserving today's behaviour). Pure, deterministic, snapshot-persisted.
+globalThis.__hasTopLevelReturn = function(src){
+  if (typeof src !== 'string' || src.indexOf('return') < 0) return false;
+  try {
+    var n = src.length, i = 0, depth = 0, prev = 'start';
+    var idStart = function(c){ return /[A-Za-z_$]/.test(c); };
+    var idPart  = function(c){ return /[A-Za-z0-9_$]/.test(c); };
+    while (i < n) {
+      var c = src[i];
+      if (c === ' ' || c === '\t' || c === '\r' || c === '\n') { i++; continue; }
+      if (c === '/' && src[i+1] === '/') { i += 2; while (i < n && src[i] !== '\n') i++; continue; }
+      if (c === '/' && src[i+1] === '*') { i += 2; while (i < n && !(src[i] === '*' && src[i+1] === '/')) i++; i += 2; continue; }
+      if (c === '"' || c === "'" || c === '`') {
+        var q = c; i++;
+        while (i < n) { var d = src[i]; if (d === '\\') { i += 2; continue; } if (d === q) { i++; break; } if (d === '\n' && q !== '`') return false; i++; }
+        prev = 'val'; continue;
+      }
+      if (c === '/') {
+        var rxOk = prev === 'start' || prev === 'op' || prev === 'kw' || prev === 'open' || prev === 'semi';
+        if (rxOk) { i++; var inCls = false; while (i < n) { var e = src[i]; if (e === '\\') { i += 2; continue; } if (e === '[') inCls = true; else if (e === ']') inCls = false; else if (e === '/' && !inCls) { i++; break; } else if (e === '\n') return false; i++; } while (i < n && idPart(src[i])) i++; prev = 'val'; continue; }
+        i++; prev = 'op'; continue;
+      }
+      if (c === '(' || c === '[' || c === '{') { depth++; i++; prev = 'open'; continue; }
+      if (c === ')' || c === ']' || c === '}') { depth--; if (depth < 0) return false; i++; prev = 'val'; continue; }
+      if (c === ';') { i++; prev = 'semi'; continue; }
+      if (c === ',') { i++; prev = 'op'; continue; }
+      if (idStart(c)) {
+        var s = i; i++; while (i < n && idPart(src[i])) i++;
+        var w = src.slice(s, i);
+        if (w === 'return' && depth === 0) return true;
+        prev = (w === 'return' || w === 'typeof' || w === 'instanceof' || w === 'in' || w === 'of' || w === 'new' || w === 'delete' || w === 'void' || w === 'yield' || w === 'await' || w === 'case' || w === 'do' || w === 'else' || w === 'throw') ? 'kw' : 'val';
+        continue;
+      }
+      i++; prev = 'op';
+    }
+  } catch (e) { return false; }
+  return false;
 };
 
 // classify a value into a coarse valueType tag (for the eval-result frame).
@@ -2007,10 +2396,17 @@ fn install_cell(src: &str) {
                     // (1) Expression form: `return (src)` — supports await, returns the value.
                     try { fn = new AsyncFn("return (\n" + globalThis.__cellSrc + "\n);"); mode = 'expr'; }
                     catch(e) { fn = null; }
-                    // (2) Multi-statement cell that USES await: compile as an async function BODY
-                    // (top-level await works inside it). Declarations are function-scoped, so the
-                    // REPL persistence contract is `globalThis.x = ...` (matches the host surface).
-                    if (!fn && /\bawait\b/.test(globalThis.__cellSrc)) {
+                    // (2) Multi-statement cell that USES await OR has a TOP-LEVEL `return`: compile as
+                    // an async function BODY (top-level await works inside it; a top-level `return
+                    // <expr>` becomes the completion value instead of SyntaxError-ing under the
+                    // global-eval path (3), which forbids `return` outside a function). Declarations
+                    // are function-scoped, so the REPL persistence contract is `globalThis.x = ...`
+                    // (the host-side transform already globalizes top-level let/const/function/class
+                    // before the engine sees the cell, so persistence is preserved in the deployed
+                    // path). __hasTopLevelReturn is a depth-0, string/regex/comment-aware scan so a
+                    // `return` nested in a function/string never mis-triggers this (that case still
+                    // takes path (1) or (3) and keeps its trailing-expression completion value).
+                    if (!fn && (/\bawait\b/.test(globalThis.__cellSrc) || globalThis.__hasTopLevelReturn(globalThis.__cellSrc))) {
                       try { fn = new AsyncFn(globalThis.__cellSrc); mode = 'asyncbody'; }
                       catch(e) { fn = null; }
                     }

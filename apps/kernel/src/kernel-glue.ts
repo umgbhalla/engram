@@ -954,6 +954,11 @@ class GlueKernel {
         value: {
           status: r.status,
           ok: r.ok,
+          // statusText/url/redirected complete the in-VM WHATWG Response (Wave 4). Older engines
+          // ignore the extra fields, so this is backward-compatible with a vendored engine.
+          statusText: r.statusText || "",
+          url: r.url || url,
+          redirected: !!r.redirected,
           headers,
           body,
           bodyTruncated,
