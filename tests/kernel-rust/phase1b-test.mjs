@@ -16,7 +16,7 @@ function rpc(ws, msg) {
   });
 }
 async function fresh(id) {
-  const ws = new WebSocket(`wss://${BASE}/?id=${id}`);
+  const ws = new WebSocket(`wss://${BASE}/?id=${id}&apiKey=${process.env.ENGRAM_KERNEL_KEY||""}`);
   ws.on("error", () => {});
   await new Promise((r) => ws.once("open", r));
   return ws;

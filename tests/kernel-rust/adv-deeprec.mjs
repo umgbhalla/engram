@@ -2,7 +2,7 @@
 // And compare against the JS kernel (engram-kernel) on the identical input.
 import WebSocket from "ws";
 const RUN = Date.now();
-function connect(base,sid){return new Promise((res,rej)=>{const ws=new WebSocket(`wss://${base}/?id=${sid}`);const st={ws,alive:true,code:null};ws.on("open",()=>res(st));ws.on("error",rej);ws.on("close",c=>{st.alive=false;st.code=c});});}
+function connect(base,sid){return new Promise((res,rej)=>{const ws=new WebSocket(`wss://${base}/?id=${sid}&apiKey=${process.env.ENGRAM_KERNEL_KEY||""}`);const st={ws,alive:true,code:null};ws.on("open",()=>res(st));ws.on("error",rej);ws.on("close",c=>{st.alive=false;st.code=c});});}
 function rpc(st,msg,to=45000){return new Promise(resolve=>{let done=false;const t=setTimeout(()=>{if(!done){done=true;resolve({__timeout:true})}},to);const on=d=>{if(done)return;done=true;clearTimeout(t);st.ws.off("message",on);try{resolve(JSON.parse(d.toString()))}catch{resolve({__parsefail:String(d)})}};st.ws.on("message",on);try{st.ws.send(typeof msg==="string"?msg:JSON.stringify(msg))}catch(e){if(!done){done=true;clearTimeout(t);resolve({__sendfail:String(e)})}}});}
 const ev=(st,src,to=45000)=>rpc(st,{t:"eval",src},to);
 const SRC = "function f(n){return f(n+1)} f(0)";

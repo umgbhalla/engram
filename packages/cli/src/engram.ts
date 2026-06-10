@@ -20,6 +20,8 @@ import { runRepl, isComplete } from "./repl";
 
 const DEFAULT_ENDPOINT =
   process.env.ENGRAM_ENDPOINT || "wss://engram.umgbhalla.xyz";
+// Bare-kernel shared bearer key (engram-kernel auth). Passed as kernelKey to every connect().
+const API_KEY = process.env.ENGRAM_API_KEY || undefined;
 const STORE = path.join(os.homedir(), ".engram-sessions.json");
 
 interface Args {
@@ -128,7 +130,7 @@ async function cmdRepl(args: Args): Promise<void> {
   const onReconnect = (): void => void process.stderr.write("\x1b[2m· reconnected\x1b[22m\n");
   let session: EngramSession;
   try {
-    session = await connect({ url: endpoint, session: id, config, throwOnError: false, WebSocket, onEval, onClose, onReconnect });
+    session = await connect({ url: endpoint, session: id, config, kernelKey: API_KEY, throwOnError: false, WebSocket, onEval, onClose, onReconnect });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error(`could not connect to ${endpoint}`);
@@ -188,7 +190,7 @@ async function cmdSessions(args: Args): Promise<void> {
     const id = args._[1];
     if (!id) throw new Error("usage: engram sessions inspect <id>");
     const endpoint = str(args.endpoint) || store.sessions[id]?.endpoint || DEFAULT_ENDPOINT;
-    const s: EngramSession = await connect({ url: endpoint, session: id, WebSocket });
+    const s: EngramSession = await connect({ url: endpoint, session: id, kernelKey: API_KEY, WebSocket });
     console.log(JSON.stringify(await s.status(), null, 2));
     s.close();
     return;
@@ -197,7 +199,7 @@ async function cmdSessions(args: Args): Promise<void> {
     const id = args._[1];
     if (!id) throw new Error("usage: engram sessions rm <id>");
     const endpoint = str(args.endpoint) || store.sessions[id]?.endpoint || DEFAULT_ENDPOINT;
-    const s: EngramSession = await connect({ url: endpoint, session: id, WebSocket });
+    const s: EngramSession = await connect({ url: endpoint, session: id, kernelKey: API_KEY, WebSocket });
     await s.reset();
     s.close();
     delete store.sessions[id];
@@ -212,7 +214,7 @@ async function cmdTrace(args: Args): Promise<void> {
   const id = args._[0] || str(args.session) || "";
   const store = loadStore();
   const endpoint = str(args.endpoint) || store.sessions[id]?.endpoint || DEFAULT_ENDPOINT;
-  const s: EngramSession = await connect({ url: endpoint, session: id, WebSocket });
+  const s: EngramSession = await connect({ url: endpoint, session: id, kernelKey: API_KEY, WebSocket });
   const gen = await s.status();
   console.log(
     JSON.stringify(

@@ -27,7 +27,7 @@ const CONFIGS = {
 
 function connect(sid) {
   return new Promise((res, rej) => {
-    const ws = new WebSocket(`wss://${BASE}/?id=${sid}`);
+    const ws = new WebSocket(`wss://${BASE}/?id=${sid}&apiKey=${process.env.ENGRAM_KERNEL_KEY||""}`);
     ws.on("open", () => res(ws));
     ws.on("error", rej);
   });

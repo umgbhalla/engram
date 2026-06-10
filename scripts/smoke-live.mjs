@@ -38,9 +38,13 @@ async function check(name, fn) {
   }
 }
 
+const KERNEL_KEY = process.env.ENGRAM_KERNEL_KEY || "";
+
 function kernelRpc(frame, session = `live-smoke-${Date.now().toString(36)}`) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`${endpoints.kernelWs.replace(/\/+$/, "")}/ws?id=${encodeURIComponent(session)}`);
+    // Auth via ?apiKey= at upgrade time (no first-frame round-trip needed for single-frame RPC).
+    const auth = KERNEL_KEY ? `&apiKey=${encodeURIComponent(KERNEL_KEY)}` : "";
+    const ws = new WebSocket(`${endpoints.kernelWs.replace(/\/+$/, "")}/ws?id=${encodeURIComponent(session)}${auth}`);
     const timer = setTimeout(() => {
       try { ws.close(); } catch {}
       reject(new Error("kernel websocket timeout"));

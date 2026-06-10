@@ -5,7 +5,7 @@ let pass = 0, fail = 0;
 const ok = (n, c, got) => { if (c) { pass++; console.log("PASS  " + n); } else { fail++; console.log("FAIL  " + n + "  got=" + JSON.stringify(got)); } };
 function fresh(id) {
   return new Promise((res, rej) => {
-    const ws = new WebSocket(`wss://${BASE}/?id=${id}`);
+    const ws = new WebSocket(`wss://${BASE}/?id=${id}&apiKey=${process.env.ENGRAM_KERNEL_KEY||""}`);
     ws.on("error", rej); ws.once("open", () => res(ws));
   });
 }

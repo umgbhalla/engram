@@ -82,6 +82,13 @@ export const worker = await Worker("engram-kernel", {
     KERNEL_DO: kernelDo,
     SNAPSHOTS: snapshots,
     AE: ae,
+    // AUTH (Phase 1 shared bearer key). ENGRAM_KERNEL_KEY is a comma-split list of valid keys
+    // (rotation: "ek_new,ek_old"). Read in Rust via env.secret(); NEVER enters the heap snapshot.
+    // NOTE: set ALCHEMY_PASSWORD in the deploy env for strong at-rest encryption of this secret in
+    // the R2 state store — the default "dev-only-password" works but is WEAK (do not rely on it).
+    ENGRAM_KERNEL_KEY: alchemy.secret(process.env.ENGRAM_KERNEL_KEY!),
+    // ENFORCE flag: "0"/absent = log-only (serve + emit AE errorName=unauthorized); "1" = enforce.
+    ENGRAM_AUTH_ENFORCE: process.env.ENGRAM_AUTH_ENFORCE ?? "0",
   },
 });
 

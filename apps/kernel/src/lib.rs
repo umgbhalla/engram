@@ -106,6 +106,73 @@ extern "C" {
     fn acquire(this: &Mutex) -> js_sys::Promise;
 }
 
+// ---- AUTH (Phase 1: shared bearer key) ----
+// Per-connection auth state lives ONLY in the hibernatable socket attachment (serialize_attachment).
+// It is NEVER written to meta/manifest/oplog/kv/config — so it cannot enter the heap snapshot and
+// cannot perturb seeded determinism / byte-identical restore.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Default)]
+struct AuthState {
+    authed: bool,
+}
+
+/// Constant-time byte compare (folds all bytes; only length leaks).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// Is `token` a valid key against any of the comma-split keys?
+fn token_valid(token: &str, keys: &[String]) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    keys.iter().any(|k| ct_eq(token.as_bytes(), k.as_bytes()))
+}
+
+/// Extract a presented bearer token: `Authorization: Bearer <t>`, `x-api-key`, `?apiKey=<t>`,
+/// or `Sec-WebSocket-Protocol: engram.v1, engram-token.<t>`. Returns (token, via_subprotocol).
+fn extract_token(req: &Request) -> (String, bool) {
+    if let Ok(Some(auth)) = req.headers().get("Authorization") {
+        if let Some(rest) = auth.strip_prefix("Bearer ") {
+            let t = rest.trim();
+            if !t.is_empty() {
+                return (t.to_string(), false);
+            }
+        }
+    }
+    if let Ok(Some(xak)) = req.headers().get("x-api-key") {
+        let t = xak.trim();
+        if !t.is_empty() {
+            return (t.to_string(), false);
+        }
+    }
+    if let Ok(url) = req.url() {
+        if let Some((_, v)) = url.query_pairs().find(|(k, _)| k == "apiKey") {
+            let t = v.to_string();
+            if !t.is_empty() {
+                return (t, false);
+            }
+        }
+    }
+    if let Ok(Some(proto)) = req.headers().get("Sec-WebSocket-Protocol") {
+        for part in proto.split(',') {
+            let p = part.trim();
+            if let Some(tok) = p.strip_prefix("engram-token.") {
+                if !tok.is_empty() {
+                    return (tok.to_string(), true);
+                }
+            }
+        }
+    }
+    (String::new(), false)
+}
+
 const CHUNK_BYTES: usize = 64 * 1024;
 const SQLITE_HOT_MAX: usize = 2 * 1024 * 1024;
 /// DO SQLite caps a single bound value at ~2MB. Any TEXT/BLOB we bind in a checkpoint txn must
@@ -121,6 +188,9 @@ pub struct KernelDO {
     do_id: String,
     glue: RefCell<Option<GlueKernel>>,
     mutex: Mutex,
+    // AUTH (resolved once from env; NEVER snapshotted). keys = comma-split ENGRAM_KERNEL_KEY.
+    auth_keys: Vec<String>,
+    auth_enforce: bool,
 }
 
 /// Semantic snapshot layout epoch (bump on quickjs-ng/rustc/feature/static-layout change). Recorded
@@ -189,6 +259,24 @@ impl DurableObject for KernelDO {
         write_meta(&store, "generation", &generation.to_string());
         let do_id = state.id().to_string();
 
+        // AUTH: resolve the shared key(s) + enforce flag ONCE from env. Read here only — the value
+        // is held in plain struct fields and never persisted (not in meta/manifest/oplog/heap).
+        let auth_keys: Vec<String> = env
+            .secret("ENGRAM_KERNEL_KEY")
+            .ok()
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let auth_enforce = env
+            .var("ENGRAM_AUTH_ENFORCE")
+            .ok()
+            .map(|v| v.to_string())
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false);
+
         Self {
             state,
             env,
@@ -196,18 +284,44 @@ impl DurableObject for KernelDO {
             do_id,
             glue: RefCell::new(None),
             mutex: new_mutex(),
+            auth_keys,
+            auth_enforce,
         }
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
         if req.headers().get("Upgrade")?.as_deref() == Some("websocket") {
+            // AUTH at upgrade time. Token present+invalid -> 401 WITHOUT accepting (cheapest
+            // rejection; no actor work, no SSRF surface). Token present+valid -> accept + mark
+            // authed in the hibernation-safe attachment. Token absent -> accept but authed:false
+            // (the credential-less browser path completes via the first-message {t:auth} gate).
+            let (token, via_subproto) = extract_token(&req);
+            let token_present = !token.is_empty();
+            let valid = token_valid(&token, &self.auth_keys);
+            if self.auth_enforce && token_present && !valid {
+                self.emit_unauth("ws-upgrade");
+                return Response::error("unauthorized", 401);
+            }
+            if token_present && !valid {
+                // log-only mode: note it but still serve.
+                self.emit_unauth("ws-upgrade");
+            }
             let pair = WebSocketPair::new()?;
             let server = pair.server;
             self.state.accept_web_socket(&server);
+            // authed iff a valid token was presented at upgrade; otherwise pending first-message auth.
+            let _ = server.serialize_attachment(AuthState { authed: valid });
             if let Ok(rp) = WebSocketRequestResponsePair::new("ping", "pong") {
                 self.state.set_websocket_auto_response(&rp);
             }
-            return Response::from_websocket(pair.client);
+            let mut resp = Response::from_websocket(pair.client)?;
+            if via_subproto && valid {
+                // Echo only the app subprotocol; NEVER echo the token entry back.
+                let _ = resp
+                    .headers_mut()
+                    .set("Sec-WebSocket-Protocol", "engram.v1");
+            }
+            return Ok(resp);
         }
         // FACET RPC seam: a POST /frame with a JSON {t:...} body runs one protocol frame and
         // returns the reply JSON. This is the proxy-model entry the supervisor uses when the
@@ -218,6 +332,15 @@ impl DurableObject for KernelDO {
         if req.method() == Method::Post && req.path().ends_with("/frame") {
             {
                 {
+                    // POST /frame requires a valid key header (Authorization: Bearer / x-api-key).
+                    let (token, _) = extract_token(&req);
+                    let valid = token_valid(&token, &self.auth_keys);
+                    if !valid {
+                        self.emit_unauth("frame");
+                        if self.auth_enforce {
+                            return Response::error("unauthorized", 401);
+                        }
+                    }
                     let body = req.text().await.unwrap_or_else(|_| "{}".into());
                     let reply = match serde_json::from_str::<serde_json::Value>(&body) {
                         Ok(msg) => self
@@ -253,6 +376,42 @@ impl DurableObject for KernelDO {
             }
         };
         let t = msg.get("t").and_then(|v| v.as_str()).unwrap_or("");
+
+        // AUTH GATE (before ANY dispatch, incl. hostcall-result). Auth lives in the hibernatable
+        // socket attachment (survives eviction; never in the heap snapshot). If not authed, the
+        // ONLY honored frame is {t:"auth",token}; anything else closes the socket 1008.
+        let authed = ws
+            .deserialize_attachment::<AuthState>()
+            .ok()
+            .flatten()
+            .map(|a| a.authed)
+            .unwrap_or(false);
+        if !authed {
+            if t == "auth" {
+                let token = msg.get("token").and_then(|v| v.as_str()).unwrap_or("");
+                if token_valid(token, &self.auth_keys) {
+                    let _ = ws.serialize_attachment(AuthState { authed: true });
+                    ws.send_with_str("{\"ok\":true,\"t\":\"auth\"}")?;
+                    return Ok(());
+                }
+                // invalid token presented to the auth frame.
+                self.emit_unauth("ws-auth");
+                if self.auth_enforce {
+                    ws.close(Some(1008u16), Some("unauthorized"))?;
+                    return Ok(());
+                }
+                // log-only: accept the auth attempt as a no-op so the client proceeds.
+                ws.send_with_str("{\"ok\":true,\"t\":\"auth\"}")?;
+                return Ok(());
+            }
+            // not authed and frame is not {t:auth}.
+            self.emit_unauth(t);
+            if self.auth_enforce {
+                ws.close(Some(1008u16), Some("unauthorized"))?;
+                return Ok(());
+            }
+            // log-only: fall through and serve the frame as before (nothing breaks).
+        }
 
         // HOST-CALLBACK RESULT: a client's reply to a mid-eval {t:hostcall}. It MUST be
         // resolved WITHOUT acquiring self.mutex — the mutex is held by the suspended eval
@@ -328,6 +487,16 @@ impl KernelDO {
         });
         console_log(&log.to_string());
         let _ = self.write_ae(dp);
+    }
+
+    /// AUTH observability: emit an AE datapoint + log line with errorName=unauthorized.
+    /// `op` carries the rejected context (ws-upgrade / ws-auth / frame / the frame `t`).
+    fn emit_unauth(&self, op: &str) {
+        let mut dp = Datapoint::new(op);
+        dp.error_name = "unauthorized".into();
+        dp.ok = false;
+        dp.label = if self.auth_enforce { "enforce".into() } else { "log-only".into() };
+        self.emit(&dp);
     }
 
     fn write_ae(&self, dp: &Datapoint) -> std::result::Result<(), JsValue> {
@@ -1120,6 +1289,32 @@ async fn fetch(req: Request, env: Env, _ctx: worker::Context) -> Result<Response
     let url = req.url()?;
     if url.path() == "/health" {
         return Response::ok("ok");
+    }
+    // Cheap pre-DO auth fast-path: if a credential IS present and invalid, 401 before spinning a
+    // DO (garbage never mints a session). A credential-LESS request must still reach the DO so the
+    // browser first-message {t:auth} path works. Only enforces when ENGRAM_AUTH_ENFORCE=1.
+    {
+        let enforce = env
+            .var("ENGRAM_AUTH_ENFORCE")
+            .ok()
+            .map(|v| v.to_string())
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false);
+        if enforce {
+            let keys: Vec<String> = env
+                .secret("ENGRAM_KERNEL_KEY")
+                .ok()
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let (token, _) = extract_token(&req);
+            if !token.is_empty() && !token_valid(&token, &keys) {
+                return Response::error("unauthorized", 401);
+            }
+        }
     }
     let session = url
         .query_pairs()

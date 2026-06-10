@@ -3,7 +3,7 @@
 import WebSocket from "ws";
 const BASE="engram-rust1b.umg-bhalla88.workers.dev";
 const SID="w4-restore-"+Date.now();
-const conn=()=>new Promise((res,rej)=>{const ws=new WebSocket(`wss://${BASE}/?id=${SID}`);ws.on("open",()=>res(ws));ws.on("error",rej);});
+const conn=()=>new Promise((res,rej)=>{const ws=new WebSocket(`wss://${BASE}/?id=${SID}&apiKey=${process.env.ENGRAM_KERNEL_KEY||""}`);ws.on("open",()=>res(ws));ws.on("error",rej);});
 const rpc=(ws,m)=>new Promise((res,rej)=>{const t=setTimeout(()=>rej(new Error("timeout")),30000);ws.once("message",d=>{clearTimeout(t);res(JSON.parse(d.toString()));});ws.send(JSON.stringify(m));});
 let ws=await conn();
 await rpc(ws,{t:"create",config:{rngSeed:7}});

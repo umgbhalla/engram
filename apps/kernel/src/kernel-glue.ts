@@ -351,6 +351,43 @@ const FETCH_MAX_BODY_BYTES = (() => {
 const FETCH_BODY_UTF8_PREVIEW_BYTES = 64 * 1024;
 // base64 encode/decode over Uint8Array, chunked so a large packfile does not blow the call stack
 // of String.fromCharCode(...spread). Mirrors the fs-op base64 boundary.
+// SSRF defense: is this URL hostname a private/internal/metadata address that must be blocked
+// UNCONDITIONALLY (even under allow-all egress and with a valid auth key)? Covers metadata
+// (169.254.0.0/16), loopback (127.0.0.0/8, ::1), RFC1918 (10/8, 172.16/12, 192.168/16),
+// 0.0.0.0, link-local v6 (fe80::/10), unique-local v6 (fc00::/7), and *.internal/localhost names.
+// Hostname allowlists do NOT survive DNS-rebind, so this is enforced at fetch time by literal-IP
+// and known-internal-suffix inspection.
+function isBlockedSsrfHost(hostname: string): boolean {
+  if (!hostname) return true;
+  let h = hostname.toLowerCase();
+  // strip IPv6 brackets if any slipped through
+  if (h.startsWith("[") && h.endsWith("]")) h = h.slice(1, h.length - 1);
+  // internal hostname suffixes / loopback names
+  if (h === "localhost" || h.endsWith(".localhost")) return true;
+  if (h.endsWith(".internal") || h.endsWith(".local")) return true;
+  if (h === "metadata.google.internal") return true;
+  // IPv6 loopback / link-local / unique-local
+  if (h === "::1" || h === "::") return true;
+  if (h.startsWith("fe80:") || h.startsWith("fe8") || h.startsWith("fe9") || h.startsWith("fea") || h.startsWith("feb")) return true; // fe80::/10
+  if (h.startsWith("fc") || h.startsWith("fd")) return true; // fc00::/7 unique-local
+  // IPv4-mapped IPv6 (::ffff:a.b.c.d) — extract the v4 tail and re-check
+  const mapped = h.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  if (mapped) return isBlockedSsrfHost(mapped[1]);
+  // IPv4 literal checks
+  const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m) {
+    const a = Number(m[1]), b = Number(m[2]);
+    if (a === 127) return true;                 // 127.0.0.0/8 loopback
+    if (a === 10) return true;                  // 10.0.0.0/8
+    if (a === 0) return true;                    // 0.0.0.0/8
+    if (a === 169 && b === 254) return true;    // 169.254.0.0/16 link-local + metadata
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+    if (a === 192 && b === 168) return true;    // 192.168.0.0/16
+    if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
+  }
+  return false;
+}
+
 function bytesToB64(u8: Uint8Array): string {
   let s = "";
   const CH = 0x8000;
@@ -1043,10 +1080,19 @@ class GlueKernel {
       // allowlist enforcement (parity with P3 kernel).
       const allow = this._fetchAllow;
       let host = "";
+      let hostname = "";
       try {
-        host = new URL(url).host;
+        const u = new URL(url);
+        host = u.host;
+        hostname = u.hostname;
       } catch {
         return { ok: false, error: "FetchError: invalid url" };
+      }
+      // SSRF HARD-BLOCK (UNCONDITIONAL — applies even on allow-all and with a valid key; DNS-rebind
+      // defense). Block link-local/metadata + RFC1918 + loopback literal IPs and known-internal
+      // hostname suffixes. A hostname allowlist alone does NOT stop rebind to an internal IP.
+      if (isBlockedSsrfHost(hostname)) {
+        return { ok: false, error: "FetchBlockedError: " + hostname + " is a blocked private/internal address" };
       }
       let permitted = false;
       if (allow === true) permitted = true;

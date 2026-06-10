@@ -133,8 +133,9 @@ async function probeSession(session) {
 function openSocket(session) {
   return new Promise((resolve, reject) => {
     const wsUrl = endpoint.replace(/\/+$/, "") + "/ws?id=" + encodeURIComponent(session);
+  const _k = process.env.ENGRAM_KERNEL_KEY; const wsUrlAuthed = _k ? wsUrl + "&apiKey=" + encodeURIComponent(_k) : wsUrl;
     const t0 = performance.now();
-    const ws = new WebSocket(wsUrl);
+    const ws = new WebSocket(wsUrlAuthed);
     const timer = setTimeout(() => {
       try { ws.close(); } catch {}
       reject(new Error("websocket open timeout"));

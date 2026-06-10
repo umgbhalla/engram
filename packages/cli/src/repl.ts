@@ -779,6 +779,7 @@ export async function openSession(opts: {
     url: opts.endpoint,
     session: opts.sessionId,
     config: opts.config,
+    kernelKey: process.env.ENGRAM_API_KEY || undefined,
     throwOnError: false,
     WebSocket: opts.WebSocketImpl,
   });

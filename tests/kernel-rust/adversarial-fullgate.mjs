@@ -8,7 +8,7 @@ const RUN = Date.now();
 
 function connect(sid) {
   return new Promise((res, rej) => {
-    const ws = new WebSocket(`wss://${BASE}/?id=${sid}`);
+    const ws = new WebSocket(`wss://${BASE}/?id=${sid}&apiKey=${process.env.ENGRAM_KERNEL_KEY||""}`);
     const state = { ws, alive: true, code: null };
     ws.on("open", () => res(state));
     ws.on("error", rej);

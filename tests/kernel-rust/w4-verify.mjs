@@ -9,7 +9,7 @@ const NCELLS = 60;
 
 function connect() {
   return new Promise((res, rej) => {
-    const ws = new WebSocket(`wss://${BASE}/?id=${SID}`);
+    const ws = new WebSocket(`wss://${BASE}/?id=${SID}&apiKey=${process.env.ENGRAM_KERNEL_KEY||""}`);
     ws.on("open", () => res(ws));
     ws.on("error", rej);
   });

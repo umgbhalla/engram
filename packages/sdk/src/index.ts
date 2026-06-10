@@ -213,6 +213,12 @@ export interface ConnectOptions {
   session?: string;
   /** Cloud API key (`x-api-key`). Presence flips the transport to the cloud HTTP/WS path. */
   apiKey?: string;
+  /**
+   * Bare-kernel shared bearer key (engram-kernel auth, additive — does NOT change `apiKey`
+   * cloud semantics). When set, the bare-kernel WS URL gains `&apiKey=<kernelKey>` AND a
+   * `{t:"auth",token}` frame is sent first on every (re)connect so reconnect re-auths transparently.
+   */
+  kernelKey?: string;
   /** In-VM kernel config, applied once at connect. */
   config?: EngramConfig;
   /** JS evaluated once after create to seed VM globals; runs on every reconnect, so keep it idempotent. */
@@ -1243,7 +1249,9 @@ export const Engram = {
       ? ""
       : opts.apiKey
         ? `${wsBase}/connect?session=${encodeURIComponent(session)}&apiKey=${encodeURIComponent(opts.apiKey)}`
-        : `${wsBase}/ws?id=${encodeURIComponent(session)}`;
+        : opts.kernelKey
+          ? `${wsBase}/ws?id=${encodeURIComponent(session)}&apiKey=${encodeURIComponent(opts.kernelKey)}`
+          : `${wsBase}/ws?id=${encodeURIComponent(session)}`;
 
     let s!: EngramSession;
     const transport = new WsTransport(WS, wsUrl, {
@@ -1255,6 +1263,12 @@ export const Engram = {
       onReconnect: opts.onReconnect,
       onClose: opts.onClose,
       onReady: async (raw) => {
+        // AUTH FIRST: send {t:"auth",token} before anything else so a credential-less upgrade (and
+        // every reconnect-after-hibernation) re-auths transparently. Idempotent on an already-authed
+        // socket. Must precede {t:create}, the bootstrap eval, and the initial {t:ping} probe.
+        if (opts.kernelKey) {
+          await raw({ t: "auth", token: opts.kernelKey }, timeoutMs).catch(() => {});
+        }
         // Re-apply config on every (re)connect so a cold session is configured identically.
         if (config && Object.keys(config).length) {
           await raw({ t: "create", config }, timeoutMs);
@@ -1332,6 +1346,8 @@ export interface EngramClientOptions {
   url?: string;
   /** Cloud API key (flips all sessions to the HTTP path). */
   apiKey?: string;
+  /** Bare-kernel shared bearer key for every session (engram-kernel auth; additive). */
+  kernelKey?: string;
   /** WebSocket implementation (Node: `(await import("ws")).default`). */
   WebSocket?: unknown;
   /** Default in-VM config for every session (deep-overridable per session). */
@@ -1423,6 +1439,7 @@ export class EngramClient {
     const connectOpts: ConnectOptions = {
       url: o.url,
       apiKey: o.apiKey,
+      kernelKey: o.kernelKey,
       WebSocket: o.WebSocket,
       throwOnError: o.throwOnError,
       autoReconnect: o.autoReconnect,

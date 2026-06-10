@@ -7,7 +7,7 @@ const SID = "parity5-" + Date.now();
 
 function connect(id = SID) {
   return new Promise((res, rej) => {
-    const ws = new WebSocket(`wss://${BASE}/?id=${id}`);
+    const ws = new WebSocket(`wss://${BASE}/?id=${id}&apiKey=${process.env.ENGRAM_KERNEL_KEY||""}`);
     ws.on("open", () => res(ws));
     ws.on("error", rej);
   });
