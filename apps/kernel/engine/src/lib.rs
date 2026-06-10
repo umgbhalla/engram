@@ -184,7 +184,7 @@ const BOOTSTRAP: &str = r#"
 try { Object.defineProperty(Date, 'now', { value: globalThis.__now, writable: true, configurable: true }); } catch(e){ try { Date.now = globalThis.__now; } catch(e2){} }
 try { Object.defineProperty(Math, 'random', { value: globalThis.__rand, writable: true, configurable: true }); } catch(e){ try { Math.random = globalThis.__rand; } catch(e2){} }
 // seeded performance.now (monotone, ms) reuses the clock tick
-try { if (typeof performance === 'undefined') { globalThis.performance = {}; } try { Object.defineProperty(performance, 'now', { value: function(){ return globalThis.__now(); }, writable: true, configurable: true }); } catch(e3){ try { performance.now = function(){ return globalThis.__now(); }; } catch(e4){} } } catch(e){}
+try { if (typeof performance === 'undefined') { globalThis.performance = {}; } try { Object.defineProperty(performance, 'now', { value: function(){ return globalThis.__now(); }, writable: true, configurable: true }); } catch(e3){ try { performance.now = function(){ return globalThis.__now(); }; } catch(e4){} } if (performance.now() === 0) { try { var __perfNew = {}; for (var __pk in performance) { try { __perfNew[__pk] = performance[__pk]; } catch(__pe){} } __perfNew.now = function(){ return globalThis.__now(); }; if (typeof __perfNew.timeOrigin !== 'number') __perfNew.timeOrigin = 0; globalThis.performance = __perfNew; } catch(e5){} } } catch(e){}
 
 // ===== ENV-FIDELITY SHIMS (fix not-real-node gotchas; all determinism-safe) =====
 // FIX: new Date() argless returned 1970 (the native Date used the engine's frozen internal clock,
@@ -1807,7 +1807,7 @@ globalThis.__builtins = {
     return { runInThisContext: runInThisContext, runInNewContext: runInNewContext, runInContext: runInNewContext, createContext: createContext, isContext: function(){ return true; }, Script: Script };
   })(),
   // FIX (env-fidelity): module — createRequire returns the global require; builtinModules enumerated.
-  module: { createRequire: function(){ return globalThis.require; }, builtinModules: Object.keys(globalThis.__builtins).filter(function(k){ return k.indexOf('node:') !== 0 && k.indexOf('/') < 0; }), Module: function(){}, _resolveFilename: function(r){ return r; } },
+  module: { createRequire: function(){ return globalThis.require; }, get builtinModules(){ return Object.keys(globalThis.__builtins).filter(function(k){ return k.indexOf('node:') !== 0 && k.indexOf('/') < 0; }); }, Module: function(){}, _resolveFilename: function(r){ return r; } },
 };
 // node:-prefixed + submodule aliases (stream/promises, fs/promises, util/types, assert/strict).
 (function(){
