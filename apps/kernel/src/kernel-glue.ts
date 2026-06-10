@@ -104,6 +104,10 @@ interface KernelConfig {
   // TRUE STREAMING (#13): per-cell budget for stream chunk pulls (streamRead/streamWrite), counted
   // separately from maxHostCallsPerCell so a long stream is not capped by the 64 host-call guard.
   maxStreamOpsPerCell?: number;
+  // WEBSOCKET-CLIENT-IN-VM (#12): per-cell budget for ws.* effects (recv/poll/send), counted
+  // separately from maxHostCallsPerCell so a chatty WS pump is not capped by the 64 host-call guard.
+  maxWsOpsPerCell?: number;
+
   // fs provider: undefined / {provider:"vfs"} = in-heap VFS (sync, durable in snapshot);
   // {provider:"r2",binding?,prefix?} = host-backed R2 (async-only; serviced DO-side in lib.rs).
   fs?: { provider?: string; binding?: string; prefix?: string };
@@ -371,8 +375,38 @@ interface StreamState {
   pending?: Uint8Array;            // re-chunk leftover (upstream chunk > STREAM_CHUNK_BYTES)
   done: boolean;
 }
+// ---- WEBSOCKET-CLIENT-IN-VM (#12) ----
+// Per-cell budget for ws.* effects (a chatty pump cell makes many recv/poll calls). Counted
+// separately from maxHostCallsPerCell (the 64 guard) like maxStreamOpsPerCell.
+const WS_MAX_OPS_PER_CELL = 4096;
+// Idle deadline for a parked recv(): if no frame arrives within this window the recv resolves
+// {type:"idle"} so the cell ends and the eval mutex turns over (never hold it forever).
+const WS_RECV_IDLE_MS = 25000;
+// Bounded inbound queue per handle (backpressure between pump cells). Over this, drop-oldest and
+// surface a typed {type:"overflow"} marker so loss is visible + deterministic-on-record.
+const WS_QUEUE_MAX_FRAMES = 1024;
+// A single inbound frame above this raw size is dropped with a typed {type:"overflow"} marker
+// (rides SCRATCH like fetch bodies; ~24MB raw practical ceiling after base64 inflation).
+const WS_FRAME_MAX_BYTES = 24 * 1024 * 1024;
+// An inbound frame the DO pushes into a handle's queue. data is a string (text) or base64 (binary).
+interface WsFrame { type: string; seq: number; data?: string; binary?: boolean; code?: number; reason?: string; severed?: boolean }
+// DO-side WebSocket registry entry. socket = the live outbound WS (DO memory, NEVER snapshotted).
+// queue = inbound frames with monotonic seq; waiters = parked recv resolvers woken by the socket
+// listeners. Dies with the isolate at eviction -> severed-on-wake semantic.
+interface WsState {
+  socket: WebSocket;
+  url: string;
+  queue: WsFrame[];
+  seq: number;                       // monotonic, last assigned
+  waiters: Array<(f: WsFrame) => void>;
+  severed: boolean;
+  closed: boolean;
+  droppedThrough: number;            // highest seq dropped by overflow (for the marker)
+}
+
 // base64 encode/decode over Uint8Array, chunked so a large packfile does not blow the call stack
 // of String.fromCharCode(...spread). Mirrors the fs-op base64 boundary.
+
 // SSRF defense: is this URL hostname a private/internal/metadata address that must be blocked
 // UNCONDITIONALLY (even under allow-all egress and with a valid auth key)? Covers metadata
 // (169.254.0.0/16), loopback (127.0.0.0/8, ::1), RFC1918 (10/8, 172.16/12, 192.168/16),
@@ -544,6 +578,14 @@ class GlueKernel {
   // instance), NEVER in the heap blit — so it dies with the isolate at eviction, which IS the
   // StreamExpired-on-wake semantic. streamRead pulls one upstream chunk per call (backpressure).
   _streams?: Map<string, StreamState>;
+  // WEBSOCKET-CLIENT-IN-VM (#12): DO-side registry of live outbound WebSockets, keyed by a
+  // deterministic handleId (`ws:${doId}:${cell}:${ordinal}`). Lives in DO memory (GlueKernel
+  // instance), NEVER in the heap blit — so it dies with the isolate at eviction, which IS the
+  // severed-on-wake semantic. The VM holds only a small JSON handle token (in globalThis.__wsHandles)
+  // that snapshot-persists; recv() PULLS frames (immediate if queued, else parks until the socket
+  // listener enqueues the next frame or the idle deadline fires).
+  _ws?: Map<string, WsState>;
+
 
   constructor() {
     this.inst = null;
@@ -980,12 +1022,19 @@ class GlueKernel {
       // still bound the loop so the pump can never spin forever. Default 4096 (~1GB at 256KB/chunk).
       const maxStreamOps = (this.config.maxStreamOpsPerCell ?? 0) || 4096;
       let streamOps = 0;
+      // WEBSOCKET-CLIENT-IN-VM (#12): ws.* effects (a pump cell makes many recv/poll calls) get their
+      // OWN large budget, like stream ops — so a chatty WS pump is not capped by the 64 host-call
+      // guard. Each parked recv still has the idle deadline so the cell can never hang forever.
+      const maxWsOps = (this.config.maxWsOpsPerCell ?? 0) || WS_MAX_OPS_PER_CELL;
+      let wsOps = 0;
       // E6 oplog: capture host requests+results for the crash-tail journal (host-side).
       this._cellHostResults = [];
-      while (status === STATUS_HOST_CALL && guard <= maxHostCalls && streamOps <= maxStreamOps) {
+      while (status === STATUS_HOST_CALL && guard <= maxHostCalls && streamOps <= maxStreamOps && wsOps <= maxWsOps) {
         const req = this._readHostCall();
         const isStreamOp = req.name === "streamRead" || req.name === "streamWrite";
-        if (isStreamOp) streamOps++; else guard++;
+        const isWsOp = req.name === "ws.recv" || req.name === "ws.poll" || req.name === "ws.send";
+        if (isStreamOp) streamOps++; else if (isWsOp) wsOps++; else guard++;
+
         let res: HostResult;
         if (this._replayHostResults && this._replayHostResults.length) {
           // engine-migration replay: feed the recorded result, do NOT re-fire the effect.
@@ -1044,7 +1093,15 @@ class GlueKernel {
     if (name === "streamRead") return this._doStreamRead(args[0] as string);
     if (name === "streamCancel") return this._doStreamCancel(args[0] as string);
     if (name === "streamWrite") return this._doStreamWrite(args[0] as string, args[1] as string | null, !!args[2]);
+    // WEBSOCKET-CLIENT-IN-VM (#12): the VM PULLS frames over these five effects; the live socket
+    // is DO-memory only (never snapshotted). recv() may PARK (resolved by the socket listener).
+    if (name === "ws.open") return this._wsOpen(args[0] as string, args[1] as string[] | undefined);
+    if (name === "ws.send") return this._wsSend(args[0] as string, args[1] as string | null, !!args[2]);
+    if (name === "ws.recv") return this._wsRecv(args[0] as string, (args[1] as number) | 0, args[2] as number | undefined);
+    if (name === "ws.poll") return this._wsPoll(args[0] as string, (args[1] as number) | 0);
+    if (name === "ws.close") return this._wsClose(args[0] as string, args[1] as number | undefined, args[2] as string | undefined);
     // host-backed fs (config.fs.provider != vfs): serviced DO-side via the installed _fsHandler.
+
     if (name === "__fs") return this._serviceFs(args[0] as Record<string, unknown>);
     return this._clientHostCall(name, args);
   }
@@ -1377,9 +1434,197 @@ class GlueKernel {
     }
   }
 
+  // ---- WEBSOCKET-CLIENT-IN-VM (#12) host effects ----
+  // _wsEnqueue: push an inbound frame onto a handle queue with a monotonic seq, wake one parked
+  // recv waiter. Bounded queue (drop-oldest + {type:"overflow"} marker). Called by the socket
+  // listeners on the DO event loop (which run while a cell is parked in await inside _wsRecv).
+  _wsEnqueue(st: WsState, frame: Omit<WsFrame, "seq">): void {
+    st.seq += 1;
+    const f: WsFrame = { ...frame, seq: st.seq };
+    st.queue.push(f);
+    // backpressure: bound the queue; drop oldest non-overflow frames, record droppedThrough.
+    while (st.queue.length > WS_QUEUE_MAX_FRAMES) {
+      const dropped = st.queue.shift();
+      if (dropped) st.droppedThrough = Math.max(st.droppedThrough, dropped.seq);
+    }
+    const w = st.waiters.shift();
+    if (w) {
+      // serve the EARLIEST queued frame at/after the implicit cursor — the waiter recorded its
+      // sinceSeq via the closure; we just hand it the next available frame.
+      w(f);
+    }
+  }
+
+  // _wsOpen: allowlist-check (reuse _fetchPrep's SSRF + config.fetch allow) the ws/wss URL, open a
+  // real outbound WebSocket, register it in _ws. handleId is DETERMINISTIC (doId,cell,ordinal) so
+  // replay reproduces the same heap token. Returns {handleId, readyState}.
+  async _wsOpen(url: string, protocols?: string[]): Promise<HostResult> {
+    let host = "";
+    let hostname = "";
+    let proto = "";
+    try {
+      const u = new URL(url);
+      host = u.host;
+      hostname = u.hostname;
+      proto = u.protocol;
+    } catch {
+      return { ok: false, error: "WsError: invalid url" };
+    }
+    if (proto !== "ws:" && proto !== "wss:") {
+      return { ok: false, error: "WsError: only ws:/wss: URLs are allowed (got " + proto + ")" };
+    }
+    // SSRF HARD-BLOCK (unconditional, same defense as host.fetch): no ws:// to metadata/loopback/RFC1918.
+    if (isBlockedSsrfHost(hostname)) {
+      return { ok: false, error: "WsBlockedError: " + hostname + " is a blocked private/internal address" };
+    }
+    // allowlist: reuse config.fetch (_fetchAllow) — false=block all, true=all, [hosts]=hostnames.
+    const allow = this._fetchAllow;
+    let permitted = false;
+    if (allow === true) permitted = true;
+    else if (allow === false) permitted = false;
+    else if (Array.isArray(allow)) permitted = allow.includes(host);
+    if (!permitted) return { ok: false, error: "WsBlockedError: " + host + " not allowed" };
+
+    const handleId = "ws:" + (this._fenceDoId ?? "do") + ":" + (this._fenceCell ?? 0) + ":" + (this._curFetchSeq ?? 0);
+    if (!this._ws) this._ws = new Map();
+    // workerd does NOT establish an outbound connection via `new WebSocket(url)` (that constructor
+    // immediately errors). The supported path for an OUTBOUND client socket from a Worker/DO is the
+    // fetch() + Upgrade handshake: fetch the ws/wss URL (mapped to http/https) with the Upgrade
+    // header, read response.webSocket, .accept() it. ws: -> http:, wss: -> https:.
+    const httpUrl = url.replace(/^ws:/i, "http:").replace(/^wss:/i, "https:");
+    let socket: WebSocket;
+    try {
+      const reqHeaders: Record<string, string> = { Upgrade: "websocket" };
+      if (protocols && protocols.length) reqHeaders["Sec-WebSocket-Protocol"] = protocols.join(", ");
+      const resp = await fetch(httpUrl, { headers: reqHeaders });
+      const sock = (resp as { webSocket?: WebSocket | null }).webSocket;
+      if (!sock) {
+        return { ok: false, error: "WsError: upstream did not upgrade (status " + resp.status + ")" };
+      }
+      socket = sock;
+    } catch (e) {
+      const err = e as { message?: string };
+      return { ok: false, error: "WsError: " + String((err && err.message) || e) };
+    }
+    const st: WsState = { socket, url, queue: [], seq: 0, waiters: [], severed: false, closed: false, droppedThrough: 0 };
+    this._ws.set(handleId, st);
+    // attach listeners BEFORE accept() so no frame is missed, then accept to start delivery.
+    socket.addEventListener("message", (ev: MessageEvent) => {
+      const d = ev.data;
+
+      if (typeof d === "string") {
+        if (d.length > WS_FRAME_MAX_BYTES) { this._wsEnqueue(st, { type: "overflow", reason: "frame too large" }); return; }
+        this._wsEnqueue(st, { type: "message", data: d, binary: false });
+      } else {
+        // binary: ArrayBuffer (binaryType=arraybuffer) -> base64.
+        try {
+          const u8 = d instanceof ArrayBuffer ? new Uint8Array(d) : new Uint8Array(d as ArrayBufferLike);
+          if (u8.length > WS_FRAME_MAX_BYTES) { this._wsEnqueue(st, { type: "overflow", reason: "frame too large" }); return; }
+          this._wsEnqueue(st, { type: "message", data: bytesToB64(u8), binary: true });
+        } catch {
+          this._wsEnqueue(st, { type: "error", reason: "bad binary frame" });
+        }
+      }
+    });
+    socket.addEventListener("close", (ev: CloseEvent) => {
+      st.closed = true;
+      this._wsEnqueue(st, { type: "close", code: (ev && ev.code) || 1000, reason: (ev && ev.reason) || "" });
+    });
+    socket.addEventListener("error", () => {
+      this._wsEnqueue(st, { type: "error", reason: "socket error" });
+    });
+    // accept() starts frame delivery on the workerd-side accepted socket. The fetch-Upgrade socket
+    // is already connected when fetch() resolved, so there is no async "open" event — synthesize one
+    // so the VM shim's onopen fires and recv() sees an `open` frame first.
+    try { (socket as { accept?: () => void }).accept?.(); } catch { /* some impls auto-accept */ }
+    this._wsEnqueue(st, { type: "open" });
+    const readyState = (socket as { readyState?: number }).readyState ?? 1;
+    return { ok: true, value: { handleId, url, readyState } };
+  }
+
+
+  // _wsSend: send a text (or base64 binary) frame. Pure output, zero entropy.
+  async _wsSend(handleId: string, data: string | null, isBinary: boolean): Promise<HostResult> {
+    const st = this._ws && this._ws.get(handleId);
+    if (!st) return { ok: true, value: { ok: false, error: "WsClosedError: handle gone (severed by hibernation?)" } };
+    if (st.closed || st.severed) return { ok: true, value: { ok: false, error: "WsClosedError: socket closed" } };
+    try {
+      if (isBinary && data != null) st.socket.send(b64ToBytes(data));
+      else st.socket.send(String(data ?? ""));
+      return { ok: true, value: { ok: true } };
+    } catch (e) {
+      const err = e as { message?: string };
+      return { ok: true, value: { ok: false, error: "WsSendError: " + String((err && err.message) || e) } };
+    }
+  }
+
+  // _wsRecv: THE pull primitive. Return a queued frame with seq >= sinceSeq immediately; else PARK
+  // (a Promise pushed to st.waiters, resolved by the socket listener) with an idle deadline that
+  // resolves {type:"idle"} so the cell ends and the mutex turns over. A severed/missing handle (cold
+  // wake) resolves a typed severed close. Every result is a recorded host effect (oplog) like fetch.
+  async _wsRecv(handleId: string, sinceSeq: number, timeoutMs?: number): Promise<HostResult> {
+    const st = this._ws && this._ws.get(handleId);
+    if (!st) {
+      // handle token survived the snapshot but the live socket did not: severed-on-wake.
+      return { ok: true, value: { type: "close", code: 1006, severed: true, seq: sinceSeq } };
+    }
+    // overflow marker first if frames were dropped past the cursor.
+    if (st.droppedThrough >= sinceSeq) {
+      const through = st.droppedThrough;
+      st.droppedThrough = 0;
+      return { ok: true, value: { type: "overflow", droppedThrough: through, seq: through } };
+    }
+    // immediate: earliest queued frame at/after the cursor.
+    const queued = st.queue.find((f) => f.seq >= sinceSeq);
+    if (queued) return { ok: true, value: queued };
+    if (st.closed) return { ok: true, value: { type: "close", code: 1006, severed: false, seq: st.seq } };
+    // park: resolve when the next frame arrives, or the idle deadline fires.
+    const deadline = (typeof timeoutMs === "number" && timeoutMs > 0) ? timeoutMs : WS_RECV_IDLE_MS;
+    return new Promise<HostResult>((resolve) => {
+      let done = false;
+      const timer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        const i = st.waiters.indexOf(waiter);
+        if (i >= 0) st.waiters.splice(i, 1);
+        resolve({ ok: true, value: { type: "idle", seq: sinceSeq } });
+      }, deadline);
+      const waiter = (f: WsFrame) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve({ ok: true, value: f });
+      };
+      st.waiters.push(waiter);
+    });
+  }
+
+  // _wsPoll: non-blocking drain of all queued frames with seq >= sinceSeq (the pump cell's fast path).
+  async _wsPoll(handleId: string, sinceSeq: number): Promise<HostResult> {
+    const st = this._ws && this._ws.get(handleId);
+    if (!st) return { ok: true, value: { events: [{ type: "close", code: 1006, severed: true, seq: sinceSeq }], readyState: 3 } };
+    const events = st.queue.filter((f) => f.seq >= sinceSeq);
+    const readyState = st.closed ? 3 : ((st.socket as { readyState?: number }).readyState ?? 1);
+    return { ok: true, value: { events, readyState } };
+  }
+
+  // _wsClose: close the real socket, mark the registry entry closed. Idempotent.
+  async _wsClose(handleId: string, code?: number, reason?: string): Promise<HostResult> {
+    const st = this._ws && this._ws.get(handleId);
+    if (st) {
+      try { st.socket.close(typeof code === "number" ? code : 1000, reason || ""); } catch { /* already gone */ }
+      st.closed = true;
+      // wake any parked waiters with a close so the cell does not hang to the idle deadline.
+      const ws = st.waiters.splice(0);
+      for (const w of ws) { try { w({ type: "close", code: code || 1000, reason: reason || "", seq: st.seq }); } catch { /* */ } }
+    }
+    return { ok: true, value: { ok: true } };
+  }
+
   // dump: read the live linear memory + counters + kv, gzip, return the image + meta.
   //
   // W5 compaction (docs/W5-COMPACTION-PLAN.md). The size-admission GUARD lives here. WASM linear
+
   // memory is MONOTONIC — it never shrinks. A session that spikes then frees keeps a high-water-
   // mark buffer. So the admission is on the USED heap (the genuine OOM fence), NOT the monotonic
   // buffer. We keep an ABSOLUTE safe-serialize cap on the raw buffer to avoid the adversarial

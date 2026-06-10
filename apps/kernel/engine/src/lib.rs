@@ -1097,7 +1097,149 @@ if (typeof globalThis.setTimeout === 'undefined') {
     globalThis.Response.prototype.sse = function(){ return globalThis.sseEvents(this); };
   }
 })();
+
+// ===== WEBSOCKET-CLIENT-IN-VM (#12) =====
+// A WHATWG-shaped WebSocket CLIENT inside the VM, layered on the host.ws.* PULL primitive. The real
+// outbound socket lives in the DO (host.ws.open returns a handleId); the VM holds only a small JSON
+// handle token in globalThis.__wsHandles (snapshot-safe: handleId + url + lastSeq + severed). recv()
+// is a parked host effect; we drive a BOUNDED internal pump (drain poll(), then one parked recv with
+// an idle deadline) that dispatches onopen/onmessage/onclose/onerror. The pump is bounded so a cell
+// never holds the eval mutex forever — each .pump() returns after the idle deadline and the VM (or
+// SDK) re-pumps on a cadence. NOTE: no host entropy crosses (frame arrival timing is invisible; any
+// timestamp comes from the seeded Date.now), so determinism is preserved exactly as for host.fetch.
+(function(){
+  if (typeof globalThis.WebSocket !== 'undefined' && globalThis.__realWebSocket) return;
+  globalThis.__wsHandles = globalThis.__wsHandles || {};
+  var CONNECTING = 0, OPEN = 1, CLOSING = 2, CLOSED = 3;
+  var B64 = globalThis.__fetchB64;
+  function WS(url, protocols){
+    if (typeof url !== 'string') url = String(url);
+    this.url = url;
+    this.readyState = CONNECTING;
+    this.bufferedAmount = 0;
+    this.binaryType = 'arraybuffer';
+    this.protocol = '';
+    this.extensions = '';
+    this.onopen = null; this.onmessage = null; this.onclose = null; this.onerror = null;
+    this._listeners = { open: [], message: [], close: [], error: [] };
+    this._handleId = null;
+    this._lastSeq = 0;
+    this._severed = false;
+    this._sendQ = [];
+    this._opened = false;
+    var self = this;
+    // open lazily (async host effect). Subsequent send/recv await this.
+    this._ready = globalThis.host['ws.open'](url, protocols || undefined).then(function(r){
+      if (!r || r.error){ self.readyState = CLOSED; self._dispatch('error', { type: 'error', message: (r && r.error) || 'ws open failed' }); self._dispatch('close', { type: 'close', code: 1006, wasClean: false }); return; }
+      self._handleId = r.handleId;
+      globalThis.__wsHandles[r.handleId] = { handleId: r.handleId, url: url, lastSeq: 0, severed: false };
+      // flush queued sends
+      var q = self._sendQ; self._sendQ = [];
+      for (var i=0;i<q.length;i++){ self._rawSend(q[i].data, q[i].binary); }
+    });
+  }
+  WS.CONNECTING = CONNECTING; WS.OPEN = OPEN; WS.CLOSING = CLOSING; WS.CLOSED = CLOSED;
+  WS.prototype.CONNECTING = CONNECTING; WS.prototype.OPEN = OPEN; WS.prototype.CLOSING = CLOSING; WS.prototype.CLOSED = CLOSED;
+  WS.prototype._dispatch = function(type, ev){
+    ev = ev || {}; ev.type = ev.type || type; ev.target = this;
+    var on = this['on' + type]; if (typeof on === 'function'){ try { on.call(this, ev); } catch(e){} }
+    var ls = this._listeners[type] || [];
+    for (var i=0;i<ls.length;i++){ try { ls[i].call(this, ev); } catch(e){} }
+  };
+  WS.prototype.addEventListener = function(type, fn){ if (this._listeners[type]) this._listeners[type].push(fn); };
+  WS.prototype.removeEventListener = function(type, fn){ var ls = this._listeners[type]; if (!ls) return; var i = ls.indexOf(fn); if (i>=0) ls.splice(i,1); };
+  WS.prototype._rawSend = function(data, binary){
+    var self = this;
+    var payload, isBin = false;
+    if (data instanceof Uint8Array){ payload = B64.enc(data); isBin = true; }
+    else if (data instanceof ArrayBuffer){ payload = B64.enc(new Uint8Array(data)); isBin = true; }
+    else if (ArrayBuffer.isView && ArrayBuffer.isView(data)){ payload = B64.enc(new Uint8Array(data.buffer, data.byteOffset, data.byteLength)); isBin = true; }
+    else { payload = String(data); isBin = false; }
+    return globalThis.host['ws.send'](self._handleId, payload, isBin).then(function(r){
+      if (r && r.error){ self._dispatch('error', { type: 'error', message: r.error }); }
+      return r;
+    });
+  };
+  WS.prototype.send = function(data){
+    if (this.readyState === CLOSING || this.readyState === CLOSED){ throw new Error('WebSocket is already in CLOSING or CLOSED state.'); }
+    if (!this._handleId){ this._sendQ.push({ data: data, binary: false }); return; }
+    return this._rawSend(data);
+  };
+  // _ingest: turn a host.ws frame into the WHATWG event + advance the cursor. Returns true if the
+  // socket is now closed/severed (stop pumping).
+  WS.prototype._ingest = function(f){
+    if (!f || typeof f.seq !== 'number') return false;
+    if (f.seq > this._lastSeq) this._lastSeq = f.seq;
+    if (this._handleId && globalThis.__wsHandles[this._handleId]) globalThis.__wsHandles[this._handleId].lastSeq = this._lastSeq;
+    if (f.type === 'open'){ this.readyState = OPEN; this._opened = true; this._dispatch('open', { type: 'open' }); return false; }
+    if (f.type === 'message'){
+      if (this.readyState === CONNECTING){ this.readyState = OPEN; this._opened = true; this._dispatch('open', { type: 'open' }); }
+      var data = f.data;
+      if (f.binary){ var u8 = B64.dec(f.data); data = (this.binaryType === 'arraybuffer') ? u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength) : u8; }
+      this._dispatch('message', { type: 'message', data: data });
+      return false;
+    }
+    if (f.type === 'close'){ this.readyState = CLOSED; if (f.severed) this._severed = true; this._dispatch('close', { type: 'close', code: f.code || 1006, reason: f.reason || '', wasClean: !f.severed && (f.code === 1000) }); return true; }
+    if (f.type === 'error'){ this._dispatch('error', { type: 'error', message: f.reason || 'socket error' }); return false; }
+    if (f.type === 'overflow'){ this._dispatch('error', { type: 'error', message: 'frame overflow (dropped through seq ' + (f.droppedThrough || f.seq) + ')' }); return false; }
+    if (f.type === 'idle'){ return false; }
+    return false;
+  };
+  // pump(opts): drain queued frames (poll), then do ONE parked recv with an idle deadline. Returns
+  // when the socket goes idle/closed. Bounded: never an unbounded recv loop (mutex turns over).
+  // opts.maxFrames caps frames per pump (default 256); opts.idleMs sets the recv idle deadline.
+  WS.prototype.pump = function(opts){
+    opts = opts || {};
+    var self = this; var maxFrames = opts.maxFrames || 256; var idleMs = opts.idleMs;
+    return self._ready.then(function(){
+      if (!self._handleId) return { closed: true, frames: 0 };
+      var n = 0;
+      function step(){
+        if (n >= maxFrames) return { closed: self.readyState === CLOSED, frames: n };
+        return globalThis.host['ws.poll'](self._handleId, self._lastSeq + 1).then(function(p){
+          var evs = (p && p.events) || [];
+          var closedNow = false;
+          for (var i=0;i<evs.length;i++){ n++; if (self._ingest(evs[i])) closedNow = true; if (n >= maxFrames) break; }
+          if (closedNow || self.readyState === CLOSED) return { closed: true, frames: n };
+          if (evs.length) return step();
+          // queue empty: ONE parked recv with the idle deadline.
+          return globalThis.host['ws.recv'](self._handleId, self._lastSeq + 1, idleMs).then(function(f){
+            n++;
+            var done = self._ingest(f);
+            if (f && f.type === 'idle') return { closed: false, frames: n, idle: true };
+            if (done || self.readyState === CLOSED) return { closed: true, frames: n };
+            return step();
+          });
+        });
+      }
+      return step();
+    });
+  };
+  // recv(idleMs): pull exactly ONE frame (poll fast-path, else parked recv). Lower-level than pump.
+  WS.prototype.recv = function(idleMs){
+    var self = this;
+    return self._ready.then(function(){
+      if (!self._handleId) return { type: 'close', code: 1006, severed: true };
+      return globalThis.host['ws.poll'](self._handleId, self._lastSeq + 1).then(function(p){
+        var evs = (p && p.events) || [];
+        if (evs.length){ self._ingest(evs[0]); return evs[0]; }
+        return globalThis.host['ws.recv'](self._handleId, self._lastSeq + 1, idleMs).then(function(f){ self._ingest(f); return f; });
+      });
+    });
+  };
+  WS.prototype.close = function(code, reason){
+    if (this.readyState === CLOSED) return;
+    this.readyState = CLOSING;
+    var self = this;
+    if (!this._handleId){ this.readyState = CLOSED; return; }
+    return globalThis.host['ws.close'](this._handleId, code, reason).then(function(){ self.readyState = CLOSED; if (self._handleId && globalThis.__wsHandles[self._handleId]) delete globalThis.__wsHandles[self._handleId]; });
+  };
+  globalThis.WebSocket = WS;
+  globalThis.__realWebSocket = true;
+})();
+
 // console.dir/group/table over the existing capture + __preview.
+
 globalThis.console.dir      = function(x, o){ globalThis.console.log(globalThis.__preview(x, (o && o.depth) || 4)); };
 globalThis.console.group    = function(){ globalThis.console.log.apply(null, arguments); };
 globalThis.console.groupEnd = function(){};
