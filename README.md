@@ -8,7 +8,7 @@
 
 Engram runs untrusted / agent-authored JavaScript in a sandboxed [QuickJS](https://github.com/quickjs-ng/quickjs) interpreter compiled to WASM, hosted inside a Cloudflare Durable Object. A session keeps a **live interpreter namespace** — variables, closures, pending promises, injected stdlib — that **survives idle eviction and cold restart with no replay and no re-fired side effects**, because the entire interpreter heap is snapshotted to durable storage and blitted back on wake.
 
-It is a Jupyter/IPython-kernel for the edge: a REPL that sleeps when idle and resumes with full live state. On top of that core it ships a codemode/RLM execution backend, per-tenant auth + metering, an SDK, a CLI, and a browser notebook.
+It is a Jupyter/IPython-kernel for the edge: a REPL that sleeps when idle and resumes with full live state, with a deterministic Node-v20-shaped compat facade inside the VM (require/Buffer/fs-VFS/streams/fetch). On top of that core it ships per-tenant auth + metering, an SDK, a CLI, and a browser notebook. (RLM/codemode flows are an `@engram/sdk@0.9.x` legacy layer, **not** part of the v2 runtime — see `docs/RLM-STRIPPED.md`.)
 
 > **Provenance.** Formerly `montydyn`, renamed to **Engram** on the rebrand — the heap snapshot *is* an engram, a memory trace. The on-disk folder stays `montydyn/`; brand, repo, and deployed worker names changed.
 
@@ -172,7 +172,7 @@ Full numbers: `docs/results/SUMMARY.md`.
 
 ## Status & remaining gaps (honest)
 
-**Product complete** as a durable, hibernating, multi-tenant codemode/RLM REPL platform — kernel + auth/metering + lambda-RLM + agent mode + SDK + CLI + UI, scale-validated, known holes closed.
+**Product complete** as a durable, hibernating, multi-tenant **stateful JS REPL substrate** with per-cell heap-snapshot durability + a Node-v20-shaped VM facade — kernel + auth/metering + SDK + CLI + UI, scale-validated, known holes closed. RLM/codemode flows are an `@engram/sdk@0.9.x` legacy layer (not in the v2 runtime); being rebuilt as an application layer on `host.fetch`/`host.<name>()`/`host.final`/`host.ctx`.
 
 **Not done (owner-gated or out of scope):**
 1. **npm publish** of `@engram/sdk` + CLI — built, needs owner OK.

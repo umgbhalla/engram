@@ -37,9 +37,10 @@ True live-state snapshot/restore. Not journaling. Not source replay. The heap *i
 - **Determinism on tap.** Seeded clock/RNG/crypto → byte-identical sessions across restore.
 - **A clean host boundary.** Network, KV, and a genuinely-huge host-side context (`host.ctx.*`,
   kept *out* of the snapshot envelope) reached via `host.<name>()`.
-- **Code Mode + RLM, batteries included.** `execute(code, fns)`, an SDK-orchestrated `rlm()`, a
-  **provably-terminating** `lambdaRLM()`, and a durable **agent** adapter whose multi-turn memory
-  hibernates between turns.
+- **Code Mode + RLM building blocks.** `host.fetch`, generic `host.<name>()` tools, the `host.final`
+  sentinel, and the durable `host.ctx` map are the seam orchestration is built on. The loops
+  themselves (`execute`/`rlm`/`lambdaRLM`/`createAgent`) live in `@engram/sdk@0.9.x` — they are **not**
+  in the v2 core; they're being rebuilt as an application layer on top.
 - **Multi-tenant when you need it.** Same SDK, point at `engram-cloud`: per-tenant API keys,
   metering, and per-session facet isolation.
 

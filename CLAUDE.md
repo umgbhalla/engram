@@ -11,7 +11,9 @@
 
 **One line:** a durable, hibernating, dynamically-configured **stateful JavaScript REPL** on
 Cloudflare — the live QuickJS interpreter heap is snapshotted to a Durable Object's SQLite,
-so a session sleeps when idle and wakes with full live state, no replay.
+so a session sleeps when idle and wakes with full live state, no replay. The VM now wears a
+deterministic **Node-v20-shaped compat facade** (Waves 1–4: require/Buffer/in-heap-VFS-fs/streams/
+seeded-crypto/zlib/WHATWG-fetch) over a hard 12-import WASM ceiling — Node-*shaped*, never real Node.
 
 **How we got here (the journey + plans/expectations):**
 1. Started exploring **Cloudflare Dynamic Worker Loader** (run code in fresh isolates at runtime).
@@ -74,7 +76,7 @@ Older `v0.x`/version dirs pruned (git history + `v0.N-milestone` tags).
 
 **Shipped after V1.0:** **v0.9.1** big-context fix (chunked store, multi-MB survives cold-restore) · **V1.1** multi-tenant facet at v0.8 parity + adaptive keep-warm · **v1.2** per-tenant API-key auth + AE metering + `/usage` (billable SaaS seam) · **v0.9.2** bounded **lambda-RLM** combinators (SPLIT/MAP/REDUCE, terminates) + durable **agent code-mode** adapter · **notebook UI** (`montydyn-ui`: durable browser REPL + RLM demo) · **v0.9.3** native-C giant-alloc backstop (no WS-1006) + engine-migration journal + scale-validated (0% err @150 concurrent, bad-facet isolation).
 
-**PRODUCT COMPLETE (arc end):** Engram is a durable, hibernating, **multi-tenant codemode/RLM REPL platform** — kernel + auth/metering + lambda-RLM + agent mode + SDK + CLI + UI, scale-validated, all known holes closed. Deployed (post-rebrand): `engram-kernel` (codemode kernel, from v0.9.3/) · `engram-cloud` (multi-tenant SaaS, from v1.2/) · `engram-ui` (notebook, from ui/). **Remaining to GA (NOT auto-done):** npm-publish `@engram/sdk` (needs owner OK) · scale-at-1000s · docs site · R2 stale-key prune (needs R2 S3 token). **Python kernel: DROPPED per owner.**
+**PRODUCT COMPLETE (arc end):** Engram is a durable, hibernating, multi-tenant **stateful JS REPL substrate** (kernel + auth/metering + SDK + CLI + UI) whose per-cell heap snapshot is the durable resumption primitive. The v0.9.x codemode/RLM layer (lambda-RLM, agent mode, `execute`/`rlm`/`createAgent`) was **stripped from the v2 Rust core** (`docs/RLM-STRIPPED.md`) and lives only in `@engram/sdk@0.9.x` / git history — RLM is an **application layer** being rebuilt on top (ouru), NOT a runtime capability. Scale-validated, all known holes closed. Deployed (post-rebrand): `engram-kernel` (codemode kernel, from v0.9.3/) · `engram-cloud` (multi-tenant SaaS, from v1.2/) · `engram-ui` (notebook, from ui/). **Remaining to GA (NOT auto-done):** npm-publish `@engram/sdk` (needs owner OK) · scale-at-1000s · docs site · R2 stale-key prune (needs R2 S3 token). **Python kernel: DROPPED per owner.**
 
 ## Goal
 

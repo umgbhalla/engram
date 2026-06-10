@@ -1,5 +1,7 @@
 # Engram — Codebase Design & Internals
 
+> **NOTE (positioning, 2026-06-10):** Engram is a **durable hibernating Node-ish QuickJS REPL substrate** — the per-cell heap snapshot is the durable resumption primitive. Any RLM/codemode surface described below (`setContext`/`final`/stdlib frames, `host.subLM`, `ctx_chunks`) is **legacy v0.9.x**; the deployed Rust v2 kernel routes only `create/eval/ping/gen/reset/evict/health`. RLM is an application layer (ouru), not a runtime capability — see `docs/RLM-STRIPPED.md`.
+
 Text-first design doc. Every diagram encodes one idea; read the caption as the takeaway.
 Source of truth for *where things live*: `v0.9.3/src/{lib.rs,glue.js}` (kernel), `v1.2/src/supervisor.js` (cloud).
 
