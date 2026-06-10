@@ -186,6 +186,93 @@ try { Object.defineProperty(Math, 'random', { value: globalThis.__rand, writable
 // seeded performance.now (monotone, ms) reuses the clock tick
 try { if (typeof performance === 'undefined') { globalThis.performance = {}; } performance.now = function(){ return globalThis.__now(); }; } catch(e){}
 
+// ===== ENV-FIDELITY SHIMS (fix not-real-node gotchas; all determinism-safe) =====
+// FIX: new Date() argless returned 1970 (the native Date used the engine's frozen internal clock,
+// disconnected from the seeded __now()). Wrap Date so no-arg construction + Date()-as-function use
+// the SEEDED clock; every other form (ms / ISO / y,m,d...) passes through. instanceof stays correct
+// (prototype shared). Determinism preserved.
+try {
+  var __ND = Date;
+  function EngramDate(){ 
+    if (!(this instanceof EngramDate)) { return new __ND(globalThis.__now()).toString(); }
+    if (arguments.length === 0) { return new __ND(globalThis.__now()); }
+    return new __ND(...arguments);
+  }
+  EngramDate.prototype = __ND.prototype;
+  EngramDate.now = globalThis.__now;
+  EngramDate.parse = __ND.parse;
+  EngramDate.UTC = __ND.UTC;
+  try { Object.setPrototypeOf(EngramDate, __ND); } catch(e){}
+  globalThis.Date = EngramDate;
+} catch(e){}
+
+// FIX: Atomics was absent while SharedArrayBuffer existed (a feature-detect lie). The VM is
+// single-threaded, so atomic ops are plain memory ops — correct for one thread.
+try {
+  if (typeof globalThis.Atomics === 'undefined') {
+    globalThis.Atomics = {
+      load: function(t,i){ return t[i]; },
+      store: function(t,i,v){ t[i]=v; return v; },
+      add: function(t,i,v){ var x=t[i]; t[i]=x+v; return x; },
+      sub: function(t,i,v){ var x=t[i]; t[i]=x-v; return x; },
+      and: function(t,i,v){ var x=t[i]; t[i]=x&v; return x; },
+      or:  function(t,i,v){ var x=t[i]; t[i]=x|v; return x; },
+      xor: function(t,i,v){ var x=t[i]; t[i]=x^v; return x; },
+      exchange: function(t,i,v){ var x=t[i]; t[i]=v; return x; },
+      compareExchange: function(t,i,e,v){ var x=t[i]; if(x===e) t[i]=v; return x; },
+      isLockFree: function(){ return true; },
+      wait: function(){ return 'not-equal'; },
+      notify: function(){ return 0; }
+    };
+  }
+} catch(e){}
+
+// FIX: EventTarget/Event/CustomEvent were absent (Web-event code + custom emitters broke). Minimal
+// synchronous-dispatch shim.
+try {
+  if (typeof globalThis.EventTarget === 'undefined') {
+    function EngramEvent(type, init){ this.type=type; init=init||{}; this.bubbles=!!init.bubbles; this.cancelable=!!init.cancelable; this.defaultPrevented=false; this.target=null; this.currentTarget=null; this.timeStamp=globalThis.__now(); if('detail' in init) this.detail=init.detail; }
+    EngramEvent.prototype.preventDefault=function(){ if(this.cancelable) this.defaultPrevented=true; };
+    EngramEvent.prototype.stopPropagation=function(){};
+    EngramEvent.prototype.stopImmediatePropagation=function(){};
+    function ETarget(){ this.__l = Object.create(null); }
+    ETarget.prototype.addEventListener=function(t,cb){ if(typeof cb!=='function') return; (this.__l[t]||(this.__l[t]=[])).push(cb); };
+    ETarget.prototype.removeEventListener=function(t,cb){ var a=this.__l[t]; if(a){ var i=a.indexOf(cb); if(i>=0) a.splice(i,1); } };
+    ETarget.prototype.dispatchEvent=function(ev){ ev.target=ev.target||this; ev.currentTarget=this; var a=(this.__l[ev.type]||[]).slice(); for(var i=0;i<a.length;i++){ try{ a[i].call(this,ev); }catch(e){} } return !ev.defaultPrevented; };
+    globalThis.EventTarget = ETarget;
+    if (typeof globalThis.Event === 'undefined') globalThis.Event = EngramEvent;
+    if (typeof globalThis.CustomEvent === 'undefined') globalThis.CustomEvent = EngramEvent;
+  }
+} catch(e){}
+
+// FIX: Intl was entirely absent (ReferenceError on Intl.NumberFormat; i18n/format libs broke).
+// Minimal non-localized-but-functional NumberFormat/DateTimeFormat/Collator/PluralRules.
+try {
+  if (typeof globalThis.Intl === 'undefined') {
+    function NumberFormat(loc, opts){ this._o = opts || {}; }
+    NumberFormat.prototype.format = function(n){
+      var o=this._o; n=Number(n);
+      if(o.style==='percent'){ return String(n*100)+'%'; }
+      var s = (o.minimumFractionDigits!=null || o.maximumFractionDigits!=null)
+        ? n.toFixed(o.maximumFractionDigits!=null ? o.maximumFractionDigits : (o.minimumFractionDigits||0))
+        : String(n);
+      if(o.useGrouping!==false){ var pp=s.split('.'); pp[0]=pp[0].replace(/\B(?=(\d{3})+(?!\d))/g, ','); s=pp.join('.'); }
+      if(o.style==='currency'){ s=(o.currency||'USD')+' '+s; }
+      return s;
+    };
+    NumberFormat.prototype.resolvedOptions=function(){ return Object.assign({locale:'en-US',numberingSystem:'latn'}, this._o); };
+    function DateTimeFormat(loc, opts){ this._o = opts || {}; }
+    DateTimeFormat.prototype.format=function(d){ d=(d==null)?new Date():(d instanceof Date?d:new Date(d)); return d.toISOString(); };
+    DateTimeFormat.prototype.resolvedOptions=function(){ return Object.assign({locale:'en-US',timeZone:'UTC'}, this._o); };
+    function Collator(){}
+    Collator.prototype.compare=function(a,b){ a=String(a); b=String(b); return a<b?-1:(a>b?1:0); };
+    function PluralRules(){}
+    PluralRules.prototype.select=function(n){ return Number(n)===1?'one':'other'; };
+    globalThis.Intl = { NumberFormat:NumberFormat, DateTimeFormat:DateTimeFormat, Collator:Collator, PluralRules:PluralRules, getCanonicalLocales:function(l){ return Array.isArray(l)?l.slice():[l]; } };
+  }
+} catch(e){}
+// ===== END ENV-FIDELITY SHIMS =====
+
 // seeded crypto shim: nanoid/uuid call crypto.getRandomValues. Route through the seeded
 // __rand so seeded sessions stay byte-reproducible across restore. randomUUID is v4-shaped.
 try {
@@ -622,8 +709,11 @@ if (typeof globalThis.setTimeout === 'undefined') {
   globalThis.clearTimeout = function(id){ __tcancel[id] = true; };
   globalThis.setImmediate = function(f){ var a = Array.prototype.slice.call(arguments, 1); var id = __tid++; queueMicrotask(function(){ if (typeof f === 'function') f.apply(null, a); }); return id; };
   globalThis.clearImmediate = function(){};
-  globalThis.setInterval = function(){ return __tid++; };   // no-op: no repeating timers
-  globalThis.clearInterval = function(){};
+  // FIX: setInterval was a no-op (never fired — a silent lie). The VM has no wall clock, so a
+  // repeating timer drains on the event loop (microtask queue), bounded to 10k iterations so a
+  // forgotten clearInterval cannot wedge the cell; stop early via clearInterval(id).
+  globalThis.setInterval = function(f){ var a = Array.prototype.slice.call(arguments, 2); var id = __tid++; var n = 0; function tick(){ if (__tcancel[id]) { delete __tcancel[id]; return; } if (++n > 10000) { delete __tcancel[id]; return; } if (typeof f === 'function') { try { f.apply(null, a); } catch(e){} } if (!__tcancel[id]) queueMicrotask(tick); } queueMicrotask(tick); return id; };
+  globalThis.clearInterval = function(id){ __tcancel[id] = true; };
 }
 // base64<->bytes helpers shared by fetch, Response/Request/Blob bodies, and FormData.
 (function(){
@@ -1613,6 +1703,34 @@ globalThis.__builtins = {
   string_decoder: __string_decoder,
   os: { platform: function(){ return 'engram'; }, EOL: '\n', homedir: function(){ return '/'; }, tmpdir: function(){ return '/tmp'; }, hostname: function(){ return 'engram'; }, arch: function(){ return 'wasm'; }, cpus: function(){ return []; }, type: function(){ return 'Engram'; }, release: function(){ return '0.0.0'; }, totalmem: function(){ return 0; }, freemem: function(){ return 0; }, uptime: function(){ return 0; }, endianness: function(){ return 'LE'; } },
   buffer: { Buffer: globalThis.Buffer, kMaxLength: 0x7fffffff, constants: { MAX_LENGTH: 0x7fffffff, MAX_STRING_LENGTH: 0x1fffffff } },
+  // FIX: dns was excluded (no resolver in an isolate). Shim it over DNS-over-HTTPS via the mediated
+  // host.fetch (cloudflare-dns.com must be on the fetch allowlist). async promises + node-style
+  // callback forms. Results are host-provided (like fetch): recorded in the oplog so restore stays
+  // consistent; adds no entropy to the seeded clock/rng.
+  dns: (function(){
+    function doh(name, type){
+      return globalThis.host.fetch('https://cloudflare-dns.com/dns-query?name=' + encodeURIComponent(name) + '&type=' + type, { headers: { accept: 'application/dns-json' } })
+        .then(function(r){ if(!r || !r.ok) throw new Error('dns: DoH query failed (' + (r && r.status) + ')'); var j = JSON.parse(r.body); var want = {A:1,AAAA:28,TXT:16,CNAME:5,MX:15,NS:2}[type]; return (j.Answer || []).filter(function(an){ return an.type === want; }).map(function(an){ return an.data; }); });
+    }
+    var promises = {
+      resolve4: function(n){ return doh(n,'A'); },
+      resolve6: function(n){ return doh(n,'AAAA'); },
+      resolveTxt: function(n){ return doh(n,'TXT').then(function(a){ return a.map(function(x){ return [String(x).replace(/^"|"$/g,'')]; }); }); },
+      resolveCname: function(n){ return doh(n,'CNAME'); },
+      resolveNs: function(n){ return doh(n,'NS'); },
+      resolveMx: function(n){ return doh(n,'MX').then(function(a){ return a.map(function(x){ var p=String(x).split(' '); return { priority: (+p[0])||0, exchange: p[1]||p[0] }; }); }); },
+      resolve: function(n,t){ return doh(n, t||'A'); },
+      lookup: function(n){ return doh(n,'A').then(function(a){ return { address: a[0], family: 4 }; }); }
+    };
+    function cb(fn){ return function(){ var args = Array.prototype.slice.call(arguments); var c = args.pop(); fn.apply(null, args).then(function(v){ c(null, v); }, function(e){ c(e); }); }; }
+    return {
+      promises: promises,
+      resolve4: cb(promises.resolve4), resolve6: cb(promises.resolve6), resolveTxt: cb(promises.resolveTxt),
+      resolveCname: cb(promises.resolveCname), resolveNs: cb(promises.resolveNs), resolveMx: cb(promises.resolveMx),
+      resolve: cb(promises.resolve),
+      lookup: function(n, opts, c){ if (typeof opts === 'function') { c = opts; } promises.lookup(n).then(function(r){ c(null, r.address, r.family); }, function(e){ c(e); }); }
+    };
+  })(),
 };
 // node:-prefixed + submodule aliases (stream/promises, fs/promises, util/types, assert/strict).
 (function(){
@@ -1634,7 +1752,7 @@ globalThis.__nodeCompat = {
   globals: ['Buffer','TextEncoder','TextDecoder','URL','URLSearchParams','Headers','Request','Response','Blob','File','FormData','AbortController','AbortSignal','structuredClone','crypto','fetch','queueMicrotask','setTimeout','setImmediate','process','console','performance'],
   stdlib: ['fs (in-heap VFS, sync + promises + createReadStream/createWriteStream + readdir withFileTypes Dirent)', 'path (full posix)', 'stream (Readable/Writable/Duplex/Transform/PassThrough + pipeline/finished)', 'util.inspect/format/types/promisify', 'assert (structural deepStrictEqual)', 'Buffer (full read/write matrix)', 'crypto (randomBytes/randomUUID/randomInt + createHash sha256|sha1|md5 + createHmac + scryptSync)', 'zlib (gzip/gunzip/deflate/inflate sync+async; pure-JS DEFLATE; NO brotli)', 'url (legacy parse/format/resolve + WHATWG URL/URLSearchParams)', 'http/https (CLIENT request/get over host.fetch; NO server)', 'WHATWG fetch: fetch()->Response + Request/Response/Headers/Blob/File/FormData/AbortController'],
   use: "await use('pkgname') — fetch+eval a self-contained CJS/UMD npm bundle from a CDN (esm.sh ?bundle&cjs, then jsDelivr). Async; pin a version with use('pkg@1.2.3'); override the URL with use('pkg', {url}). ESM-only packages surface an actionable error suggesting the esm.sh ?bundle CJS build. Use this for any npm package not in builtins.",
-  excluded: ['net','dns','tls','http-server','https-server','child_process','cluster','worker_threads','dgram','v8','vm','repl'],
+  excluded: ['net','tls','http-server','https-server','child_process','cluster','worker_threads','dgram','v8','vm','repl'],
   caveats: [
     'Deterministic sandbox: Date.now()/Math.random() are SEEDED (reproducible across restore), not wall-clock/entropy.',
     'Timers are IMMEDIATE: setTimeout/setImmediate fire on the microtask queue ignoring the delay; setInterval is a no-op. No wall-clock timers.',
@@ -1876,6 +1994,7 @@ globalThis.use = async function(name, opts){
   var urls = opts.url ? [opts.url] : [
     'https://esm.sh/' + name + '?bundle&cjs&target=es2022',
     'https://cdn.jsdelivr.net/npm/' + name,
+    'https://unpkg.com/' + name,
   ];
   var src = null, usedUrl = null, lastErr = null, lastStatus = 0;
   for (var ui=0; ui<urls.length; ui++){
