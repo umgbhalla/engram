@@ -386,6 +386,14 @@ const SCRUB_SLACK_BYTES = 4 * 1024 * 1024;          // scrub when freed slack ex
 const SCRUB_MAX_BUFFER_BYTES = 44 * 1024 * 1024 + SCRATCH_DELTA_BYTES;      // only scrub below this (stay under the absolute cap)
 const COMPACT_TRIGGER_BYTES = 12 * 1024 * 1024;     // cell-boundary scrub trigger (bloated buffer)
 const COMPACT_USED_RATIO = 0.4;                     // ...AND used/buffer < 0.4 (>=60% slack = freed spike)
+// TIER-1 ADDITIVE INCOMPRESSIBLE-CONTENT CEILING (below the ~28MB transient-OOM cliff).
+// buffer_bytes() includes up to SCRATCH_DELTA_BYTES of zero-filled scratch high-water that gzips
+// away; the genuine INCOMPRESSIBLE content is ~max(usedHeap, bufferBytes - SCRATCH_DELTA_BYTES).
+// A flat raw buffer_bytes() gate would false-trip every benign session that ever pulled in a big
+// fetch (resident scratch high-water), which is exactly why the absolute cap is 76MB not 24MB.
+// Gating the INCOMPRESSIBLE extent catches an incompressible-heap session BELOW the uncatchable
+// WS-1006 cliff (the dump's transient ~2-3x gz/copy expansion OOMs there) WITHOUT false-tripping.
+const INCOMPRESSIBLE_BUFFER_CEILING_BYTES = 24 * 1024 * 1024; // 24MB, below the ~28MB incompressible WS-1006 cliff
 
 // ---- W4 byte-delta thresholds (docs/W4-BYTEDELTA-PLAN.md, W4-proven) ----
 const DELTA_GRAIN_BYTES = 256;   // W4-proven sweet spot (295KB gz delta vs ~1MB full)
@@ -1009,6 +1017,19 @@ class GlueKernel {
       throw new Error(
         "SizeAdmissionError: live used heap " + usedHeap +
           "B > MAX_USED_BYTES " + MAX_USED_BYTES + "; refusing snapshot"
+      );
+    }
+    // TIER-1 ADDITIVE: gate the INCOMPRESSIBLE extent (max of the genuine allocator tally and the
+    // buffer minus the zeroed scratch high-water) below the ~28MB transient-OOM cliff. This closes
+    // the gap between MAX_USED_BYTES(50MB) and SAFE_SERIALIZE_BUFFER_BYTES(76MB) for the specific
+    // incompressible-heap case that WS-1006s the DO during the dump's transient gz/copy expansion.
+    // usedHeap here is the GC-refined value (scrub_arena ran above when the buffer was bloated).
+    const incompressibleBytes = Math.max(usedHeap, bufBytes0 - SCRATCH_DELTA_BYTES);
+    if (incompressibleBytes >= INCOMPRESSIBLE_BUFFER_CEILING_BYTES) {
+      throw new Error(
+        "SizeAdmissionError: incompressible buffer " + incompressibleBytes +
+          "B >= INCOMPRESSIBLE_BUFFER_CEILING_BYTES " + INCOMPRESSIBLE_BUFFER_CEILING_BYTES +
+          " (below the ~28MB transient-OOM cliff; refusing snapshot — reset to recover)"
       );
     }
     // W5 (b)+(c): scrub freed slack so the STORED gz image shrinks below the soft ceiling.
