@@ -696,6 +696,24 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
   // Single graceful-exit path, idempotent (rl 'close', .exit, and the process
   // SIGINT backstop all funnel here). Prints the resume command so the durable
   // session can be picked up later — its live namespace survives on the kernel.
+  // Backstop: in some pty/pane setups readline does not deliver its 'SIGINT'
+  // event reliably (e.g. while paused mid-eval), so a process-level handler
+  // guarantees double-Ctrl-C always exits. First press latches + hints; second
+  // consecutive press exits. Any submitted line clears the latch (in the 'line'
+  // handler via sigintOnEmpty=false).
+  const sigintHandler = (): void => {
+    if (editorMode || buffer) return; // rl's own handler covers cancel/clear
+    if (sigintOnEmpty) {
+      wantExit = true;
+      gracefulExit();
+      return;
+    }
+    sigintOnEmpty = true;
+    stdout.write("\n" + c.dim("(To exit, press Ctrl+C again or Ctrl+D or type .exit)") + "\n");
+    rl.prompt();
+  };
+  process.on("SIGINT", sigintHandler);
+
   let exited = false;
   const gracefulExit = (): void => {
     if (exited) return;
@@ -709,26 +727,11 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
     const epFlag = endpoint === DEFAULT_ENDPOINT ? "" : ` --endpoint ${endpoint}`;
     console.log(c.dim("\nbye. session is durable — resume with:"));
     console.log(c.cyan(`  engram repl --session ${sessionId}${epFlag}`));
+    process.removeListener("SIGINT", sigintHandler);
     session.close();
     resolveDone();
+    process.exit(0);
   };
-
-  // Backstop: in some pty/pane setups readline does not deliver its 'SIGINT'
-  // event reliably (e.g. while paused mid-eval), so a process-level handler
-  // guarantees double-Ctrl-C always exits. First press latches + hints; second
-  // consecutive press exits. Any submitted line clears the latch (in the 'line'
-  // handler via sigintOnEmpty=false).
-  process.on("SIGINT", () => {
-    if (editorMode || buffer) return; // rl's own handler covers cancel/clear
-    if (sigintOnEmpty) {
-      wantExit = true;
-      gracefulExit();
-      return;
-    }
-    sigintOnEmpty = true;
-    stdout.write("\n" + c.dim("(To exit, press Ctrl+C again or Ctrl+D or type .exit)") + "\n");
-    rl.prompt();
-  });
 
   wire();
   setPrompt();
