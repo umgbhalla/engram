@@ -1,0 +1,43 @@
+{
+  // CF Sandbox comparison worker.
+  //
+  // @cloudflare/sandbox runs user code inside a Cloudflare *Container* fronted by a
+  // Durable Object. The DO is the addressable identity (getSandbox(env.Sandbox, id));
+  // the Container is the full-Linux runtime where code actually executes.
+  //
+  // BETA / ACCESS CAVEATS (read README.md before deploying):
+  //   - Cloudflare Containers require the Workers Paid plan AND Containers beta access.
+  //   - The DO class MUST extend the Sandbox class exported by @cloudflare/sandbox, and
+  //     MUST be declared in BOTH a durable_objects binding and a migration.
+  //   - Containers need a `containers` stanza (image + the class that owns it). The image
+  //     is built/pushed by `wrangler deploy`.
+  //   - This config name is namespaced so it never collides with the live engram workers.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "engram-compare-cfsandbox",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-05-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "containers": [
+    {
+      // The container image @cloudflare/sandbox ships. Pin to the version in package.json.
+      // (As of the sandbox SDK docs the published base image is referenced by the SDK; if
+      // you vendor your own Dockerfile, point `image` at it instead.)
+      "class_name": "Sandbox",
+      "image": "./Dockerfile",
+      "max_instances": 50
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      { "class_name": "Sandbox", "name": "Sandbox" }
+    ]
+  },
+
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Sandbox"] }
+  ],
+
+  "observability": { "enabled": true }
+}

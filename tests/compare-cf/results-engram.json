@@ -1,0 +1,228 @@
+{
+  "target": "engram",
+  "base": "engram-kernel.umg-bhalla88.workers.dev",
+  "startedAt": "2026-06-10T18:20:46.224Z",
+  "durationMs": 459912,
+  "summary": [
+    {
+      "capability": "CAP-1-live-heap-survives-eviction",
+      "outcome": "PASS-claim"
+    },
+    {
+      "capability": "CAP-2-no-replay-effects-once",
+      "outcome": "PASS-claim"
+    },
+    {
+      "capability": "CAP-3-determinism-by-seed",
+      "outcome": "PASS-claim"
+    },
+    {
+      "capability": "CAP-4-per-cell-snapshot-granularity",
+      "outcome": "INCONCLUSIVE"
+    },
+    {
+      "capability": "CAP-5-zero-idle-cost",
+      "outcome": "PASS-claim"
+    },
+    {
+      "capability": "CAP-6-wake-latency-distribution",
+      "outcome": "INCONCLUSIVE"
+    },
+    {
+      "capability": "CAP-7-concurrency-isolation-at-scale",
+      "outcome": "PASS-claim"
+    }
+  ],
+  "probes": [
+    {
+      "capability": "CAP-1-live-heap-survives-eviction",
+      "outcome": "PASS-claim",
+      "evidence": {
+        "preEvictValue": 101,
+        "postEvictValue": 102,
+        "inMemoryBefore": false,
+        "restoreSource": "sqlite-restore",
+        "postEvictError": null
+      },
+      "tookMs": 23503
+    },
+    {
+      "capability": "CAP-2-no-replay-effects-once",
+      "outcome": "PASS-claim",
+      "evidence": {
+        "firedAfterFirst": 1,
+        "firedAfterRestore": 1,
+        "inMemoryBefore": false,
+        "restoreSource": "sqlite-restore"
+      },
+      "tookMs": 24302
+    },
+    {
+      "capability": "CAP-3-determinism-by-seed",
+      "outcome": "PASS-claim",
+      "evidence": {
+        "A_R1": [
+          0.4932122668392295,
+          0.955659538405286,
+          1700000000001,
+          "e8454423-6752-4bb5-ab8f-31a23a10e428"
+        ],
+        "A_R2": [
+          0.08103754218646353,
+          0.9599486139030248
+        ],
+        "B_R1": [
+          0.4932122668392295,
+          0.955659538405286,
+          1700000000001,
+          "e8454423-6752-4bb5-ab8f-31a23a10e428"
+        ],
+        "byteIdenticalFields": "4/4",
+        "A_R2_continues": true
+      },
+      "tookMs": 37499
+    },
+    {
+      "capability": "CAP-4-per-cell-snapshot-granularity",
+      "outcome": "INCONCLUSIVE",
+      "evidence": {
+        "perCell": [
+          {
+            "n": 1,
+            "mode": "full",
+            "sizeGz": 568830,
+            "store": "sqlite"
+          },
+          {
+            "n": 2,
+            "mode": "delta",
+            "sizeGz": 18375,
+            "store": "sqlite"
+          },
+          {
+            "n": 3,
+            "mode": "delta",
+            "sizeGz": 17357,
+            "store": "sqlite"
+          },
+          {
+            "n": 4,
+            "mode": "delta",
+            "sizeGz": 18324,
+            "store": "sqlite"
+          },
+          {
+            "n": 5,
+            "mode": "delta",
+            "sizeGz": 17348,
+            "store": "sqlite"
+          },
+          {
+            "n": 6,
+            "mode": "delta",
+            "sizeGz": 15994,
+            "store": "sqlite"
+          },
+          {
+            "n": 7,
+            "mode": "delta",
+            "sizeGz": 15524,
+            "store": "sqlite"
+          },
+          {
+            "n": 8,
+            "mode": "delta",
+            "sizeGz": 16494,
+            "store": "sqlite"
+          },
+          {
+            "n": 9,
+            "mode": "delta",
+            "sizeGz": 16699,
+            "store": "sqlite"
+          },
+          {
+            "n": 10,
+            "mode": "delta",
+            "sizeGz": 17260,
+            "store": "sqlite"
+          }
+        ],
+        "afterRestoreN": 10,
+        "medianSteadySizeGz": 17260,
+        "deltaModeCount": 9,
+        "hasPerCellDurability": true
+      },
+      "tookMs": 25365
+    },
+    {
+      "capability": "CAP-5-zero-idle-cost",
+      "outcome": "PASS-claim",
+      "evidence": {
+        "idleMs": 3000,
+        "heartbeatsSent": 0,
+        "value": 777,
+        "inMemoryBefore": false,
+        "restoreSource": "sqlite-restore",
+        "note": "short idle (CI) — may not exceed the genuine eviction window; set ctx.idleMs ~20min for the real test"
+      },
+      "tookMs": 27061
+    },
+    {
+      "capability": "CAP-6-wake-latency-distribution",
+      "outcome": "INCONCLUSIVE",
+      "evidence": {
+        "samples": 12,
+        "wallMs": [
+          1241,
+          1307,
+          1174,
+          1200,
+          1232,
+          1046,
+          984,
+          971,
+          1047,
+          1165,
+          1028,
+          1187
+        ],
+        "restoreSources": {
+          "sqlite-restore": 12
+        },
+        "p50": 1174,
+        "p95": 1307,
+        "p99": 1307
+      },
+      "tookMs": 284332
+    },
+    {
+      "capability": "CAP-7-concurrency-isolation-at-scale",
+      "outcome": "PASS-claim",
+      "evidence": {
+        "K": 12,
+        "errors": 0,
+        "isolationViolations": 0,
+        "leaks": []
+      },
+      "tookMs": 12950
+    }
+  ],
+  "scale": {
+    "N": 40,
+    "errors": 0,
+    "isolationViolations": 0,
+    "killsOrClose": 0,
+    "leaks": [],
+    "latencyMs": {
+      "p50": 23568,
+      "p95": 24358,
+      "p99": 24888,
+      "min": 22800,
+      "max": 24888
+    },
+    "completed": 40,
+    "errorRate": 0,
+    "clean": true
+  }
+}

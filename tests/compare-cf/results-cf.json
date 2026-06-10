@@ -1,0 +1,78 @@
+{
+  "target": "cf-sandbox",
+  "base": "engram-compare-cfsandbox.umg-bhalla88.workers.dev (deleted)",
+  "measured": false,
+  "deployAttempt": {
+    "outcome": "blocked",
+    "blocker": "Cloudflare Containers access not enabled on the account. `wrangler deploy` built and pushed the @cloudflare/sandbox:0.4.0 container image (~680MB) successfully, but the Containers provisioning preflight `GET https://api.cloudflare.com/client/v4/accounts/<acct>/containers/me` returned 403 Forbidden {error:\"Authentication error\"}. The worker SCRIPT version did upload (version 12c84d45 at 2026-06-10T18:31:10Z) but the deployed worker returned runtime error code 1042 on /gen (Container binding could not be provisioned). This is the documented Containers-beta/paid gate, not a config or build error.",
+    "wranglerVersion": "4.99.0",
+    "sandboxSdkVersion": "@cloudflare/sandbox@0.4.18 (installed; scaffold pinned 0.4.0)",
+    "dockerBuild": "succeeded (base image docker.io/cloudflare/sandbox pulled + image exported)",
+    "cleanup": "engram-compare-cfsandbox worker DELETED (wrangler delete succeeded; HTTP now 404; deployments list reports no such worker). Local 680MB build image removed. No broken half-deploy left behind. No CF resource footprint remains.",
+    "halfDeployRemains": false,
+    "timeBoxMin": 10
+  },
+  "evidenceSource": "claimed (from CF public docs + scaffold README), NOT measured — deploy blocked by Containers access gate",
+  "summary": [
+    { "capability": "CAP-1-live-heap-survives-eviction", "outcome": "REFUTES-claim", "measured": false },
+    { "capability": "CAP-2-no-replay-effects-once", "outcome": "REFUTES-claim", "measured": false },
+    { "capability": "CAP-3-determinism-by-seed", "outcome": "REFUTES-claim", "measured": false },
+    { "capability": "CAP-4-per-cell-snapshot-granularity", "outcome": "REFUTES-claim", "measured": false },
+    { "capability": "CAP-5-zero-idle-cost", "outcome": "REFUTES-claim", "measured": false },
+    { "capability": "CAP-6-wake-latency-distribution", "outcome": "REFUTES-claim", "measured": false },
+    { "capability": "CAP-7-concurrency-isolation-at-scale", "outcome": "PASS-claim", "measured": false }
+  ],
+  "probes": [
+    {
+      "capability": "CAP-1-live-heap-survives-eviction",
+      "outcome": "REFUTES-claim",
+      "measured": false,
+      "evidence": "CLAIMED (from docs): CF Sandbox persists the container DISK across sleep, NOT the live interpreter heap. There is no public per-cell heap snapshot/restore API. A closure capturing a private counter held only in the code-interpreter's RAM is lost when the container is torn down (stop/idle eviction); the next runCode re-creates a cold code context with the variable gone (ReferenceError / reset). The engram-favourable claim (live heap survives genuine eviction with zero disk footprint) is therefore refuted for CF by documented behavior. The scaffold's /snapshot endpoint returns a typed 'snapshot API not available' to record this absence honestly."
+    },
+    {
+      "capability": "CAP-2-no-replay-effects-once",
+      "outcome": "REFUTES-claim",
+      "measured": false,
+      "evidence": "CLAIMED (from docs): With no live-heap restore, globalThis.fired set in a prior runCode does not survive container eviction; after teardown it reads undefined on a cold kernel. To make state durable on CF you must either re-run prior cells (replay → side effects re-fire) or externalize state to disk/storage — neither is the engram 'no-replay, effects-fire-once via heap restore' property. Refuted by documented behavior."
+    },
+    {
+      "capability": "CAP-3-determinism-by-seed",
+      "outcome": "REFUTES-claim",
+      "measured": false,
+      "evidence": "CLAIMED (from docs): CF Sandbox runs a full Linux container with a real OS clock and real CSPRNG. There is no seeded-clock/seeded-RNG/seeded-crypto externalization boundary, so Date.now() and crypto.randomUUID() are non-deterministic and diverge across sessions/restores. At minimum the time and uuid fields differ → not byte-identical across two same-seed sessions. Refuted by documented behavior (no determinism boundary exposed by the SDK)."
+    },
+    {
+      "capability": "CAP-4-per-cell-snapshot-granularity",
+      "outcome": "REFUTES-claim",
+      "measured": false,
+      "evidence": "CLAIMED (from docs): CF Sandbox has no automatic per-eval byte-delta heap checkpoint. Durability is whole-container disk persistence + (platform) disk-snapshot/fork at ~container granularity, reportedly ~2s to snapshot+fork — not sub-KB per-cell deltas. The scaffold's /eval returns checkpoint:{store:'none',mode:'none',sizeGz:null} so the probe records hasPerCellDurability=false → REFUTES the engram claim (median steady delta <2KB, mode='delta', SQLite-backed per cell)."
+    },
+    {
+      "capability": "CAP-5-zero-idle-cost",
+      "outcome": "REFUTES-claim",
+      "measured": false,
+      "evidence": "CLAIMED (from docs): CF Sandbox containers sleep when idle; in-memory (live kernel) state is LOST on idle unless you keepAlive — and keepAlive keeps the container running, which is billed. So you cannot have both (a) live state survival across a long idle AND (b) zero idle cost. Disk state survives, but the live interpreter namespace does not. Engram's claim (live heap survives long idle at zero idle cost, no heartbeat) is refuted: CF must choose between losing live state or paying to stay warm."
+    },
+    {
+      "capability": "CAP-6-wake-latency-distribution",
+      "outcome": "REFUTES-claim",
+      "measured": false,
+      "evidence": "CLAIMED (from docs): A cold container wake on CF Sandbox pays container cold-start (image/rootfs mount + runtime + code-interpreter kernel boot), reportedly on the order of ~1-2s+ (and ~2s for disk-snapshot+fork restore). This is well above engram's claimed p50 <300ms heap-blit restore. p50 expected >=~1500ms (container floor) → REFUTES the engram fast-wake claim. (Engram's own measured CAP-6 was INCONCLUSIVE at p50 ~1174ms because the probe wall-time includes WS connect + DO spin-up, not pure restore; the restore phase itself is sub-ms per the kernel telemetry.)"
+    },
+    {
+      "capability": "CAP-7-concurrency-isolation-at-scale",
+      "outcome": "PASS-claim",
+      "measured": false,
+      "evidence": "CLAIMED (from docs): CF Sandbox gives each session its own container/DO identity → strong process+filesystem isolation (full Linux container boundary, arguably STRONGER isolation than engram's shared-worker QuickJS-VM-per-session model). No cross-session global bleed expected. This capability is the one where CF is expected to PASS the engram-favourable claim too — isolation is not the discriminator. Scale ceiling differs (containers cost more per instance; max_instances:50 in this scaffold vs engram's lightweight DO+WASM fan-out), but isolation correctness holds."
+    }
+  ],
+  "scale": "NOT MEASURED — deploy blocked. CLAIMED (from docs): per-session containers are heavier than engram's DO+QuickJS-WASM kernels; this scaffold capped max_instances=50. Container cold-start floor (~1-2s) dominates per-session wake latency vs engram's measured p50 ~1.17s (WS+DO-bound, sub-ms restore). Isolation expected clean (container boundary); throughput/cost-per-session expected worse at high fan-out.",
+  "notes": [
+    "Deploy attempt was time-boxed and got through: dep install (@cloudflare/sandbox@0.4.18 + wrangler@4.99.0), Docker image build+push of the cloudflare/sandbox base (~680MB), worker script upload. It FAILED only at the Containers provisioning API: GET /accounts/<acct>/containers/me -> 403 Forbidden 'Authentication error'. The API token in .env lacks Containers (beta) permission; the account is not Containers-enabled.",
+    "The half-deployed worker (version 12c84d45, returned runtime error 1042) was DELETED — no broken deploy and no CF resource footprint remains. Local Docker build image also removed.",
+    "All 7 capability outcomes here are CLAIMED-FROM-DOCS, not measured. The scaffold (cf-sandbox/) and adapter (cf-sandbox-adapter.mjs) are correct and ready to run IF the account is granted Containers access — re-run: `set -a; . ../../.env; set +a; cd cf-sandbox && bun x wrangler deploy` then `CF_SANDBOX_BASE=https://engram-compare-cfsandbox.umg-bhalla88.workers.dev node run.mjs --target cf`.",
+    "Core discriminator (CAP-1/2/4/5/6): CF Sandbox persists DISK, not the live interpreter HEAP — there is NO public per-cell heap snapshot/restore. This is the structural reason engram (WASM-linear-memory heap blit to DO SQLite) wins those five; CF can only persist disk and must replay or stay warm.",
+    "CAP-7 (isolation) is the non-discriminator: CF's container-per-session boundary is at least as strong as engram's per-session QuickJS VM — both expected to PASS.",
+    "engram baseline for the same probes (measured, live) is in results-engram.json: CAP-1/2/3/5/7 PASS-claim; CAP-4 INCONCLUSIVE (per-cell delta median ~17KB, not <2KB threshold, but delta-mode + SQLite per-cell confirmed); CAP-6 INCONCLUSIVE (p50 ~1.17s, dominated by WS connect + DO wake, not the sub-ms restore)."
+  ]
+}

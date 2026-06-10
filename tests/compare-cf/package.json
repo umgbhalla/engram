@@ -1,0 +1,17 @@
+{
+  "name": "engram-compare-cf",
+  "private": true,
+  "type": "module",
+  "version": "0.0.1",
+  "description": "Capability comparison harness: engram-kernel (live-heap snapshot REPL) vs Cloudflare Sandbox (Container+DO). Runs identical probes against both substrates.",
+  "scripts": {
+    "engram": "node run.mjs --target engram",
+    "cf": "node run.mjs --target cf",
+    "scale": "node scale.mjs",
+    "check": "node --check engram-adapter.mjs && node --check cf-sandbox-adapter.mjs && node --check probes.mjs && node --check scale.mjs && node --check run.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.0.0"
+  },
+  "//": "ws is resolved via a node_modules symlink to ../../apps/kernel/node_modules (created on setup: ln -sfn ../../apps/kernel/node_modules node_modules). Re-create it if missing."
+}
