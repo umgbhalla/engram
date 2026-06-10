@@ -255,6 +255,42 @@ normalized identically.
 
 ---
 
+## Substrate / extensibility
+
+The SDK is built to embed inside your own service (e.g. a Cloudflare Worker that owns its URL
+scheme and maps request ids → durable Engram sessions). Four seams keep that clean:
+
+- **`connect({ transport })`** — drive a **custom `Transport`** instead of opening a WS/HTTP
+  channel from `url`. Bind via a Cloudflare service binding, a DO-to-DO RPC stub, an in-process
+  kernel, or a signed/audited channel. Pass an instance or a `(session) => Transport` factory.
+  The `Transport`, `Frame`, and `HostFn` types are exported. `EngramSession.fromTransport(t, opts)`
+  is the low-level constructor (you call `_applyConfig()` yourself).
+- **`onEval` interceptor(s)** — middleware wrapping every `eval`: `(code, opts, next) => Promise<EvalResult>`.
+  Trace, time, redact, retry, or rewrite the code/result centrally instead of per call site.
+  Pass one or an array (outermost first); add more at runtime with `session.use(mw)`.
+- **`session.supportsHostCalls`** — `true` only when the transport can deliver `host.<name>()`
+  callbacks (WS / custom transport that opts in). Check it so host tools don't silently no-op
+  over the cloud HTTP path.
+- **Lifecycle hooks** — `onConnect` (first connect), `onReconnect` (after a cold reconnect
+  re-applies config — re-register dynamic host tools here), `onClose` (unexpected drop). WS /
+  `openSocket` transports.
+
+```ts
+const s = await Engram.connect({
+  session: `proj:${projectId}`,                 // bring-your-own id; route however you like
+  transport: (sess) => serviceBindingTransport(env.ENGRAM_KERNEL, sess),
+  onEval: async (code, _opts, next) => { const r = await next(code); log(r.cell, r.ok); return r; },
+  onReconnect: () => s.defineHostModule("db", { query }),  // re-register after a drop
+});
+```
+
+For DO-to-DO **WebSocket** binding with reconnect, `openSocket: (session) => WebSocketLike` already
+exists — use that when you want host callbacks over an injected socket. Use a custom `transport`
+when your channel is request/reply (service binding) or non-WS. See
+[`examples/substrate-custom-transport.ts`](./examples/substrate-custom-transport.ts).
+
+---
+
 ## Roadmap (not in v2 core yet)
 
 The v0.9.x SDK (`packages/sdk`, `@engram/sdk@0.9.x`) carries higher-level flows the v2 core does

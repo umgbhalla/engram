@@ -87,6 +87,27 @@ export interface RuntimeEnv {
 /** A namespaced bundle of host functions registered together via {@link EngramSession.defineHostModule}. */
 export type HostModule = Record<string, (...args: any[]) => unknown | Promise<unknown>>;
 
+/**
+ * An eval interceptor (middleware) — see {@link ConnectOptions.onEval}. Wraps every
+ * {@link EngramSession.eval}: receives the cell `code` and resolved `opts`, and a `next`
+ * continuation that runs the actual eval (or the next interceptor). Return the result of
+ * `next(...)` to proceed, optionally transforming the code passed in or the result returned.
+ * Throwing skips the eval. Use for tracing, timing, redaction, retries, or result rewriting
+ * without wrapping every call site.
+ *
+ * ```ts
+ * const onEval: EvalInterceptor = async (code, opts, next) => {
+ *   const t = Date.now();
+ *   try { return await next(code); } finally { console.log(`cell ${Date.now() - t}ms`); }
+ * };
+ * ```
+ */
+export type EvalInterceptor = (
+  code: string,
+  opts: { throwOnError?: boolean; timeoutMs?: number },
+  next: (code: string) => Promise<EvalResult>,
+) => Promise<EvalResult>;
+
 /** The typed result of {@link EngramSession.eval}. */
 export interface EvalResult<T = unknown, F = unknown> {
   /** `true` if the cell completed without throwing. */
@@ -207,6 +228,36 @@ export interface ConnectOptions {
   /** Callback for every captured `console.*` line, across all cells. */
   onConsole?: (line: ConsoleLine) => void;
   /**
+   * Drive a CUSTOM {@link Transport} instead of opening a WebSocket / HTTP channel from
+   * `url`. Pass a transport instance, or a factory `(session) => Transport` invoked once at
+   * connect. Use this to bind Engram into your own substrate — a Cloudflare service-binding
+   * or DO-to-DO RPC stub, an in-process kernel, a signed/audited channel. When set, `url`,
+   * `apiKey`, `socket`, and `openSocket` are ignored. The transport owns its own reconnect
+   * lifecycle; the SDK applies config/bootstrap once via {@link EngramSession._applyConfig}.
+   */
+  transport?: Transport | ((session: string) => Transport | Promise<Transport>);
+  /** Fired once after the FIRST connect (config/bootstrap applied). WS/openSocket transports only. */
+  onConnect?: () => void;
+  /**
+   * Fired after each RECONNECT once config/bootstrap is re-applied (WS/openSocket transports
+   * only). The hook to re-register dynamic host tools (`bindHost`/`defineHostModule`) that a
+   * substrate added after connect — these live only in memory and are cleared by a fresh socket.
+   */
+  onReconnect?: () => void;
+  /**
+   * Fired on an UNEXPECTED socket drop (the remote/network closed it). Not fired by an
+   * explicit {@link EngramSession.close} or the internal reconnect teardown — both detach the
+   * close listener first. On an auto-reconnecting session a genuine drop fires `onClose` then,
+   * after the channel is back, {@link onReconnect}.
+   */
+  onClose?: () => void;
+  /**
+   * An eval interceptor (or a chain of them, applied left-to-right — the first wraps the
+   * outermost). See {@link EvalInterceptor}. Lets a substrate trace/time/transform every cell
+   * centrally instead of wrapping each `session.eval()` call.
+   */
+  onEval?: EvalInterceptor | EvalInterceptor[];
+  /**
    * Host functions the VM can invoke as `host.<name>(...args)` mid-eval (the VM->client
    * bridge). Each is bound via {@link EngramSession.bindHost} before connect returns.
    * Requires the WebSocket transport (no-op over the cloud HTTP path).
@@ -288,8 +339,12 @@ function toTypedError(info: EvalErrorInfo, result?: EvalResult): EngramError {
 // Transport abstraction
 // ---------------------------------------------------------------------------
 
-/** A frame sent to the kernel. `t` is the verb; `src` carries eval source. */
-interface Frame {
+/**
+ * A frame sent to the kernel. `t` is the verb; `src` carries eval source.
+ * Exported so a custom {@link Transport} (see {@link ConnectOptions.transport}) can speak
+ * the same wire protocol the built-in WS/HTTP transports use.
+ */
+export interface Frame {
   t: string;
   src?: string;
   config?: EngramConfig;
@@ -297,15 +352,34 @@ interface Frame {
 }
 
 /** A host function the VM can invoke via `host.<name>(...args)` during an eval. */
-type HostFn = (...args: unknown[]) => unknown | Promise<unknown>;
+export type HostFn = (...args: unknown[]) => unknown | Promise<unknown>;
 
-interface Transport {
+/**
+ * The transport seam the SDK drives. Implement this to bind Engram into your own
+ * substrate — e.g. a Cloudflare service-binding / DO-to-DO RPC stub, an in-process kernel,
+ * a signed/audited HTTP channel — and pass it via {@link ConnectOptions.transport} (or
+ * {@link EngramSession.fromTransport}). The built-in {@link WsTransport}/{@link HttpTransport}
+ * are just two implementations of this interface.
+ *
+ * A transport is responsible for its own (re)connect lifecycle. If it can lose and reopen its
+ * underlying channel, it should re-apply config/bootstrap on reconnect by invoking the
+ * `onReady` callback the SDK passes at construction (the WS transport does this); the SDK
+ * calls {@link EngramSession._applyConfig} once at connect for transports without an onReady.
+ */
+export interface Transport {
   /** Send one frame, await its single reply. */
   request(frame: Frame, timeoutMs: number): Promise<any>;
   /** Register a host function callable from the VM as `host.<name>`. */
   setHost(name: string, fn: HostFn): void;
   /** Tear down. */
   close(): void;
+  /**
+   * `true` if this transport can deliver VM->host calls (`host.<name>()`) back to registered
+   * host fns. The WS transport is `true`; the cloud HTTP transport is `false` (host binds are
+   * silent no-ops there). Surfaced on {@link EngramSession.supportsHostCalls}. Defaults to
+   * `false` when omitted.
+   */
+  readonly supportsHostCalls?: boolean;
 }
 
 function resolveWebSocket(explicit: unknown): any {
@@ -323,10 +397,14 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  * single socket, reconnects with exponential backoff, and re-applies config on reconnect.
  */
 class WsTransport implements Transport {
+  /** WS can deliver VM->host calls. */
+  readonly supportsHostCalls = true;
   private ws: any = null;
   private queue: Promise<unknown> = Promise.resolve();
   private closed = false;
   private reconnects = 0;
+  /** Flips true after the first successful onReady so subsequent ones are reconnects. */
+  private hasConnected = false;
   /** Host functions callable from the VM as `host.<name>`. */
   private hostFns = new Map<string, HostFn>();
   /** The resolver/rejecter for the single in-flight rpc on this socket, if any. */
@@ -350,6 +428,12 @@ class WsTransport implements Transport {
       socket?: WebSocketLike;
       /** A factory invoked on each (re)connect to mint a fresh, already-open socket. */
       openSocket?: (session: string) => WebSocketLike | Promise<WebSocketLike>;
+      /** Fired after config/bootstrap re-applied on the FIRST connect. */
+      onConnect?: () => void;
+      /** Fired after config/bootstrap re-applied on each RECONNECT (not the first connect). */
+      onReconnect?: () => void;
+      /** Fired on an unexpected socket drop (listeners are detached before deliberate closes). */
+      onClose?: () => void;
     },
   ) {}
 
@@ -412,6 +496,11 @@ class WsTransport implements Transport {
       this.pending = null;
       clearTimeout(p.timer);
       p.reject(new EngramError("__ws_closed__"));
+    }
+    try {
+      this.opts.onClose?.();
+    } catch {
+      /* ignore */
     }
   };
 
@@ -503,6 +592,22 @@ class WsTransport implements Transport {
     // queue (which is currently held by the request that triggered this open() — that would
     // deadlock).
     if (this.opts.onReady) await this.opts.onReady((f, t) => this.rawRequest(f, t));
+    // Lifecycle: first ready -> onConnect; every subsequent ready -> onReconnect. Fired after
+    // config/bootstrap is back in place so a substrate can safely re-register dynamic state.
+    if (!this.hasConnected) {
+      this.hasConnected = true;
+      try {
+        this.opts.onConnect?.();
+      } catch {
+        /* user callback must not break the connect path */
+      }
+    } else {
+      try {
+        this.opts.onReconnect?.();
+      } catch {
+        /* ignore */
+      }
+    }
   }
 
   /**
@@ -579,6 +684,8 @@ class WsTransport implements Transport {
  * supervisor's REST routes so the rest of the SDK is transport-agnostic.
  */
 class HttpTransport implements Transport {
+  /** Host callbacks require the WS bridge; the cloud HTTP path cannot push hostcalls. */
+  readonly supportsHostCalls = false;
   constructor(
     private base: string,
     private apiKey: string,
@@ -757,6 +864,8 @@ export class EngramSession {
   private config: EngramConfig;
   private bootstrap?: string;
   private onConsole?: (line: ConsoleLine) => void;
+  /** Eval interceptor chain (outermost first). Empty = no wrapping. */
+  private interceptors: EvalInterceptor[];
 
   /**
    * Per-eval capture of the LAST `host.__engram_final(value)` hostcall. `WsTransport`
@@ -776,7 +885,15 @@ export class EngramSession {
   /** @internal */
   constructor(
     private transport: Transport,
-    opts: { session: string; throwOnError: boolean; timeoutMs: number; config: EngramConfig; bootstrap?: string; onConsole?: (l: ConsoleLine) => void },
+    opts: {
+      session: string;
+      throwOnError: boolean;
+      timeoutMs: number;
+      config: EngramConfig;
+      bootstrap?: string;
+      onConsole?: (l: ConsoleLine) => void;
+      onEval?: EvalInterceptor | EvalInterceptor[];
+    },
   ) {
     this.session = opts.session;
     this.throwOnError = opts.throwOnError;
@@ -784,6 +901,7 @@ export class EngramSession {
     this.config = opts.config;
     this.bootstrap = opts.bootstrap;
     this.onConsole = opts.onConsole;
+    this.interceptors = opts.onEval ? (Array.isArray(opts.onEval) ? opts.onEval.slice() : [opts.onEval]) : [];
     // Reserved final channel: record the LAST arg of each host.final / host.__engram_final
     // call this eval. Both names are registered so the in-VM host proxy forwards them here
     // with FAITHFUL JSON args (the kernel dispatches client-registered names to the client).
@@ -815,6 +933,56 @@ export class EngramSession {
     };
   }
 
+  /**
+   * `true` if the underlying transport can deliver VM->host calls (`host.<name>()`). The WS
+   * transport is `true`; the cloud HTTP transport is `false`, where {@link bindHost} /
+   * {@link defineHostModule} are silent no-ops. Check this before relying on host tools so a
+   * misconfigured substrate fails loud instead of silently dropping callbacks.
+   */
+  get supportsHostCalls(): boolean {
+    return this.transport.supportsHostCalls === true;
+  }
+
+  /**
+   * Append an {@link EvalInterceptor} at runtime (composes after any from
+   * {@link ConnectOptions.onEval}). The newly-added interceptor becomes the innermost wrapper.
+   * Returns `this` for chaining.
+   */
+  use(interceptor: EvalInterceptor): this {
+    this.interceptors.push(interceptor);
+    return this;
+  }
+
+  /**
+   * Build a session over a CUSTOM {@link Transport} you already constructed. The lower-level
+   * counterpart to {@link Engram.connect} for substrates that own their own channel (service
+   * binding, DO-to-DO RPC, in-process). You are responsible for applying config: call
+   * {@link EngramSession._applyConfig} (or send the `{t:'create'}` frame yourself) after this.
+   * `connect({ transport })` does that wiring for you.
+   */
+  static fromTransport(
+    transport: Transport,
+    opts: {
+      session?: string;
+      throwOnError?: boolean;
+      timeoutMs?: number;
+      config?: EngramConfig;
+      bootstrap?: string;
+      onConsole?: (l: ConsoleLine) => void;
+      onEval?: EvalInterceptor | EvalInterceptor[];
+    } = {},
+  ): EngramSession {
+    return new EngramSession(transport, {
+      session: opts.session ?? "default",
+      throwOnError: opts.throwOnError !== false,
+      timeoutMs: opts.timeoutMs ?? 60000,
+      config: { ...(opts.config || {}) },
+      bootstrap: opts.bootstrap,
+      onConsole: opts.onConsole,
+      onEval: opts.onEval,
+    });
+  }
+
   /** @internal applied once when the transport first connects. */
   async _applyConfig(): Promise<void> {
     if (this.config && Object.keys(this.config).length) {
@@ -835,6 +1003,20 @@ export class EngramSession {
    * @returns a typed {@link EvalResult}. Throws a typed {@link EngramError} on failure unless `throwOnError` is false.
    */
   async eval<T = unknown, F = unknown>(code: string, opts: { throwOnError?: boolean; timeoutMs?: number } = {}): Promise<EvalResult<T, F>> {
+    // No interceptors: straight to the core (the common, zero-overhead path).
+    if (!this.interceptors.length) return this._evalCore<T, F>(code, opts);
+    // Build the chain inside-out: the core is the innermost `next`; each interceptor wraps it.
+    let next: (c: string) => Promise<EvalResult> = (c) => this._evalCore(c, opts) as Promise<EvalResult>;
+    for (let i = this.interceptors.length - 1; i >= 0; i--) {
+      const mw = this.interceptors[i]!;
+      const inner = next;
+      next = (c) => mw(c, opts, inner);
+    }
+    return next(code) as Promise<EvalResult<T, F>>;
+  }
+
+  /** The actual eval rpc + result normalisation, wrapped by any {@link EvalInterceptor}s. */
+  private async _evalCore<T = unknown, F = unknown>(code: string, opts: { throwOnError?: boolean; timeoutMs?: number }): Promise<EvalResult<T, F>> {
     // Reset the captured final before each eval; the reserved __engram_final hostfn
     // records the LAST value during this (serialised) rpc.
     this.capturedFinal = { set: false, value: undefined };
@@ -988,9 +1170,10 @@ export const Engram = {
    * const r = await s.eval("2 + 2");   // r.value === 4
    */
   async connect(opts: ConnectOptions): Promise<EngramSession> {
+    const custom = !!(opts && opts.transport);
     const injected = !!(opts && (opts.socket || opts.openSocket));
-    if (!opts || (!opts.url && !injected)) {
-      throw new EngramError("connect({ url }) is required (or pass { socket } / { openSocket })");
+    if (!opts || (!opts.url && !injected && !custom)) {
+      throw new EngramError("connect({ url }) is required (or pass { socket } / { openSocket } / { transport })");
     }
     const session = opts.session || "default";
     const throwOnError = opts.throwOnError !== false;
@@ -1029,11 +1212,24 @@ export const Engram = {
         : undefined;
     const fullBootstrap = ctxSeed ? (bootstrap ? `${bootstrap}\n${ctxSeed}` : ctxSeed) : bootstrap;
 
-    if (opts.apiKey && isHttp) {
-      const transport = new HttpTransport(base, opts.apiKey, session);
-      const s = new EngramSession(transport, { session, throwOnError, timeoutMs, config, bootstrap: fullBootstrap, onConsole: opts.onConsole });
+    // Custom transport path: the substrate owns the channel (service binding, DO-to-DO RPC,
+    // in-process). The SDK just drives the provided transport and applies config once.
+    if (custom) {
+      const tx = opts.transport!;
+      const t = typeof tx === "function" ? await tx(session) : tx;
+      const s = new EngramSession(t, { session, throwOnError, timeoutMs, config, bootstrap: fullBootstrap, onConsole: opts.onConsole, onEval: opts.onEval });
       applyHost(s);
       await s._applyConfig();
+      opts.onConnect?.();
+      return s;
+    }
+
+    if (opts.apiKey && isHttp) {
+      const transport = new HttpTransport(base, opts.apiKey, session);
+      const s = new EngramSession(transport, { session, throwOnError, timeoutMs, config, bootstrap: fullBootstrap, onConsole: opts.onConsole, onEval: opts.onEval });
+      applyHost(s);
+      await s._applyConfig();
+      opts.onConnect?.();
       return s;
     }
 
@@ -1055,6 +1251,9 @@ export const Engram = {
       session,
       socket: opts.socket,
       openSocket: opts.openSocket,
+      onConnect: opts.onConnect,
+      onReconnect: opts.onReconnect,
+      onClose: opts.onClose,
       onReady: async (raw) => {
         // Re-apply config on every (re)connect so a cold session is configured identically.
         if (config && Object.keys(config).length) {
@@ -1066,9 +1265,9 @@ export const Engram = {
         }
       },
     });
-    s = new EngramSession(transport, { session, throwOnError, timeoutMs, config, bootstrap: fullBootstrap, onConsole: opts.onConsole });
+    s = new EngramSession(transport, { session, throwOnError, timeoutMs, config, bootstrap: fullBootstrap, onConsole: opts.onConsole, onEval: opts.onEval });
     applyHost(s);
-    // Force the first connect (onReady applies config).
+    // Force the first connect (onReady applies config; onConnect fires inside the transport).
     await transport.request({ t: "ping" }, timeoutMs).catch(() => {});
     return s;
   },

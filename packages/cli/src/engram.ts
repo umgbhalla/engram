@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // engram — configurable durable REPL CLI for the Engram kernel.
 //
-//   engram repl     [--endpoint <wss>] [--session <id>] [--config <file>] [--exec '<cell>'] [--interactive]
+//   engram repl     [--endpoint <wss>] [--session <id>] [--config <file>] [--exec '<cell>'] [--interactive] [--trace]
 //   engram sessions [list|inspect <id>|rm <id>] [--endpoint <wss>]
 //   engram trace    <id> [--endpoint <wss>]
 //
@@ -108,9 +108,27 @@ async function cmdRepl(args: Args): Promise<void> {
   const endpoint = str(args.endpoint) || DEFAULT_ENDPOINT;
   const id = str(args.session) || stableTtyId();
   const config = readConfig(args.config);
+  const trace = !!args.trace;
+  // --trace uses the SDK's onEval interceptor to print a per-cell timing/metadata line to
+  // stderr (kept off stdout so it never pollutes the REPL's value output / pipe mode).
+  const onEval = trace
+    ? async (code: string, _opts: unknown, next: (c: string) => Promise<EvalResult>): Promise<EvalResult> => {
+        const t0 = Date.now();
+        const r = await next(code);
+        process.stderr.write(
+          `\x1b[2m[trace] cell=${r.cell ?? "?"} ok=${r.ok} ${Date.now() - t0}ms` +
+            (r.checkpoint ? ` store=${r.checkpoint.store} gz=${r.checkpoint.sizeGz ?? "?"}` : "") +
+            `\x1b[22m\n`,
+        );
+        return r;
+      }
+    : undefined;
+  // Surface transport resilience (the durable session reattaches transparently).
+  const onClose = (): void => void process.stderr.write("\x1b[2m· connection dropped — reconnecting…\x1b[22m\n");
+  const onReconnect = (): void => void process.stderr.write("\x1b[2m· reconnected\x1b[22m\n");
   let session: EngramSession;
   try {
-    session = await connect({ url: endpoint, session: id, config, throwOnError: false, WebSocket });
+    session = await connect({ url: endpoint, session: id, config, throwOnError: false, WebSocket, onEval, onClose, onReconnect });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error(`could not connect to ${endpoint}`);
