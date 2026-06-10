@@ -26,24 +26,34 @@ function expectContains(path, needle, label = needle) {
 }
 
 requireString("public.kernel.defaultWs", publicEndpoints.kernel?.defaultWs);
+requireString("public.kernel.browserDefaultWs", publicEndpoints.kernel?.browserDefaultWs);
+requireString("public.kernel.cliDefaultWs", publicEndpoints.kernel?.cliDefaultWs);
 requireString("public.kernel.workersDevHttp", publicEndpoints.kernel?.workersDevHttp);
+requireString("public.kernel.customDomainHttp", publicEndpoints.kernel?.customDomainHttp);
+requireString("public.kernel.customDomainWs", publicEndpoints.kernel?.customDomainWs);
 requireString("public.cloud.http", publicEndpoints.cloud?.http);
 requireString("public.ui.http", publicEndpoints.ui?.http);
 requireString("public.docs.http", publicEndpoints.docs?.http);
+requireString("resources.alchemyStateBucket", manifest.resources?.alchemyStateBucket);
+requireString("resources.alchemyStatePrefix", manifest.resources?.alchemyStatePrefix);
 requireString("resources.r2Snapshots", manifest.resources?.r2Snapshots);
 requireString("resources.analyticsEngine", manifest.resources?.analyticsEngine);
 
 const kernelWs = publicEndpoints.kernel?.defaultWs;
+const kernelBrowserWs = publicEndpoints.kernel?.browserDefaultWs;
+const kernelCliWs = publicEndpoints.kernel?.cliDefaultWs;
 const kernelHttp = publicEndpoints.kernel?.workersDevHttp;
+const kernelCustomHttp = publicEndpoints.kernel?.customDomainHttp;
+const kernelCustomWs = publicEndpoints.kernel?.customDomainWs;
 const uiHttp = publicEndpoints.ui?.http;
 const docsHttp = publicEndpoints.docs?.http;
 
 expectContains("scripts/smoke-live.mjs", "deployed-endpoints.json", "endpoint manifest loader");
 expectContains("scripts/e2e-ui.ts", "deployed-endpoints.json", "endpoint manifest loader");
-expectContains("apps/ui/src/main.ts", kernelWs, "kernel default WebSocket");
-expectContains("apps/ui/index.html", kernelWs, "kernel default WebSocket");
-expectContains("packages/cli/src/engram.ts", kernelWs, "CLI default WebSocket");
-expectContains("packages/cli/src/repl.ts", kernelWs, "REPL resume default WebSocket");
+expectContains("apps/ui/src/main.ts", kernelBrowserWs, "browser kernel default WebSocket");
+expectContains("apps/ui/index.html", kernelBrowserWs, "browser kernel default WebSocket");
+expectContains("packages/cli/src/engram.ts", kernelCliWs, "CLI default WebSocket");
+expectContains("packages/cli/src/repl.ts", kernelCliWs, "REPL resume default WebSocket");
 expectContains("README.md", kernelWs, "README kernel WebSocket");
 expectContains("README.md", uiHttp, "README UI URL");
 expectContains("apps/docs/src/content/docs/reference/protocol.md", kernelWs, "protocol docs kernel WebSocket");
@@ -54,6 +64,13 @@ expectContains("apps/docs/src/content/docs/index.mdx", uiHttp, "docs index UI UR
 expectContains("apps/docs/astro.config.mjs", uiHttp, "docs live demo URL");
 expectContains("apps/docs/src/components/TopLinks.astro", uiHttp, "docs top link URL");
 expectContains("apps/kernel/wrangler.jsonc", '"engram-kernel"', "kernel worker name");
+expectContains("apps/kernel/alchemy.run.ts", 'R2RestStateStore', "Alchemy R2 state store");
+expectContains("apps/kernel/alchemy.run.ts", manifest.resources?.alchemyStateBucket, "Alchemy state bucket");
+expectContains("apps/kernel/alchemy.run.ts", manifest.resources?.alchemyStatePrefix, "Alchemy state prefix");
+expectContains("apps/kernel/alchemy.run.ts", "url: true", "Alchemy workers.dev route");
+expectContains("apps/kernel/alchemy.run.ts", new URL(kernelCustomHttp || "https://invalid.local").hostname, "Alchemy custom domain");
+expectContains("apps/kernel/alchemy.run.ts", manifest.resources?.r2Snapshots, "snapshot bucket");
+expectContains("apps/kernel/alchemy.run.ts", manifest.resources?.analyticsEngine, "Analytics Engine dataset");
 expectContains("apps/docs/wrangler.jsonc", '"engram-docs"', "docs worker name");
 expectContains("apps/ui/wrangler.jsonc", '"engram-ui"', "UI worker name");
 
@@ -62,6 +79,12 @@ if (kernelHttp && kernelWs && !kernelWs.startsWith("wss://")) {
 }
 if (kernelHttp && !kernelHttp.startsWith("https://")) {
   failures.push("public.kernel.workersDevHttp must be an https:// URL");
+}
+if (kernelCustomHttp && !kernelCustomHttp.startsWith("https://")) {
+  failures.push("public.kernel.customDomainHttp must be an https:// URL");
+}
+if (kernelCustomWs && !kernelCustomWs.startsWith("wss://")) {
+  failures.push("public.kernel.customDomainWs must be a wss:// URL");
 }
 if (docsHttp && !docsHttp.startsWith("https://")) {
   failures.push("public.docs.http must be an https:// URL");

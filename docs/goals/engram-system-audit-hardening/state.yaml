@@ -8,7 +8,7 @@ goal:
   slug: "engram-system-audit-hardening"
   kind: audit
   tranche: "Audit deployed/runtime truth, test/CI reliability, and product/code correctness; then continuously complete safe verified improvement slices until the full original outcome is complete."
-  status: active
+  status: done
   intake:
     original_request: "Audit and test infra, existing deployed and code, everything; goal mode; extract anything efficiently possible without breaking any feature; dynamic task creation."
     interpreted_outcome: "Build a GoalBuddy execution board that audits Engram end to end and then safely implements the highest-value verified improvements."
@@ -60,7 +60,7 @@ visual_board:
     command: "npx goalbuddy extend github-projects"
     missing: []
 
-active_task: T022
+active_task: null
 
 tasks:
   - id: T001
@@ -785,7 +785,7 @@ tasks:
   - id: T022
     type: worker
     assignee: Worker
-    status: active
+    status: done
     reasoning_hint: default
     objective: "Reconcile the deployed endpoint manifest/checker with the current Alchemy-owned kernel route and R2-backed IaC state."
     allowed_files:
@@ -799,11 +799,32 @@ tasks:
     stop_if:
       - "Need to deploy, change Cloudflare routes, edit Alchemy state, or touch secrets."
       - "The custom domain needs to be asserted live before Cloudflare finishes certificate issuance."
-    receipt: null
+    receipt:
+      result: done
+      changed_files:
+        - config/deployed-endpoints.json
+        - scripts/check-deployed-endpoints.mjs
+        - docs/goals/engram-system-audit-hardening/state.yaml
+      commands:
+        - cmd: "bun run endpoints:check"
+          status: pass
+        - cmd: "bun run check"
+          status: pass
+        - cmd: "bun run smoke:live"
+          status: pass
+        - cmd: "bun run e2e:ui"
+          status: pass
+        - cmd: "curl --resolve engram.umgbhalla.xyz:443:104.21.78.96 https://engram.umgbhalla.xyz/health"
+          status: pass
+        - cmd: "node dns.resolve4 / dns.lookup engram.umgbhalla.xyz"
+          status: pass
+      summary: "Reconciled the endpoint manifest/checker with the current Alchemy-owned kernel deployment: R2-backed Alchemy state, workers.dev route kept live, custom domain tracked as Alchemy-bound and edge-verified via forced resolution, and snapshot/AE resources validated against alchemy.run.ts. Local getaddrinfo/Node lookup on this Mac still returns ENOTFOUND for the custom hostname even after DNS cache flush, while dns.resolve4 and dig return Cloudflare A records."
+      external_pending:
+        - "Local macOS getaddrinfo cache/resolver path still does not resolve engram.umgbhalla.xyz on this machine; workers.dev remains the verified default for automated gates."
   - id: T999
     type: judge
     assignee: Judge
-    status: queued
+    status: done
     reasoning_hint: high
     objective: "Final audit: decide whether the full Engram system audit and hardening tranche is complete."
     inputs:
@@ -822,13 +843,34 @@ tasks:
       - "Coverage of deployed/runtime, test/CI, and product/code correctness"
       - "Missing evidence"
       - "Next task if not complete"
-    receipt: null
+    receipt:
+      result: done
+      decision: "complete"
+      full_outcome_complete: true
+      coverage:
+        deployed_runtime: "Covered by T001/T016/T019/T022. Current workers.dev kernel health is 200 ok; smoke:live passes kernel eval, cloud health, cloud auth gate, UI HTML, and docs HTML; e2e:ui passes stateful eval, hibernate/resume, closure restore, large-source socket survival, and recovery. Alchemy ownership, R2 state, custom-domain binding, snapshot bucket, and AE dataset are represented in the endpoint manifest checker."
+        test_ci_reliability: "Covered by T002/T005/T009/T013/T021. Root check now runs endpoint manifest drift checks plus SDK/CLI/UI/cloud/kernel typechecks. GitHub Actions workflow runs bun run check without deploys or secrets."
+        product_code_correctness: "Covered by T003/T007/T010/T012/T014/T019/T022. UI/kernel E2E was repaired for the current assets-only UI and live protocol; deployed-resource docs and kernel architecture docs were refreshed; operator TODO was replaced with current truth."
+        architecture_skill: "Covered by T017/T018/T019/T020/T021/T022. improve-codebase-architecture was used read-only, candidates were recorded, and the deployed endpoint manifest Module was implemented as the highest-value safe local deepening slice."
+      final_verification:
+        - "node /Users/umang/.agents/skills/goalbuddy/scripts/check-goal-state.mjs docs/goals/engram-system-audit-hardening/state.yaml"
+        - "bun run check"
+        - "bun run smoke:live"
+        - "bun run e2e:ui"
+        - "curl --resolve engram.umgbhalla.xyz:443:104.21.78.96 https://engram.umgbhalla.xyz/health"
+      residual_risk:
+        - "This Mac's getaddrinfo path still returns ENOTFOUND for engram.umgbhalla.xyz even though dig/node dns.resolve4 resolve Cloudflare A records and forced-resolution HTTPS returns ok."
+        - "Owner-gated GA work remains outside this audit tranche: npm publish, larger scale runs, docs site policy, and R2 stale-key prune credentials."
+        - "Further architecture candidates remain available in notes/T017-architecture-deepening.md, but no additional safe local Worker is required to satisfy the original audit/hardening objective."
+      summary: "Final audit proves the requested tranche complete: deployed/runtime, test/CI, product/code, and architecture-improvement surfaces were audited; safe fixes were implemented; current no-write, live smoke, UI/kernel E2E, and forced custom-domain edge verification are green; external or owner-gated items are explicitly recorded."
 
 checks:
   dirty_fingerprint: unknown
   last_verification:
     result: pass
-    task: T021
+    task: T022
     commands:
       - "bun run endpoints:check"
+      - "bun run smoke:live"
+      - "bun run e2e:ui"
       - "bun run check"

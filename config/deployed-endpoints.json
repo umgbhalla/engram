@@ -5,8 +5,13 @@
     "kernel": {
       "worker": "engram-kernel",
       "defaultWs": "wss://engram-kernel.umg-bhalla88.workers.dev",
+      "browserDefaultWs": "wss://engram-kernel.umg-bhalla88.workers.dev",
+      "cliDefaultWs": "wss://engram.umgbhalla.xyz",
       "workersDevHttp": "https://engram-kernel.umg-bhalla88.workers.dev",
       "workersDevWs": "wss://engram-kernel.umg-bhalla88.workers.dev",
+      "customDomainHttp": "https://engram.umgbhalla.xyz",
+      "customDomainWs": "wss://engram.umgbhalla.xyz",
+      "customDomainStatus": "edge-verified-with-forced-resolution-local-getaddrinfo-pending",
       "wsPath": "/ws",
       "healthPath": "/health",
       "env": {
@@ -36,6 +41,8 @@
     }
   },
   "resources": {
+    "alchemyStateBucket": "engram-alchemy-state",
+    "alchemyStatePrefix": "engram-kernel/",
     "r2Snapshots": "engram-snapshots",
     "analyticsEngine": "engram_kernel"
   }
