@@ -705,7 +705,7 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
     } catch {
       /* ignore */
     }
-    const DEFAULT_ENDPOINT = "wss://engram-kernel.umg-bhalla88.workers.dev";
+    const DEFAULT_ENDPOINT = "wss://engram.umgbhalla.xyz";
     const epFlag = endpoint === DEFAULT_ENDPOINT ? "" : ` --endpoint ${endpoint}`;
     console.log(c.dim("\nbye. session is durable — resume with:"));
     console.log(c.cyan(`  engram repl --session ${sessionId}${epFlag}`));

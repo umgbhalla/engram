@@ -19,7 +19,7 @@ import { connect, type EngramSession, type EngramConfig, type EvalResult } from 
 import { runRepl, isComplete } from "./repl";
 
 const DEFAULT_ENDPOINT =
-  process.env.ENGRAM_ENDPOINT || "wss://engram-kernel.umg-bhalla88.workers.dev";
+  process.env.ENGRAM_ENDPOINT || "wss://engram.umgbhalla.xyz";
 const STORE = path.join(os.homedir(), ".engram-sessions.json");
 
 interface Args {
