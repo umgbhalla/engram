@@ -1277,3 +1277,214 @@ export default Engram;
 
 /** Convenience: bare {@link Engram.connect}. */
 export const connect = Engram.connect;
+
+// ---------------------------------------------------------------------------
+// Config presets + builder (substrate config sugar)
+// ---------------------------------------------------------------------------
+
+/**
+ * Identity helper that validates an {@link EngramConfig} at the call site (so a typo in a
+ * numeric field fails fast in your substrate instead of silently passing through the kernel's
+ * open `[k: string]: unknown` map). Returns the same object. Throws {@link EngramError} on a
+ * structurally invalid field.
+ */
+export function defineConfig(config: EngramConfig): EngramConfig {
+  if (config.rngSeed !== undefined && (!Number.isInteger(config.rngSeed) || config.rngSeed < 0)) {
+    throw new EngramError(`defineConfig: rngSeed must be a non-negative integer (got ${config.rngSeed})`);
+  }
+  if (config.cellBudgetTicks !== undefined && (!Number.isInteger(config.cellBudgetTicks) || config.cellBudgetTicks <= 0)) {
+    throw new EngramError(`defineConfig: cellBudgetTicks must be a positive integer (got ${config.cellBudgetTicks})`);
+  }
+  if (config.clock !== undefined && config.clock !== "seeded" && config.clock !== "real") {
+    throw new EngramError(`defineConfig: clock must be "seeded" | "real" (got ${String(config.clock)})`);
+  }
+  if (config.fetch !== undefined && typeof config.fetch !== "boolean" && !Array.isArray(config.fetch)) {
+    throw new EngramError(`defineConfig: fetch must be boolean | string[] (got ${typeof config.fetch})`);
+  }
+  if (config.modules !== undefined && typeof config.modules !== "boolean" && !Array.isArray(config.modules)) {
+    throw new EngramError(`defineConfig: modules must be boolean | string[] (got ${typeof config.modules})`);
+  }
+  return config;
+}
+
+/**
+ * Ready-made {@link EngramConfig} presets for common substrate postures. Each returns a fresh
+ * object you can spread + override: `{ ...presets.deterministic(), cellBudgetTicks: 1500 }`.
+ */
+export const presets = {
+  /** Byte-identical replay: seeded clock + RNG (+ seeded crypto in-VM). The default for RLM/trajectory work. */
+  deterministic: (rngSeed = 1): EngramConfig => ({ clock: "seeded", rngSeed, capture: true }),
+  /** Real wall-clock Date/Math (non-reproducible snapshots). Use for human-facing REPLs. */
+  realtime: (): EngramConfig => ({ clock: "real", capture: true }),
+  /** Full Node-shaped sandbox: in-VM stdlib bundle + open egress, seeded for reproducibility. */
+  nodeFull: (rngSeed = 1): EngramConfig => ({ clock: "seeded", rngSeed, modules: true, fetch: true, capture: true }),
+  /** Locked down: no egress (or an explicit hostname allowlist), seeded, console captured. */
+  sandboxed: (allow: string[] | false = false): EngramConfig => ({ clock: "seeded", rngSeed: 1, fetch: allow, capture: true }),
+} as const;
+
+// ---------------------------------------------------------------------------
+// EngramClient — instance management (a pool/registry of durable sessions)
+// ---------------------------------------------------------------------------
+
+/** Defaults applied to every session an {@link EngramClient} mints. Per-session overrides win. */
+export interface EngramClientOptions {
+  /** Kernel/cloud endpoint shared by all sessions (omit when every session injects its own transport). */
+  url?: string;
+  /** Cloud API key (flips all sessions to the HTTP path). */
+  apiKey?: string;
+  /** WebSocket implementation (Node: `(await import("ws")).default`). */
+  WebSocket?: unknown;
+  /** Default in-VM config for every session (deep-overridable per session). */
+  config?: EngramConfig;
+  /** Default bootstrap appended for every session. */
+  bootstrap?: string;
+  /** Default runtime env (globals/prelude/modules) for every session. */
+  env?: RuntimeEnv;
+  /** Default flat host fns for every session. */
+  host?: Record<string, (...a: unknown[]) => unknown | Promise<unknown>>;
+  /** Default namespaced host modules for every session. */
+  hostModules?: Record<string, HostModule>;
+  /** Default throw-on-error (default true). */
+  throwOnError?: boolean;
+  /** Default auto-reconnect (default true). */
+  autoReconnect?: boolean;
+  /** Default per-request timeout in ms. */
+  timeoutMs?: number;
+  /** Default console sink for every session. */
+  onConsole?: (line: ConsoleLine) => void;
+  /** Default eval interceptor(s) for every session. */
+  onEval?: EvalInterceptor | EvalInterceptor[];
+  /**
+   * Default custom-transport factory: called per session id to mint a {@link Transport}
+   * (service binding / DO-to-DO RPC / in-process). When set, `url`/`apiKey` are ignored.
+   */
+  transport?: (session: string) => Transport | Promise<Transport>;
+}
+
+/**
+ * A manager for many durable Engram sessions behind one set of connection defaults — the
+ * substrate-facing handle when your service owns a fleet of sessions (one per user / project /
+ * conversation). It reuses a live {@link EngramSession} per id (so two requests for the same id
+ * share one socket), dedupes concurrent connects, and gives you fleet-wide lifecycle ops.
+ *
+ * ```ts
+ * const client = new EngramClient({ url, WebSocket, config: presets.deterministic() });
+ * const a = await client.session(`proj:${id}`);        // connect-or-reuse by id
+ * const b = await client.session(`proj:${id}`);        // same instance as `a`
+ * await client.eval(`proj:${id}`, "globalThis.x = 1"); // shorthand
+ * await client.closeAll();                              // tear down the whole fleet
+ * ```
+ */
+export class EngramClient {
+  private sessions = new Map<string, EngramSession>();
+  /** In-flight connects, so two concurrent session(id) calls share one connect. */
+  private pending = new Map<string, Promise<EngramSession>>();
+
+  constructor(private opts: EngramClientOptions = {}) {}
+
+  /** Number of live (cached) sessions. */
+  get size(): number {
+    return this.sessions.size;
+  }
+
+  /** The ids of all live (cached) sessions. */
+  ids(): string[] {
+    return [...this.sessions.keys()];
+  }
+
+  /** The cached session for `id`, or `undefined` if none is open (does NOT connect). */
+  get(id: string): EngramSession | undefined {
+    return this.sessions.get(id);
+  }
+
+  /** `true` if a session for `id` is currently open. */
+  has(id: string): boolean {
+    return this.sessions.has(id);
+  }
+
+  /** All live sessions as `{ id, session }` pairs. */
+  list(): { id: string; session: EngramSession }[] {
+    return [...this.sessions.entries()].map(([id, session]) => ({ id, session }));
+  }
+
+  /**
+   * Connect-or-reuse a durable session by id. A cached live session is returned as-is;
+   * otherwise one is connected with the client defaults merged with any per-call `overrides`
+   * (overrides win; `config`/`host`/`hostModules`/`env` are shallow-merged). Concurrent calls
+   * for the same id share a single connect.
+   */
+  async session(id: string, overrides: Partial<ConnectOptions> = {}): Promise<EngramSession> {
+    const existing = this.sessions.get(id);
+    if (existing) return existing;
+    const inFlight = this.pending.get(id);
+    if (inFlight) return inFlight;
+
+    const o = this.opts;
+    const connectOpts: ConnectOptions = {
+      url: o.url,
+      apiKey: o.apiKey,
+      WebSocket: o.WebSocket,
+      throwOnError: o.throwOnError,
+      autoReconnect: o.autoReconnect,
+      timeoutMs: o.timeoutMs,
+      onConsole: o.onConsole,
+      onEval: o.onEval,
+      bootstrap: o.bootstrap,
+      ...overrides,
+      session: id,
+      config: { ...(o.config || {}), ...(overrides.config || {}) },
+      env: o.env || overrides.env ? { ...(o.env || {}), ...(overrides.env || {}) } : undefined,
+      host: o.host || overrides.host ? { ...(o.host || {}), ...(overrides.host || {}) } : undefined,
+      hostModules:
+        o.hostModules || overrides.hostModules ? { ...(o.hostModules || {}), ...(overrides.hostModules || {}) } : undefined,
+      transport: overrides.transport ?? (o.transport ? (s) => o.transport!(s) : undefined),
+    };
+
+    const p = Engram.connect(connectOpts).then(
+      (s) => {
+        this.sessions.set(id, s);
+        this.pending.delete(id);
+        return s;
+      },
+      (e) => {
+        this.pending.delete(id);
+        throw e;
+      },
+    );
+    this.pending.set(id, p);
+    return p;
+  }
+
+  /** Shorthand: connect-or-reuse `id`, then eval one cell against it. */
+  async eval<T = unknown, F = unknown>(id: string, code: string, opts?: { throwOnError?: boolean; timeoutMs?: number }): Promise<EvalResult<T, F>> {
+    const s = await this.session(id);
+    return s.eval<T, F>(code, opts);
+  }
+
+  /** Liveness/generation probe for every live session, keyed by id. */
+  async statusAll(): Promise<Record<string, { generation?: number; inMemory?: boolean; [k: string]: unknown }>> {
+    const out: Record<string, { generation?: number; inMemory?: boolean }> = {};
+    await Promise.all(this.list().map(async ({ id, session }) => { out[id] = await session.status().catch(() => ({})); }));
+    return out;
+  }
+
+  /** Force-evict every live session's in-memory kernel (snapshots kept). Sessions stay registered. */
+  async evictAll(): Promise<void> {
+    await Promise.all(this.list().map(({ session }) => session.evict().catch(() => {})));
+  }
+
+  /** Close + forget one session. The durable heap persists server-side and can be reattached later. */
+  async close(id: string): Promise<void> {
+    const s = this.sessions.get(id);
+    if (!s) return;
+    this.sessions.delete(id);
+    s.close();
+  }
+
+  /** Close + forget every session. Durable heaps persist server-side. */
+  async closeAll(): Promise<void> {
+    for (const { session } of this.list()) session.close();
+    this.sessions.clear();
+    this.pending.clear();
+  }
+}

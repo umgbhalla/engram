@@ -289,6 +289,47 @@ exists — use that when you want host callbacks over an injected socket. Use a 
 when your channel is request/reply (service binding) or non-WS. See
 [`examples/substrate-custom-transport.ts`](./examples/substrate-custom-transport.ts).
 
+### Instance management — `EngramClient`
+
+When your service owns a **fleet** of sessions (one per user / project / conversation), `EngramClient`
+holds the connection defaults once and reuses a live `EngramSession` per id — two requests for the
+same id share one socket, concurrent connects dedupe, and you get fleet-wide lifecycle ops.
+
+```ts
+import { EngramClient, presets } from "@engram/sdk";
+
+const client = new EngramClient({ url, WebSocket, config: presets.deterministic() });
+
+const s = await client.session(`proj:${id}`);          // connect-or-reuse by id
+await client.eval(`proj:${id}`, "globalThis.x = 1");    // shorthand (connect-or-reuse + eval)
+client.size; client.ids(); client.has(id); client.get(id); client.list();
+await client.statusAll();                                // {id: {generation, inMemory}}
+await client.evictAll();                                 // hibernate the whole fleet
+await client.close(id);                                  // close + forget one (durable heap persists)
+await client.closeAll();                                 // tear down the fleet
+```
+
+Per-call overrides merge over the client defaults (`config`/`host`/`hostModules`/`env` shallow-merge,
+overrides win): `await client.session(id, { config: { cellBudgetTicks: 1500 } })`. `EngramClient` also
+takes a `transport: (session) => Transport` factory, so a fleet can bind over service bindings too.
+
+### Config presets + `defineConfig`
+
+`presets` are ready-made `EngramConfig` postures (spread + override freely); `defineConfig` validates
+a config at the call site so a typo fails fast instead of passing silently through the kernel's open
+config map.
+
+```ts
+import { presets, defineConfig } from "@engram/sdk";
+
+presets.deterministic(7)         // { clock:"seeded", rngSeed:7, capture:true } — byte-identical replay
+presets.realtime()               // real wall-clock Date/Math
+presets.nodeFull()               // in-VM stdlib bundle + open egress, seeded
+presets.sandboxed(["api.x.com"]) // locked egress allowlist (or sandboxed() to block all)
+
+const config = defineConfig({ ...presets.nodeFull(), cellBudgetTicks: 2000 }); // throws on bad fields
+```
+
 ---
 
 ## Roadmap (not in v2 core yet)

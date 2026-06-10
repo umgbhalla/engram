@@ -8,7 +8,7 @@
 // onEval interceptor (single, chain order, runtime use(), throw, transform),
 // EngramSession.fromTransport, and the WS lifecycle hooks (onConnect/onReconnect/onClose)
 // via a fake WebSocket that can simulate a mid-session drop + reconnect.
-import { Engram, EngramSession } from "../../packages/sdk/dist/index.mjs";
+import { Engram, EngramSession, EngramClient, presets, defineConfig } from "../../packages/sdk/dist/index.mjs";
 
 let pass = 0, fail = 0;
 const check = (n, c, x = "") => { (c ? pass++ : fail++); console.log(`  ${c ? "PASS" : "FAIL"}  ${n}${x ? "  — " + x : ""}`); };
@@ -181,6 +181,77 @@ class FakeWS {
   check("onReconnect fired after reconnect", events.includes("reconnect"), JSON.stringify(events));
   check("onConnect NOT re-fired on reconnect", events.filter((e) => e === "connect").length === 1, JSON.stringify(events));
   s.close();
+}
+
+// 11) config presets + defineConfig validation
+{
+  check("preset deterministic", presets.deterministic(7).clock === "seeded" && presets.deterministic(7).rngSeed === 7);
+  check("preset nodeFull", presets.nodeFull().modules === true && presets.nodeFull().fetch === true);
+  check("preset sandboxed default blocks egress", presets.sandboxed().fetch === false);
+  check("preset sandboxed allowlist", JSON.stringify(presets.sandboxed(["api.example.com"]).fetch) === '["api.example.com"]');
+  check("presets return fresh objects", presets.deterministic() !== presets.deterministic());
+  check("defineConfig passes valid", defineConfig({ clock: "seeded", rngSeed: 3 }).rngSeed === 3);
+  let threwSeed = false; try { defineConfig({ rngSeed: -1 }); } catch { threwSeed = true; }
+  check("defineConfig rejects bad rngSeed", threwSeed);
+  let threwBudget = false; try { defineConfig({ cellBudgetTicks: 0 }); } catch { threwBudget = true; }
+  check("defineConfig rejects bad cellBudgetTicks", threwBudget);
+  let threwClock = false; try { defineConfig({ clock: "fast" }); } catch { threwClock = true; }
+  check("defineConfig rejects bad clock", threwClock);
+}
+
+// 12) EngramClient — instance management over a transport factory
+{
+  const minted = []; // record each session id the factory built a transport for
+  const client = new EngramClient({
+    config: presets.deterministic(2),
+    transport: (sess) => { minted.push(sess); return makeMock(true).transport; },
+  });
+  const a = await client.session("u1");
+  const a2 = await client.session("u1");
+  check("client reuses session by id", a === a2 && client.size === 1, `size=${client.size}`);
+  check("client minted transport once for id", minted.filter((m) => m === "u1").length === 1, JSON.stringify(minted));
+  check("client passes id as session", a.session === "u1");
+  const b = await client.session("u2");
+  check("client tracks multiple sessions", client.size === 2 && client.has("u1") && client.has("u2"));
+  check("client ids()", client.ids().sort().join(",") === "u1,u2");
+  check("client get() returns cached", client.get("u1") === a);
+  check("client get() undefined for unknown", client.get("nope") === undefined);
+  check("client list()", client.list().length === 2);
+  // eval shorthand
+  const r = await client.eval("u1", "abcd");
+  check("client.eval shorthand", r.value === 4, `v=${r.value}`);
+  // close one
+  await client.close("u1");
+  check("client close(id) removes", !client.has("u1") && client.size === 1);
+  // closeAll
+  await client.closeAll();
+  check("client closeAll empties", client.size === 0);
+}
+
+// 13) EngramClient — concurrent session(id) dedupes to one connect
+{
+  let connects = 0;
+  const client = new EngramClient({ transport: () => { connects++; return makeMock(true).transport; } });
+  const [x, y, z] = await Promise.all([client.session("c"), client.session("c"), client.session("c")]);
+  check("client dedupes concurrent connects", x === y && y === z && connects === 1, `connects=${connects}`);
+  await client.closeAll();
+}
+
+// 14) EngramClient — per-call overrides merge over client defaults
+{
+  let seenConfig = null;
+  const client = new EngramClient({
+    config: { clock: "seeded", rngSeed: 1 },
+    transport: () => {
+      const m = makeMock(true);
+      const orig = m.transport.request.bind(m.transport);
+      m.transport.request = (f) => { if (f.t === "create") seenConfig = f.config; return orig(f); };
+      return m.transport;
+    },
+  });
+  await client.session("o1", { config: { rngSeed: 99, cellBudgetTicks: 1500 } });
+  check("client merges config overrides", seenConfig && seenConfig.clock === "seeded" && seenConfig.rngSeed === 99 && seenConfig.cellBudgetTicks === 1500, JSON.stringify(seenConfig));
+  await client.closeAll();
 }
 
 console.log(`\n${pass} passed, ${fail} failed\n`);
