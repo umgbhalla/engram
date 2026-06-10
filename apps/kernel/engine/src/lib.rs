@@ -252,7 +252,7 @@ try {
   if (typeof globalThis.ReadableStream === 'undefined') {
     function EngramRS(underlying){
       underlying = underlying || {};
-      this._queue = []; this._closed = false; this._errored = null; this._pull = underlying.pull || null;
+      this._queue = []; this._closed = false; this._errored = null; this._pull = underlying.pull || null; this._underlying = underlying;
       this._locked = false;
       var self = this;
       var controller = {
@@ -282,8 +282,20 @@ try {
         cancel: function(){ self._closed = true; self._queue = []; return Promise.resolve(); }
       };
     };
-    EngramRS.prototype.cancel = function(){ this._closed = true; this._queue = []; return Promise.resolve(); };
+    EngramRS.prototype.cancel = function(){ this._closed = true; this._queue = []; var u = this._underlying; if (u && typeof u.cancel === 'function'){ try { return Promise.resolve(u.cancel()); } catch(e){} } return Promise.resolve(); };
     Object.defineProperty(EngramRS.prototype, 'locked', { get: function(){ return this._locked; }, configurable: true });
+    // TRUE STREAMING (#13): async-iteration over the stream so `for await (const c of res.body)`
+    // works; early break / return cancels the underlying source (releases the DO-side reader).
+    EngramRS.prototype[Symbol.asyncIterator] = function(){
+      var rd = this.getReader();
+      var it = {
+        next: function(){ return rd.read(); },
+        return: function(){ try { rd.cancel(); } catch(e){} try { rd.releaseLock(); } catch(e){} return Promise.resolve({ value: undefined, done: true }); },
+        throw: function(e){ try { rd.cancel(); } catch(_){} return Promise.reject(e); }
+      };
+      it[Symbol.asyncIterator] = function(){ return this; };
+      return it;
+    };
     globalThis.ReadableStream = EngramRS;
   }
 } catch(e){}
@@ -883,12 +895,29 @@ if (typeof globalThis.setTimeout === 'undefined') {
     if (globalThis.FormData && body instanceof globalThis.FormData) return 'application/x-www-form-urlencoded;charset=UTF-8';
     return null;
   }
+  // TRUE STREAMING (#13): drain a streamed body to a single buffer so .text()/.json()/.arrayBuffer()
+  // keep their buffered semantics for code that does not care about streaming. Pulls host.streamRead
+  // to completion, concatenates, stores into _buf, marks the stream drained (body getter then yields
+  // the buffer, not a live stream). If the stream already expired -> rejects typed.
+  function drainBody(self){
+    if (self._streamId == null || self._streamDrained) return Promise.resolve(self._buf || new Uint8Array(0));
+    var sid = self._streamId, B64 = globalThis.__fetchB64, parts = [], total = 0;
+    function step(){
+      return globalThis.host.streamRead(sid).then(function(r){
+        if (r && r.error){ self._streamDrained = true; self._streamDone = true; throw new Error(r.error); }
+        if (r && r.done){ self._streamDrained = true; self._streamDone = true; var all = new Uint8Array(total), off = 0; for (var i=0;i<parts.length;i++){ all.set(parts[i], off); off += parts[i].length; } self._buf = all; return all; }
+        if (r && typeof r.chunk === 'string'){ var u8 = B64.dec(r.chunk); parts.push(u8); total += u8.length; }
+        return step();
+      });
+    }
+    return step();
+  }
   function installBody(proto){
-    proto.arrayBuffer = function(){ if (this.bodyUsed) return Promise.reject(new TypeError('Body has already been consumed.')); this.bodyUsed = true; var b = this._buf; return Promise.resolve(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength)); };
-    proto.bytes = function(){ if (this.bodyUsed) return Promise.reject(new TypeError('Body has already been consumed.')); this.bodyUsed = true; return Promise.resolve(this._buf.slice()); };
-    proto.text = function(){ if (this.bodyUsed) return Promise.reject(new TypeError('Body has already been consumed.')); this.bodyUsed = true; var self = this; return Promise.resolve(self._fullText ? self._fullText() : DEC.decode(self._buf)); };
+    proto.arrayBuffer = function(){ if (this.bodyUsed) return Promise.reject(new TypeError('Body has already been consumed.')); this.bodyUsed = true; var self = this; return drainBody(self).then(function(b){ return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); }); };
+    proto.bytes = function(){ if (this.bodyUsed) return Promise.reject(new TypeError('Body has already been consumed.')); this.bodyUsed = true; var self = this; return drainBody(self).then(function(b){ return b.slice(); }); };
+    proto.text = function(){ if (this.bodyUsed) return Promise.reject(new TypeError('Body has already been consumed.')); this.bodyUsed = true; var self = this; if (self._streamId != null && !self._streamDrained) return drainBody(self).then(function(b){ return DEC.decode(b); }); return Promise.resolve(self._fullText ? self._fullText() : DEC.decode(self._buf)); };
     proto.json = function(){ return this.text().then(function(t){ return JSON.parse(t); }); };
-    proto.blob = function(){ if (this.bodyUsed) return Promise.reject(new TypeError('Body has already been consumed.')); this.bodyUsed = true; var ct = (this.headers && this.headers.get && this.headers.get('content-type')) || ''; return Promise.resolve(new globalThis.Blob([this._buf.slice()], { type: ct })); };
+    proto.blob = function(){ if (this.bodyUsed) return Promise.reject(new TypeError('Body has already been consumed.')); this.bodyUsed = true; var self = this; var ct = (this.headers && this.headers.get && this.headers.get('content-type')) || ''; return drainBody(self).then(function(b){ return new globalThis.Blob([b.slice()], { type: ct }); }); };
     proto.formData = function(){ return this.text().then(function(t){ var fd = new globalThis.FormData(); var usp = new globalThis.URLSearchParams(t); usp.forEach(function(v, k){ fd.append(k, v); }); return fd; }); };
   }
 
@@ -928,7 +957,23 @@ if (typeof globalThis.setTimeout === 'undefined') {
     this._fullText = null;
   }
   installBody(Response.prototype);
-  Object.defineProperty(Response.prototype, 'body', { get: function(){ var self = this; if (typeof globalThis.ReadableStream === 'function'){ var chunk = self._buf.slice(); var sent = false; return new globalThis.ReadableStream({ pull: function(c){ if (!sent){ sent = true; if (chunk && chunk.length) c.enqueue(chunk); c.close(); } } }); } return null; }, configurable: true });
+  // TRUE STREAMING (#13): when the Response carries a live _streamId (set by fetch() for a truly
+  // chunked upstream), body returns a real ReadableStream whose pull() drives host.streamRead — each
+  // chunk is one host park/resume cycle with end-to-end backpressure. Otherwise (buffered / inline
+  // body) it yields the already-complete _buf once (today's behavior, zero change).
+  Object.defineProperty(Response.prototype, 'body', { get: function(){ var self = this; if (typeof globalThis.ReadableStream !== 'function') return null;
+    if (self._streamId != null && !self._streamDrained){
+      var sid = self._streamId; var B64 = globalThis.__fetchB64;
+      return new globalThis.ReadableStream({
+        pull: function(c){ return globalThis.host.streamRead(sid).then(function(r){
+          if (r && r.error){ self._streamDone = true; c.error(new Error(r.error)); return; }
+          if (r && r.done){ self._streamDone = true; c.close(); return; }
+          if (r && typeof r.chunk === 'string'){ c.enqueue(B64.dec(r.chunk)); }
+        }); },
+        cancel: function(){ self._streamDone = true; return globalThis.host.streamCancel(sid); }
+      });
+    }
+    var chunk = self._buf ? self._buf.slice() : new Uint8Array(0); var sent = false; return new globalThis.ReadableStream({ pull: function(c){ if (!sent){ sent = true; if (chunk && chunk.length) c.enqueue(chunk); c.close(); } } }); }, configurable: true });
   Response.prototype.clone = function(){ var r = new Response(this._buf.slice(), { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url, redirected: this.redirected, type: this.type }); r.bodyUsed = false; r._fullText = this._fullText; return r; };
   Response.json = function(data, init){ init = init || {}; var h = new globalThis.Headers(init.headers || {}); if (!h.has('content-type')) h.set('content-type', 'application/json'); var r = new Response(JSON.stringify(data), { status: init.status, statusText: init.statusText, headers: h }); return r; };
   Response.error = function(){ var r = new Response(null, { status: 0 }); r.type = 'error'; r.ok = false; return r; };
@@ -947,24 +992,56 @@ if (typeof globalThis.setTimeout === 'undefined') {
       // Build the host init: method, headers (plain object), and a binary-safe body (bodyB64).
       var hdrObj = {}; req.headers.forEach(function(v, k){ hdrObj[k] = v; });
       var sendInit = { method: req.method, headers: hdrObj };
-      if (req._buf && req._buf.length){ sendInit.bodyB64 = B64.enc(req._buf); }
+      // TRUE STREAMING (#13): detect a streaming REQUEST body (a ReadableStream or async-iterable
+      // passed directly as init.body) -> upload via streamWrite. A normal buffered body still ships
+      // as bodyB64 exactly as before (no regression).
+      var rawBody = (init && init.body != null) ? init.body : null;
+      var isStreamBody = rawBody && typeof rawBody !== 'string' && !(rawBody instanceof Uint8Array) && !(rawBody instanceof ArrayBuffer) && (typeof rawBody.getReader === 'function' || typeof rawBody[Symbol.asyncIterator] === 'function');
+      if (isStreamBody){ sendInit.requestStream = true; }
+      else if (req._buf && req._buf.length){ sendInit.bodyB64 = B64.enc(req._buf); }
       else if (init && init.body != null && typeof init.body === 'string'){ sendInit.body = init.body; }
-      var hostPromise = globalThis.host.fetch(u, sendInit).then(function(r){
-        var _bytes = null;
-        function bytes(){ if (_bytes) return _bytes; _bytes = (typeof r.bodyB64 === 'string') ? B64.dec(r.bodyB64) : ENC.encode(r.body || ''); return _bytes; }
-        // r.body is a CAPPED utf8 PREVIEW (host truncates big bodies). Use it ONLY when it is the
-        // WHOLE body (!r.bodyTruncated); else decode exact bytes from bodyB64 (so .text()/.json()
-        // are never truncated). This preserves the prior fullText() semantics on the new Response.
-        var resp = new globalThis.Response(bytes(), {
+      // ALWAYS open via fetchStream: the host decides inline (small/known length -> bodyB64, today\'s
+      // one round trip) vs truly-chunked (returns a streamId). .text()/.json() on a chunked body
+      // drain the stream internally, so existing buffered-fetch code is byte-identical.
+      function mkResp(r){
+        if (r && r.uploadOpen){ return uploadThenResp(r.streamId, rawBody); }
+        var hasInlineBytes = (typeof r.bodyB64 === 'string');
+        var initBytes = hasInlineBytes ? B64.dec(r.bodyB64) : new Uint8Array(0);
+        var resp = new globalThis.Response(initBytes, {
           status: r.status|0,
           statusText: r.statusText || '',
           headers: r.headers || {},
           url: r.url || u,
           redirected: !!r.redirected,
         });
-        resp._fullText = function(){ return (typeof r.body === 'string' && !r.bodyTruncated) ? r.body : DEC.decode(bytes()); };
+        if (r && r.stream && r.streamId != null && !r.inline && !hasInlineBytes){
+          // truly chunked: attach the live stream handle; .text()/body pull via host.streamRead.
+          resp._streamId = r.streamId;
+          resp._buf = new Uint8Array(0);
+        } else {
+          resp._fullText = function(){ return DEC.decode(initBytes); };
+        }
         return resp;
-      });
+      }
+      // request-body upload: drain the source into streamWrite, then flip to the response.
+      function uploadThenResp(sid, src){
+        function drain(){
+          if (src && typeof src.getReader === 'function'){
+            var rd = src.getReader();
+            function pump(){ return rd.read().then(function(s){ if (s.done) return globalThis.host.streamWrite(sid, null, true); var u8 = (s.value instanceof Uint8Array) ? s.value : ENC.encode(String(s.value)); return globalThis.host.streamWrite(sid, B64.enc(u8), false).then(pump); }); }
+            return pump();
+          }
+          // async-iterable
+          return (async function(){ for await (var c of src){ var u8 = (c instanceof Uint8Array) ? c : ENC.encode(String(c)); await globalThis.host.streamWrite(sid, B64.enc(u8), false); } return globalThis.host.streamWrite(sid, null, true); })();
+        }
+        return drain().then(function(fin){
+          if (fin && fin.error) throw new Error(fin.error);
+          var resp = new globalThis.Response(new Uint8Array(0), { status: (fin && fin.status)|0 || 200, statusText: (fin && fin.statusText) || '', headers: (fin && fin.headers) || {}, url: u });
+          resp._streamId = sid; resp._buf = new Uint8Array(0);
+          return resp;
+        });
+      }
+      var hostPromise = globalThis.host.fetchStream(u, sendInit).then(mkResp);
       // Wire the signal: reject the fetch promise on abort (the host call resolves independently;
       // the abort just wins the race for the caller). Deterministic — abort fires on a microtask.
       if (signal){
@@ -977,6 +1054,47 @@ if (typeof globalThis.setTimeout === 'undefined') {
       return hostPromise;
     };
     globalThis.__realFetch = true;
+  }
+
+  // TRUE STREAMING (#13): SSE — a pure in-VM async-generator over the deterministic chunk stream.
+  // Frames events on a blank line ("\n\n"), accumulates data: lines (joined "\n"), reads event:/id:/
+  // retry:. No timers, no auto-reconnect (reconnect is app code) -> inherits determinism for free.
+  function parseSseBlock(raw){
+    var ev = { event: 'message', data: '', id: undefined, retry: undefined };
+    var lines = raw.split(/\r?\n/); var dataLines = [];
+    for (var i=0;i<lines.length;i++){
+      var line = lines[i];
+      if (line === '' || line.charAt(0) === ':') continue;
+      var ci = line.indexOf(':');
+      var field = ci < 0 ? line : line.slice(0, ci);
+      var val = ci < 0 ? '' : line.slice(ci + 1);
+      if (val.charAt(0) === ' ') val = val.slice(1);
+      if (field === 'data') dataLines.push(val);
+      else if (field === 'event') ev.event = val;
+      else if (field === 'id') ev.id = val;
+      else if (field === 'retry') ev.retry = parseInt(val, 10);
+    }
+    ev.data = dataLines.join('\n');
+    return ev;
+  }
+  globalThis.sseEvents = async function* (response){
+    var DEC2 = new TextDecoder(); var buf = '';
+    var body = (response && response.body) ? response.body : response;
+    for await (var chunk of body){
+      buf += DEC2.decode(chunk, { stream: true });
+      var idx;
+      while ((idx = buf.search(/\r?\n\r?\n/)) >= 0){
+        var m = buf.slice(idx).match(/^\r?\n\r?\n/);
+        var sepLen = m ? m[0].length : 2;
+        var raw = buf.slice(0, idx); buf = buf.slice(idx + sepLen);
+        if (raw.length) yield parseSseBlock(raw);
+      }
+    }
+    if (buf.trim().length) yield parseSseBlock(buf);
+  };
+  // Response.prototype.sse(): sugar for SSE async-iteration over this response body.
+  if (globalThis.Response && !globalThis.Response.prototype.sse){
+    globalThis.Response.prototype.sse = function(){ return globalThis.sseEvents(this); };
   }
 })();
 // console.dir/group/table over the existing capture + __preview.

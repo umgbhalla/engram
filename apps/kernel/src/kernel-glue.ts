@@ -88,7 +88,6 @@ interface HostCall {
 type HostResult =
   | { ok: true; value: unknown }
   | { ok: false; error: string };
-
 interface KernelConfig {
   rngSeed?: number;
   typescript?: boolean;
@@ -102,6 +101,9 @@ interface KernelConfig {
   cellBudgetTicks?: number;
   cellGrowCapPages?: number;
   maxHostCallsPerCell?: number;
+  // TRUE STREAMING (#13): per-cell budget for stream chunk pulls (streamRead/streamWrite), counted
+  // separately from maxHostCallsPerCell so a long stream is not capped by the 64 host-call guard.
+  maxStreamOpsPerCell?: number;
   // fs provider: undefined / {provider:"vfs"} = in-heap VFS (sync, durable in snapshot);
   // {provider:"r2",binding?,prefix?} = host-backed R2 (async-only; serviced DO-side in lib.rs).
   fs?: { provider?: string; binding?: string; prefix?: string };
@@ -333,13 +335,15 @@ const STATUS_HOST_CALL = 1;
 // (`bodyB64`), the SAME pattern the R2 fs op uses (ADR-0011). This is the structural unblocker
 // for binary transfers (git packfiles), which the prior `await r.text()` path lossy-corrupted +
 // truncated. We KEEP a utf8 `body` (capped) for back-compat with the existing string fetch shim.
-// Cap raised 1MB -> 32MB (env-overridable via FETCH_MAX_BODY_BYTES). A request body may also be
-// binary (git-upload-pack POSTs a packfile): the engine sends `init.bodyB64` (base64 bytes) which
-// we decode to a Uint8Array before fetch.
+// Default cap is deliberately set to the live-verified stable boundary. The engine/glue boundary is
+// still env-overridable via FETCH_MAX_BODY_BYTES for experiments, but the public kernel should
+// truncate instead of letting 3MB+ response bodies close the WebSocket during decode/checkpoint.
+// A request body may also be binary (git-upload-pack POSTs a packfile): the engine sends
+// init.bodyB64 (base64 bytes) which we decode to a Uint8Array before fetch.
 const FETCH_MAX_BODY_BYTES = (() => {
   const v = (globalThis as { FETCH_MAX_BODY_BYTES?: unknown }).FETCH_MAX_BODY_BYTES;
   const n = typeof v === "number" ? v : (typeof v === "string" ? parseInt(v, 10) : NaN);
-  return Number.isFinite(n) && n > 0 ? n : 32 * 1024 * 1024;
+  return Number.isFinite(n) && n > 0 ? n : 2 * 1024 * 1024;
 })();
 // The back-compat utf8 `body` is a CAPPED PREVIEW only — the exact bytes always travel as `bodyB64`.
 // Capping is REQUIRED for big binary payloads: a 6.6MB PDF would otherwise also ship a ~6.6MB utf8
@@ -349,6 +353,24 @@ const FETCH_MAX_BODY_BYTES = (() => {
 // the exact bytes from `bodyB64` (engine shim), so correctness is unaffected; only the convenience
 // preview is truncated. 64KB is enough for the common text/JSON case while keeping binary cheap.
 const FETCH_BODY_UTF8_PREVIEW_BYTES = 64 * 1024;
+// ---- TRUE STREAMING (#13) ----
+// Per-chunk cap for streamRead results: each upstream reader.read() is re-chunked to <= this so the
+// base64 (~1.34x) rides the dynamic SCRATCH result buffer (1MB floor / 32MB ceil) comfortably, never
+// the fixed 64KB HOSTCALL *request* buffer (only the streamId crosses that way). 256KB raw.
+const STREAM_CHUNK_BYTES = 256 * 1024;
+// Below this content-length the DO buffers the whole body inline at fetchStream-open time and returns
+// it as bodyB64 (today's one-round-trip semantics for small JSON APIs). >= this, or unknown length
+// (chunked-transfer), takes the truly-chunked streamRead path.
+const STREAM_INLINE_THRESHOLD = 256 * 1024;
+// DO-side stream registry entry. reader = download cursor; writer/fetchPromise = upload (request-body
+// streaming) before it flips to the response reader. Lives in DO memory, never snapshotted.
+interface StreamState {
+  reader?: ReadableStreamDefaultReader<Uint8Array>;
+  writer?: WritableStreamDefaultWriter<Uint8Array>;
+  fetchPromise?: Promise<Response>;
+  pending?: Uint8Array;            // re-chunk leftover (upstream chunk > STREAM_CHUNK_BYTES)
+  done: boolean;
+}
 // base64 encode/decode over Uint8Array, chunked so a large packfile does not blow the call stack
 // of String.fromCharCode(...spread). Mirrors the fs-op base64 boundary.
 // SSRF defense: is this URL hostname a private/internal/metadata address that must be blocked
@@ -517,6 +539,11 @@ class GlueKernel {
   _fenceDoId?: string;
   _fenceCell?: number;
   _curFetchSeq?: number;
+  // TRUE STREAMING (#13): DO-side registry of open upstream stream readers/writers, keyed by a
+  // deterministic streamId (`${doId}:${cell}:${ordinal}`). Lives in DO memory (GlueKernel
+  // instance), NEVER in the heap blit — so it dies with the isolate at eviction, which IS the
+  // StreamExpired-on-wake semantic. streamRead pulls one upstream chunk per call (backpressure).
+  _streams?: Map<string, StreamState>;
 
   constructor() {
     this.inst = null;
@@ -948,10 +975,17 @@ class GlueKernel {
       // host-call loop cap: bound the host calls a single cell may make (re-entrant cells
       // can chain many). Configurable via config.maxHostCallsPerCell; default 64.
       const maxHostCalls = (this.config.maxHostCallsPerCell ?? 0) || 64;
+      // TRUE STREAMING (#13): stream chunk pulls (streamRead/streamWrite) have their OWN large budget
+      // — a 100MB body at 256KB chunks is ~400 pulls, far past the 64 non-stream guard. Both counters
+      // still bound the loop so the pump can never spin forever. Default 4096 (~1GB at 256KB/chunk).
+      const maxStreamOps = (this.config.maxStreamOpsPerCell ?? 0) || 4096;
+      let streamOps = 0;
       // E6 oplog: capture host requests+results for the crash-tail journal (host-side).
       this._cellHostResults = [];
-      while (status === STATUS_HOST_CALL && guard++ < maxHostCalls) {
+      while (status === STATUS_HOST_CALL && guard <= maxHostCalls && streamOps <= maxStreamOps) {
         const req = this._readHostCall();
+        const isStreamOp = req.name === "streamRead" || req.name === "streamWrite";
+        if (isStreamOp) streamOps++; else guard++;
         let res: HostResult;
         if (this._replayHostResults && this._replayHostResults.length) {
           // engine-migration replay: feed the recorded result, do NOT re-fire the effect.
@@ -979,6 +1013,22 @@ class GlueKernel {
       // (success or error), so a big-payload cell does not leave this kernel resident-large for the
       // rest of its life — the key to keeping idle/parked kernels small in the conjoined isolate.
       try { this._ex().scratch_release(); } catch { /* engine not ready / torn down */ }
+      // TRUE STREAMING (#13): sweep any stream readers NOT held past cell end (no `global` flag) so
+      // an abandoned/un-cancelled reader does not leak the upstream connection. A stream referenced
+      // by persistent global state keeps its entry (warm) and only dies at eviction (StreamExpired).
+      this._sweepStreams();
+    }
+  }
+
+  // _sweepStreams: drop FINISHED stream entries (reader hit done, or cancelled). OPEN streams are
+  // kept warm across cells (DO-instance lifetime) so a `for await` that spans cells works while the
+  // DO stays resident; they die naturally with the isolate at eviction -> StreamExpired on wake.
+  // Called in the eval finally so a fully-consumed stream does not linger.
+  _sweepStreams(): void {
+    const m = this._streams;
+    if (!m || m.size === 0) return;
+    for (const [id, st] of Array.from(m.entries())) {
+      if (st.done) m.delete(id);
     }
   }
 
@@ -990,6 +1040,10 @@ class GlueKernel {
     // `fetch` is the built-in DO-side host effect (allowlisted). Everything else is a
     // CLIENT host-callback: round-trip to the connected client over the WS.
     if (name === "fetch") return this._doFetch(args[0] as string, args[1] as RequestInit | undefined);
+    if (name === "fetchStream") return this._doFetchStream(args[0] as string, args[1] as RequestInit | undefined);
+    if (name === "streamRead") return this._doStreamRead(args[0] as string);
+    if (name === "streamCancel") return this._doStreamCancel(args[0] as string);
+    if (name === "streamWrite") return this._doStreamWrite(args[0] as string, args[1] as string | null, !!args[2]);
     // host-backed fs (config.fs.provider != vfs): serviced DO-side via the installed _fsHandler.
     if (name === "__fs") return this._serviceFs(args[0] as Record<string, unknown>);
     return this._clientHostCall(name, args);
@@ -1075,68 +1129,70 @@ class GlueKernel {
     });
   }
 
-  async _doFetch(url: string, init?: RequestInit): Promise<HostResult> {
+  // _fetchPrep: shared allowlist + SSRF + body-decode + deterministic Idempotency-Key fence used by
+  // both _doFetch (buffered) and _doFetchStream (chunked). Returns the prepared RequestInit, or an
+  // {error} envelope when the URL is invalid / blocked. Zero entropy (the key is deterministic).
+  async _fetchPrep(url: string, init?: RequestInit): Promise<{ fetchInit?: RequestInit; error?: string }> {
+    const allow = this._fetchAllow;
+    let host = "";
+    let hostname = "";
     try {
-      // allowlist enforcement (parity with P3 kernel).
-      const allow = this._fetchAllow;
-      let host = "";
-      let hostname = "";
-      try {
-        const u = new URL(url);
-        host = u.host;
-        hostname = u.hostname;
-      } catch {
-        return { ok: false, error: "FetchError: invalid url" };
-      }
-      // SSRF HARD-BLOCK (UNCONDITIONAL — applies even on allow-all and with a valid key; DNS-rebind
-      // defense). Block link-local/metadata + RFC1918 + loopback literal IPs and known-internal
-      // hostname suffixes. A hostname allowlist alone does NOT stop rebind to an internal IP.
-      if (isBlockedSsrfHost(hostname)) {
-        return { ok: false, error: "FetchBlockedError: " + hostname + " is a blocked private/internal address" };
-      }
-      let permitted = false;
-      if (allow === true) permitted = true;
-      else if (allow === false) permitted = false;
-      else if (Array.isArray(allow)) permitted = allow.includes(host);
-      if (!permitted) return { ok: false, error: "FetchBlockedError: " + host + " not allowed" };
+      const u = new URL(url);
+      host = u.host;
+      hostname = u.hostname;
+    } catch {
+      return { error: "FetchError: invalid url" };
+    }
+    // SSRF HARD-BLOCK (UNCONDITIONAL — DNS-rebind defense). Block link-local/metadata + RFC1918 +
+    // loopback literal IPs and known-internal hostname suffixes.
+    if (isBlockedSsrfHost(hostname)) {
+      return { error: "FetchBlockedError: " + hostname + " is a blocked private/internal address" };
+    }
+    let permitted = false;
+    if (allow === true) permitted = true;
+    else if (allow === false) permitted = false;
+    else if (Array.isArray(allow)) permitted = allow.includes(host);
+    if (!permitted) return { error: "FetchBlockedError: " + host + " not allowed" };
 
-      // BINARY-SAFE: a request body may be binary (git-upload-pack POSTs a packfile). The engine
-      // sends it as base64 in `init.bodyB64`; decode to bytes before fetch. (A plain string `body`
-      // still works for back-compat.)
-      let fetchInit: RequestInit | undefined = init;
-      if (init && typeof (init as { bodyB64?: unknown }).bodyB64 === "string") {
-        const ri = { ...(init as Record<string, unknown>) } as RequestInit & { bodyB64?: string };
-        const reqBytes = b64ToBytes((init as { bodyB64: string }).bodyB64);
-        delete ri.bodyB64;
-        ri.body = reqBytes as unknown as BodyInit;
-        fetchInit = ri;
-      }
+    // BINARY-SAFE: a request body may be binary; the engine sends it as base64 in init.bodyB64.
+    let fetchInit: RequestInit | undefined = init;
+    if (init && typeof (init as { bodyB64?: unknown }).bodyB64 === "string") {
+      const ri = { ...(init as Record<string, unknown>) } as RequestInit & { bodyB64?: string };
+      const reqBytes = b64ToBytes((init as { bodyB64: string }).bodyB64);
+      delete ri.bodyB64;
+      ri.body = reqBytes as unknown as BodyInit;
+      fetchInit = ri;
+    }
 
-      // EXACTLY-ONCE FENCE: for non-idempotent methods inject a deterministic Idempotency-Key
-      // derived from (doId, cell, in-cell fetch ordinal) so the residual crash-window double-fire
-      // (HTTP completed but the cell's oplog row never committed) is deduped by any compliant
-      // downstream. Committed fetches already never re-fire (E6 oplog replay feeds stored results).
-      // Skip if the caller already set one. Zero entropy: key is pure deterministic persisted state.
-      {
-        const method = String(
-          (fetchInit && (fetchInit as { method?: string }).method) ||
-            (init && (init as { method?: string }).method) || "GET",
-        ).toUpperCase();
-        if (method === "POST" || method === "PUT" || method === "DELETE" || method === "PATCH") {
-          const hdrs = new Headers((fetchInit && fetchInit.headers) || undefined);
-          if (!hdrs.has("Idempotency-Key") && this._fenceDoId != null && this._fenceCell != null) {
-            const seq = this._curFetchSeq ?? 0;
-            const mat = this._fenceDoId + ":" + this._fenceCell + ":" + seq;
-            const digest = await crypto.subtle.digest("SHA-256", TEXT_ENC.encode(mat));
-            const keyHex = Array.from(new Uint8Array(digest))
-              .map((b) => b.toString(16).padStart(2, "0")).join("");
-            hdrs.set("Idempotency-Key", "engram-" + keyHex.slice(0, 32));
-            const ri2 = { ...((fetchInit || {}) as Record<string, unknown>) } as RequestInit;
-            ri2.headers = hdrs;
-            fetchInit = ri2;
-          }
+    // EXACTLY-ONCE FENCE: deterministic Idempotency-Key for non-idempotent methods.
+    {
+      const method = String(
+        (fetchInit && (fetchInit as { method?: string }).method) ||
+          (init && (init as { method?: string }).method) || "GET",
+      ).toUpperCase();
+      if (method === "POST" || method === "PUT" || method === "DELETE" || method === "PATCH") {
+        const hdrs = new Headers((fetchInit && fetchInit.headers) || undefined);
+        if (!hdrs.has("Idempotency-Key") && this._fenceDoId != null && this._fenceCell != null) {
+          const seq = this._curFetchSeq ?? 0;
+          const mat = this._fenceDoId + ":" + this._fenceCell + ":" + seq;
+          const digest = await crypto.subtle.digest("SHA-256", TEXT_ENC.encode(mat));
+          const keyHex = Array.from(new Uint8Array(digest))
+            .map((b) => b.toString(16).padStart(2, "0")).join("");
+          hdrs.set("Idempotency-Key", "engram-" + keyHex.slice(0, 32));
+          const ri2 = { ...((fetchInit || {}) as Record<string, unknown>) } as RequestInit;
+          ri2.headers = hdrs;
+          fetchInit = ri2;
         }
       }
+    }
+    return { fetchInit: fetchInit || undefined };
+  }
+
+  async _doFetch(url: string, init?: RequestInit): Promise<HostResult> {
+    try {
+      const prep = await this._fetchPrep(url, init);
+      if (prep.error) return { ok: false, error: prep.error };
+      const fetchInit = prep.fetchInit;
       const r = await fetch(url, fetchInit || undefined);
       // BINARY-SAFE: read RAW BYTES (arrayBuffer), never lossy `.text()`. Cross the boundary as
       // base64 (`bodyB64`) — exact bytes both ways. Cap at FETCH_MAX_BODY_BYTES (was 1MB).
@@ -1177,6 +1233,147 @@ class GlueKernel {
     } catch (e) {
       const err = e as { message?: string };
       return { ok: false, error: "FetchError: " + String((err && err.message) || e) };
+    }
+  }
+
+  // ---- TRUE STREAMING (#13) host effects ----
+  // _doFetchStream: open the upstream and register a DO-side reader; return metadata + streamId (and,
+  // for small/known-length bodies, the whole body inline as bodyB64 = today's one-round-trip path).
+  // For request-body streaming (init.requestStream), build a TransformStream feeding fetch({body,
+  // duplex:"half"}) and return {uploadOpen}. Allowlist/SSRF/Idempotency reuse _fetchPrep.
+  async _doFetchStream(url: string, init?: RequestInit): Promise<HostResult> {
+    try {
+      const prep = await this._fetchPrep(url, init);
+      if (prep.error) return { ok: false, error: prep.error };
+      const fetchInit = (prep.fetchInit || {}) as RequestInit & { requestStream?: boolean };
+      const streamId = (this._fenceDoId ?? "do") + ":" + (this._fenceCell ?? 0) + ":" + (this._curFetchSeq ?? 0);
+      if (!this._streams) this._streams = new Map();
+
+      // ---- request-body streaming (upload): VM will push chunks via streamWrite ----
+      if ((init as { requestStream?: boolean } | undefined)?.requestStream) {
+        const ts = new TransformStream<Uint8Array, Uint8Array>();
+        const upInit: RequestInit & { duplex?: string } = { ...fetchInit, duplex: "half" };
+        delete (upInit as { requestStream?: boolean }).requestStream;
+        upInit.body = ts.readable as unknown as BodyInit;
+        // kick off the fetch WITHOUT awaiting; the VM drains its source via streamWrite.
+        const fetchPromise = fetch(url, upInit as RequestInit);
+        this._streams.set(streamId, { writer: ts.writable.getWriter(), fetchPromise, done: false });
+        return { ok: true, value: { streamId, uploadOpen: true, stream: true } };
+      }
+
+      const r = await fetch(url, fetchInit as RequestInit);
+      const headers: Record<string, string> = {};
+      r.headers.forEach((v, k) => (headers[k] = v));
+      const meta = {
+        streamId,
+        stream: true,
+        status: r.status,
+        ok: r.ok,
+        statusText: r.statusText || "",
+        url: r.url || url,
+        redirected: !!r.redirected,
+        headers,
+      };
+      // small-body fast path: known content-length below the inline threshold buffers in one round
+      // trip (today's semantics) — returns bodyB64, no reader registered.
+      const contentLength = r.headers.get("content-length");
+      const clen = contentLength == null ? NaN : Number(contentLength);
+      if (Number.isFinite(clen) && clen >= 0 && clen <= STREAM_INLINE_THRESHOLD) {
+        const ab = await r.arrayBuffer();
+        const bytes = new Uint8Array(ab);
+        return { ok: true, value: { ...meta, bodyB64: bytesToB64(bytes), byteLength: bytes.length, inline: true } };
+      }
+      // truly chunked: register the reader; VM pulls chunks via streamRead.
+      if (!r.body) {
+        // no body (e.g. 204): inline-empty.
+        return { ok: true, value: { ...meta, bodyB64: "", byteLength: 0, inline: true } };
+      }
+      this._streams.set(streamId, { reader: r.body.getReader(), done: false });
+      return { ok: true, value: meta };
+    } catch (e) {
+      const err = e as { message?: string };
+      return { ok: false, error: "FetchError: " + String((err && err.message) || e) };
+    }
+  }
+
+  // _doStreamRead: pull exactly ONE chunk (<= STREAM_CHUNK_BYTES raw) from the registered upstream
+  // reader. This single read IS the backpressure (only called when the VM ReadableStream wants more).
+  // Unknown streamId (fresh isolate after hibernation) -> typed StreamExpiredError, socket alive.
+  async _doStreamRead(streamId: string): Promise<HostResult> {
+    const m = this._streams;
+    const st = m && m.get(streamId);
+    if (!st || !st.reader) {
+      return { ok: true, value: { error: "StreamExpiredError: stream " + streamId + " did not survive hibernation (consume a stream within the cell that opened it)" } };
+    }
+    try {
+      // drain any re-chunk leftover first.
+      let chunk: Uint8Array;
+      if (st.pending && st.pending.length) {
+        chunk = st.pending;
+        st.pending = undefined;
+      } else {
+        const { value, done } = await st.reader.read();
+        if (done) {
+          st.done = true;
+          m!.delete(streamId);
+          return { ok: true, value: { done: true } };
+        }
+        chunk = value as Uint8Array;
+      }
+      // re-chunk to <= STREAM_CHUNK_BYTES so the b64 result rides SCRATCH; stash the remainder.
+      if (chunk.length > STREAM_CHUNK_BYTES) {
+        st.pending = chunk.subarray(STREAM_CHUNK_BYTES);
+        chunk = chunk.subarray(0, STREAM_CHUNK_BYTES);
+      }
+      return { ok: true, value: { chunk: bytesToB64(chunk), done: false } };
+    } catch (e) {
+      const err = e as { message?: string };
+      st.done = true;
+      m!.delete(streamId);
+      return { ok: true, value: { error: "StreamReadError: " + String((err && err.message) || e) } };
+    }
+  }
+
+  // _doStreamCancel: release the upstream reader (reader.cancel / GC / for-await early break).
+  async _doStreamCancel(streamId: string): Promise<HostResult> {
+    const m = this._streams;
+    const st = m && m.get(streamId);
+    if (st) {
+      try { st.reader?.cancel(); } catch { /* already gone */ }
+      try { st.writer?.abort(); } catch { /* */ }
+      st.done = true;
+      m!.delete(streamId);
+    }
+    return { ok: true, value: { ok: true } };
+  }
+
+  // _doStreamWrite: push one request-body chunk into the DO-side TransformStream writer. done=true
+  // closes the writer (the in-flight upload fetch settles) and flips the same streamId into the
+  // response-download reader so subsequent streamRead pulls the response body.
+  async _doStreamWrite(streamId: string, chunkB64: string | null, done: boolean): Promise<HostResult> {
+    const m = this._streams;
+    const st = m && m.get(streamId);
+    if (!st || !st.writer) {
+      return { ok: true, value: { error: "StreamExpiredError: upload stream " + streamId + " is gone" } };
+    }
+    try {
+      if (chunkB64) await st.writer.write(b64ToBytes(chunkB64));
+      if (done) {
+        await st.writer.close();
+        st.writer = undefined;
+        // await the response and flip to download.
+        const r = await (st.fetchPromise as Promise<Response>);
+        st.fetchPromise = undefined;
+        const headers: Record<string, string> = {};
+        r.headers.forEach((v, k) => (headers[k] = v));
+        if (r.body) st.reader = r.body.getReader();
+        else st.done = true;
+        return { ok: true, value: { ok: true, uploaded: true, status: r.status, statusOk: r.ok, statusText: r.statusText || "", headers } };
+      }
+      return { ok: true, value: { ok: true } };
+    } catch (e) {
+      const err = e as { message?: string };
+      return { ok: true, value: { error: "StreamWriteError: " + String((err && err.message) || e) } };
     }
   }
 
