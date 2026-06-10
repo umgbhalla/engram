@@ -446,6 +446,11 @@ class GlueKernel {
   // fs provider handler: the DO (lib.rs) installs a JS async closure (R2/S3 servicer) per eval
   // when config.fs.provider != vfs; the engine's `host.__fs` effect routes here. null = in-heap VFS.
   _fsHandler?: ((payload: unknown) => Promise<unknown>) | null;
+  // fetch-fence: deterministic (doId, cell) the DO installs per-eval so _doFetch derives a stable
+  // Idempotency-Key per (session, cell, in-cell fetch ordinal). _curFetchSeq = ordinal within cell.
+  _fenceDoId?: string;
+  _fenceCell?: number;
+  _curFetchSeq?: number;
 
   constructor() {
     this.inst = null;
@@ -474,6 +479,13 @@ class GlueKernel {
   // config.fs.provider != vfs. `null` clears it (in-heap VFS path; the engine never calls host.__fs).
   setFsHandler(handler: ((payload: unknown) => Promise<unknown>) | null): void {
     this._fsHandler = typeof handler === "function" ? handler : null;
+  }
+
+  // setFenceContext: the DO installs (per eval) the deterministic identity (doId, cell) used to
+  // derive the host.fetch idempotency key. Replayed / re-run cells reproduce the same key.
+  setFenceContext(doId: string, cell: number): void {
+    this._fenceDoId = doId;
+    this._fenceCell = cell;
   }
 
   // _applyFsProvider: tell the in-VM fs router which provider is active (it reads
@@ -793,6 +805,7 @@ class GlueKernel {
           // engine-migration replay: feed the recorded result, do NOT re-fire the effect.
           res = this._replayHostResults.shift() as HostResult;
         } else {
+          this._curFetchSeq = this._cellHostResults.length;
           res = await this._serviceHostCall(req);
         }
         this._cellHostResults.push(res);
@@ -938,6 +951,31 @@ class GlueKernel {
         fetchInit = ri;
       }
 
+      // EXACTLY-ONCE FENCE: for non-idempotent methods inject a deterministic Idempotency-Key
+      // derived from (doId, cell, in-cell fetch ordinal) so the residual crash-window double-fire
+      // (HTTP completed but the cell's oplog row never committed) is deduped by any compliant
+      // downstream. Committed fetches already never re-fire (E6 oplog replay feeds stored results).
+      // Skip if the caller already set one. Zero entropy: key is pure deterministic persisted state.
+      {
+        const method = String(
+          (fetchInit && (fetchInit as { method?: string }).method) ||
+            (init && (init as { method?: string }).method) || "GET",
+        ).toUpperCase();
+        if (method === "POST" || method === "PUT" || method === "DELETE" || method === "PATCH") {
+          const hdrs = new Headers((fetchInit && fetchInit.headers) || undefined);
+          if (!hdrs.has("Idempotency-Key") && this._fenceDoId != null && this._fenceCell != null) {
+            const seq = this._curFetchSeq ?? 0;
+            const mat = this._fenceDoId + ":" + this._fenceCell + ":" + seq;
+            const digest = await crypto.subtle.digest("SHA-256", TEXT_ENC.encode(mat));
+            const keyHex = Array.from(new Uint8Array(digest))
+              .map((b) => b.toString(16).padStart(2, "0")).join("");
+            hdrs.set("Idempotency-Key", "engram-" + keyHex.slice(0, 32));
+            const ri2 = { ...((fetchInit || {}) as Record<string, unknown>) } as RequestInit;
+            ri2.headers = hdrs;
+            fetchInit = ri2;
+          }
+        }
+      }
       const r = await fetch(url, fetchInit || undefined);
       // BINARY-SAFE: read RAW BYTES (arrayBuffer), never lossy `.text()`. Cross the boundary as
       // base64 (`bodyB64`) — exact bytes both ways. Cap at FETCH_MAX_BODY_BYTES (was 1MB).

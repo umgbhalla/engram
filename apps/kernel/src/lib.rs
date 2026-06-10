@@ -66,6 +66,8 @@ extern "C" {
     fn set_host_sender(this: &GlueKernel, send: &JsValue, timeout_ms: f64);
     #[wasm_bindgen(method, js_name = setFsHandler)]
     fn set_fs_handler(this: &GlueKernel, handler: &JsValue);
+    #[wasm_bindgen(method, js_name = setFenceContext)]
+    fn set_fence_context(this: &GlueKernel, do_id: &str, cell: f64);
     #[wasm_bindgen(method, js_name = dump)]
     fn dump(this: &GlueKernel) -> js_sys::Promise;
     #[wasm_bindgen(method, js_name = dumpW4)]
@@ -520,6 +522,15 @@ impl KernelDO {
             } else {
                 glue.set_fs_handler(&JsValue::NULL);
             }
+        }
+
+        // FETCH FENCE: install the deterministic (doId, cell) identity so host.fetch can derive a
+        // stable Idempotency-Key per (session, cell, in-cell fetch ordinal); replay reproduces it.
+        {
+            let sql = self.state.storage().sql();
+            let cell_now = read_int(&sql, "committedCell", -1) + 1;
+            let glue = clone_glue(self.glue.borrow().as_ref().unwrap());
+            glue.set_fence_context(&self.do_id, cell_now as f64);
         }
 
         // eval (async; cell may await host.fetch OR a client host-callback). Returns rich
