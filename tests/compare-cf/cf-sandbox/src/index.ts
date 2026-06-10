@@ -57,8 +57,17 @@ function extractValue(res: any): unknown {
   const last = results[results.length - 1] || {};
   if (last.json !== undefined) return last.json;
   if (last.text !== undefined) {
-    // results[].text is the repr; try to JSON-parse so probes can compare structured values.
-    try { return JSON.parse(last.text); } catch { return last.text; }
+    const t = String(last.text);
+    // results[].text is a JS-style repr. The CF JS executor single-quotes strings ('armed'),
+    // which is NOT valid JSON. Normalize so probes can compare structured values:
+    //   try JSON.parse (handles 42, [..], {..}, "..", true/null)
+    //   else if single-quoted string literal -> strip the quotes
+    //   else return the raw text
+    try { return JSON.parse(t); } catch { /* fall through */ }
+    if (t.length >= 2 && t.startsWith("'") && t.endsWith("'")) {
+      return t.slice(1, -1).replace(/\\'/g, "'");
+    }
+    return t;
   }
   if (last.data !== undefined) return last.data;
   return null;

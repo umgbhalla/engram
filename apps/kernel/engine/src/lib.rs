@@ -184,7 +184,7 @@ const BOOTSTRAP: &str = r#"
 try { Object.defineProperty(Date, 'now', { value: globalThis.__now, writable: true, configurable: true }); } catch(e){ try { Date.now = globalThis.__now; } catch(e2){} }
 try { Object.defineProperty(Math, 'random', { value: globalThis.__rand, writable: true, configurable: true }); } catch(e){ try { Math.random = globalThis.__rand; } catch(e2){} }
 // seeded performance.now (monotone, ms) reuses the clock tick
-try { if (typeof performance === 'undefined') { globalThis.performance = {}; } performance.now = function(){ return globalThis.__now(); }; } catch(e){}
+try { if (typeof performance === 'undefined') { globalThis.performance = {}; } try { Object.defineProperty(performance, 'now', { value: function(){ return globalThis.__now(); }, writable: true, configurable: true }); } catch(e3){ try { performance.now = function(){ return globalThis.__now(); }; } catch(e4){} } } catch(e){}
 
 // ===== ENV-FIDELITY SHIMS (fix not-real-node gotchas; all determinism-safe) =====
 // FIX: new Date() argless returned 1970 (the native Date used the engine's frozen internal clock,
@@ -224,6 +224,67 @@ try {
       wait: function(){ return 'not-equal'; },
       notify: function(){ return 0; }
     };
+  }
+} catch(e){}
+
+// FIX (env-fidelity): WebAssembly was a ReferenceError (QuickJS has no wasm engine). Honest stub:
+// feature-detect succeeds (object present) but every run/compile path rejects/throws CLEARLY.
+try {
+  if (typeof globalThis.WebAssembly === 'undefined') {
+    globalThis.WebAssembly = {
+      compile: function(){ return Promise.reject(new Error('WebAssembly is not supported in this VM (QuickJS has no wasm engine)')); },
+      instantiate: function(){ return Promise.reject(new Error('WebAssembly is not supported in this VM (QuickJS has no wasm engine)')); },
+      compileStreaming: function(){ return Promise.reject(new Error('WebAssembly unsupported in this VM')); },
+      instantiateStreaming: function(){ return Promise.reject(new Error('WebAssembly unsupported in this VM')); },
+      validate: function(){ return false; },
+      Module: function(){ throw new Error('WebAssembly.Module unsupported in this VM'); },
+      Instance: function(){ throw new Error('WebAssembly.Instance unsupported in this VM'); },
+      Memory: function(){ throw new Error('WebAssembly.Memory unsupported in this VM'); },
+      Table: function(){ throw new Error('WebAssembly.Table unsupported in this VM'); },
+      CompileError: Error, LinkError: Error, RuntimeError: Error
+    };
+  }
+} catch(e){}
+
+// FIX (env-fidelity): minimal WHATWG ReadableStream (no real backpressure; single-thread microtask
+// pull). Additive — used by Response.prototype.body to yield the already-buffered bytes once.
+try {
+  if (typeof globalThis.ReadableStream === 'undefined') {
+    function EngramRS(underlying){
+      underlying = underlying || {};
+      this._queue = []; this._closed = false; this._errored = null; this._pull = underlying.pull || null;
+      this._locked = false;
+      var self = this;
+      var controller = {
+        enqueue: function(chunk){ self._queue.push(chunk); },
+        close: function(){ self._closed = true; },
+        error: function(e){ self._errored = e || new Error('stream error'); }
+      };
+      this._controller = controller;
+      if (typeof underlying.start === 'function'){ try { underlying.start(controller); } catch(e){ this._errored = e; } }
+    }
+    EngramRS.prototype.getReader = function(){
+      var self = this; this._locked = true;
+      return {
+        read: function(){
+          return new Promise(function(resolve, reject){
+            function attempt(){
+              if (self._errored){ reject(self._errored); return; }
+              if (self._queue.length){ resolve({ value: self._queue.shift(), done: false }); return; }
+              if (self._closed){ resolve({ value: undefined, done: true }); return; }
+              if (self._pull){ try { var p = self._pull(self._controller); if (p && typeof p.then === 'function'){ p.then(function(){ queueMicrotask(attempt); }, reject); return; } } catch(e){ reject(e); return; } }
+              queueMicrotask(attempt);
+            }
+            attempt();
+          });
+        },
+        releaseLock: function(){ self._locked = false; },
+        cancel: function(){ self._closed = true; self._queue = []; return Promise.resolve(); }
+      };
+    };
+    EngramRS.prototype.cancel = function(){ this._closed = true; this._queue = []; return Promise.resolve(); };
+    Object.defineProperty(EngramRS.prototype, 'locked', { get: function(){ return this._locked; }, configurable: true });
+    globalThis.ReadableStream = EngramRS;
   }
 } catch(e){}
 
@@ -867,7 +928,7 @@ if (typeof globalThis.setTimeout === 'undefined') {
     this._fullText = null;
   }
   installBody(Response.prototype);
-  Object.defineProperty(Response.prototype, 'body', { get: function(){ var self = this; if (globalThis.__builtins && globalThis.__builtins.stream){ var rd = new globalThis.__builtins.stream.Readable({ read: function(){} }); queueMicrotask(function(){ rd.push(self._buf.slice()); rd.push(null); }); return rd; } return null; }, configurable: true });
+  Object.defineProperty(Response.prototype, 'body', { get: function(){ var self = this; if (typeof globalThis.ReadableStream === 'function'){ var chunk = self._buf.slice(); var sent = false; return new globalThis.ReadableStream({ pull: function(c){ if (!sent){ sent = true; if (chunk && chunk.length) c.enqueue(chunk); c.close(); } } }); } return null; }, configurable: true });
   Response.prototype.clone = function(){ var r = new Response(this._buf.slice(), { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url, redirected: this.redirected, type: this.type }); r.bodyUsed = false; r._fullText = this._fullText; return r; };
   Response.json = function(data, init){ init = init || {}; var h = new globalThis.Headers(init.headers || {}); if (!h.has('content-type')) h.set('content-type', 'application/json'); var r = new Response(JSON.stringify(data), { status: init.status, statusText: init.statusText, headers: h }); return r; };
   Response.error = function(){ var r = new Response(null, { status: 0 }); r.type = 'error'; r.ok = false; return r; };
@@ -1405,7 +1466,7 @@ var __crypto = (function(){
   function randomInt(min, max, cb){ if (typeof max === 'function' || max === undefined){ cb = max; max = min; min = 0; } min = Math.floor(min); max = Math.floor(max); if (!(max > min)) throw new RangeError('max must be greater than min'); var range = max - min; var bytesNeeded = Math.ceil(Math.log2(range) / 8) || 1; var maxValid = Math.floor(0x100000000 / range) * range; var val; do { var bb = randomBytes(4); val = ((bb[0]<<24)>>>0) + (bb[1]<<16) + (bb[2]<<8) + bb[3]; } while (val >= maxValid && range <= 0x100000000); var out = min + (val % range); if (typeof cb === 'function'){ queueMicrotask(function(){ cb(null, out); }); return; } return out; }
   // Hash: createHash(algo).update(data).digest([enc]). Buffers chunks, hashes once on digest().
   function normAlgo(a){ return String(a).toLowerCase().replace(/^rsa-/, ''); }
-  function Hash(algo){ this._algo = normAlgo(algo); this._fn = globalThis.__hashes[this._algo]; if (!this._fn) throw new Error("Digest method not supported: " + algo); this._chunks = []; }
+  function Hash(algo){ this._algo = normAlgo(algo); this._fn = globalThis.__hashes[this._algo]; if (!this._fn){ var __a = this._algo; if (__a === 'sha512' || __a === 'sha384' || __a === 'sha224') { throw new Error("crypto.createHash('" + algo + "'): only sha256/sha1/md5 are available synchronously in this VM. Use the async crypto.subtle.digest('SHA-512', data) instead."); } throw new Error('Digest method not supported: ' + algo); } this._chunks = []; }
   Hash.prototype.update = function(data, enc){ this._chunks.push(toBytes(data, enc)); return this; };
   Hash.prototype.digest = function(enc){ var total = 0, i; for (i=0;i<this._chunks.length;i++) total += this._chunks[i].length; var all = new Uint8Array(total), off = 0; for (i=0;i<this._chunks.length;i++){ all.set(this._chunks[i], off); off += this._chunks[i].length; } var out = globalThis.Buffer.from(this._fn(all)); return enc ? out.toString(enc) : out; };
   function createHash(algo){ return new Hash(algo); }
@@ -1731,6 +1792,22 @@ globalThis.__builtins = {
       lookup: function(n, opts, c){ if (typeof opts === 'function') { c = opts; } promises.lookup(n).then(function(r){ c(null, r.address, r.family); }, function(e){ c(e); }); }
     };
   })(),
+  // FIX (env-fidelity): perf_hooks — performance + no-op PerformanceObserver (seeded monotone clock).
+  perf_hooks: { performance: globalThis.performance, PerformanceObserver: function(){ this.observe = function(){}; this.disconnect = function(){}; this.takeRecords = function(){ return []; }; }, monotonicNow: function(){ return globalThis.__now(); }, constants: {} },
+  // FIX (env-fidelity): vm — NOT real context isolation (single QuickJS realm). runInNewContext
+  // injects ctx keys as function args; good enough for sandboxed-eval shaped code, no security boundary.
+  vm: (function(){
+    function runInThisContext(code){ return (0, eval)(String(code)); }
+    function runInNewContext(code, ctx){ ctx = ctx || {}; var ks = Object.keys(ctx); var f; try { f = Function(ks.join(','), 'return (' + code + ')'); return f.apply(null, ks.map(function(k){ return ctx[k]; })); } catch(e){ var f2 = Function(ks.join(','), String(code)); return f2.apply(null, ks.map(function(k){ return ctx[k]; })); } }
+    function createContext(o){ return o || {}; }
+    function Script(code){ this.code = String(code); }
+    Script.prototype.runInThisContext = function(){ return runInThisContext(this.code); };
+    Script.prototype.runInNewContext = function(ctx){ return runInNewContext(this.code, ctx); };
+    Script.prototype.runInContext = function(ctx){ return runInNewContext(this.code, ctx); };
+    return { runInThisContext: runInThisContext, runInNewContext: runInNewContext, runInContext: runInNewContext, createContext: createContext, isContext: function(){ return true; }, Script: Script };
+  })(),
+  // FIX (env-fidelity): module — createRequire returns the global require; builtinModules enumerated.
+  module: { createRequire: function(){ return globalThis.require; }, builtinModules: Object.keys(globalThis.__builtins).filter(function(k){ return k.indexOf('node:') !== 0 && k.indexOf('/') < 0; }), Module: function(){}, _resolveFilename: function(r){ return r; } },
 };
 // node:-prefixed + submodule aliases (stream/promises, fs/promises, util/types, assert/strict).
 (function(){
@@ -2016,7 +2093,28 @@ globalThis.use = async function(name, opts){
     // A compile error here is almost always raw ESM (`export`/`import` at top level) that the CJS
     // frame cannot parse. Surface an ACTIONABLE error naming the cause + the esm.sh ?bundle fix.
     var isEsm = /\b(export\s+(default|const|function|class|\{|\*)|import\s+[\s\S]*?from|import\s*\()/.test(src);
-    if (isEsm) throw new Error('use("' + name + '"): the bundle from ' + usedUrl + ' is ES MODULE syntax (export/import), which this CJS loader cannot eval. Retry with a CJS build: use("' + name + '", { url: "https://esm.sh/' + name + '?bundle&cjs" }), or pick a package that ships a UMD/CJS bundle. (The async ESM module loader is not yet wired — see __nodeCompat.caveats.)');
+    if (isEsm) {
+      // LAST-RESORT best-effort ESM->CJS transform. esm.sh ?bundle inlines deps, so the source is
+      // usually import-free; rewrite export forms to module.exports and re-eval in the CJS frame.
+      try {
+        var t = src;
+        t = t.replace(/export\s+default\s+/g, 'module.exports = ');
+        t = t.replace(/export\s+(const|let|var|function|class)\s+([A-Za-z_$][\w$]*)/g, function(m, kw, nm){ return kw + ' ' + nm + '; module.exports.' + nm + ' = ' + nm + '; ' + kw + ' ' + nm; });
+        t = t.replace(/export\s*\{([^}]*)\}\s*;?/g, function(m, inner){ var parts = inner.split(','); var outp = []; for (var pi=0; pi<parts.length; pi++){ var seg = parts[pi].trim(); if (!seg) continue; var mm = seg.split(/\s+as\s+/); var local = mm[0].trim(); var exp = (mm[1] || mm[0]).trim(); if (local && exp) outp.push('module.exports.' + exp + ' = ' + local + ';'); } return outp.join(' '); });
+        t = t.replace(/\bexport\s+/g, '');
+        var frame2 = (0, eval)('(function(module, exports, require, Buffer, process, global, __dirname, __filename){\n' + t + '\n})');
+        var module2 = { exports: {} };
+        frame2(module2, module2.exports, globalThis.require, globalThis.Buffer, globalThis.process, globalThis, '/', '/index.js');
+        if (module2.exports && (typeof module2.exports === 'function' || Object.keys(module2.exports).length)) {
+          var val2 = module2.exports;
+          globalThis.__mods[name] = val2;
+          var base2 = String(name).split('@')[0].split('/').pop();
+          if (base2 && globalThis.__mods[base2] === undefined) globalThis.__mods[base2] = val2;
+          return val2;
+        }
+      } catch(__et){ /* fall through to the actionable error */ }
+      throw new Error('use("' + name + '"): the bundle from ' + usedUrl + ' is ES MODULE syntax (export/import), which this CJS loader cannot eval (best-effort export->CJS transform also failed). Retry with a CJS build: use("' + name + '", { url: "https://esm.sh/' + name + '?bundle&cjs" }), or pick a package that ships a UMD/CJS bundle.');
+    }
     throw new Error('use("' + name + '"): bundle from ' + usedUrl + ' failed to compile: ' + (e && e.message || e));
   }
   try {
