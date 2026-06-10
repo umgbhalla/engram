@@ -497,6 +497,11 @@ globalThis.console = {
 };
 globalThis.__drainLogs = function(){ const l = globalThis.__logs; globalThis.__logs = []; return JSON.stringify(l); };
 
+// SANITY CANARY: a sentinel heap value (object + string + closure-over-this + funcref) snapshotted
+// with the heap. The host post-restore probe runs run_gc() then evals __engram_canary.f() (expects
+// 43); a corrupt blit faults or returns wrong, and the host discards the instance and replays.
+try { globalThis.__engram_canary = { n: 42, s: "engram-canary", f: function(){ return this.n + 1; } }; } catch(e){}
+
 // host Proxy: every host.<name>(...args) becomes a host-effect call dispatched to
 // Rust (__hostCall), which parks the request and returns a Promise resolved by the
 // shim on resume. fetch is the only wired host effect.
@@ -2152,6 +2157,18 @@ pub extern "C" fn used_heap() -> i64 {
 #[no_mangle]
 pub extern "C" fn buffer_bytes() -> i64 {
     (cur_pages() as i64) * 65536
+}
+
+// Force a full QuickJS GC sweep (mark-sweep walks every live object header + child pointer →
+// traps/asserts on a corrupt heap). Used by the host post-restore SANITY PROBE: a corrupt blit
+// (truncated R2 read, bad delta, layout mismatch) faults here and the host falls back to replay.
+#[no_mangle]
+pub extern "C" fn run_gc() {
+    CTX.with(|c| {
+        if let Some((rt, _)) = c.borrow().as_ref() {
+            rt.run_gc();
+        }
+    });
 }
 
 // W5 (docs/W5-COMPACTION-PLAN.md): run GC, then SCRUB freed dlmalloc slack by allocating

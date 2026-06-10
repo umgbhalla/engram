@@ -116,6 +116,11 @@ pub struct KernelDO {
     mutex: Mutex,
 }
 
+/// Semantic snapshot layout epoch (bump on quickjs-ng/rustc/feature/static-layout change). Recorded
+/// in meta as groundwork; compatibility is proven by the build artifacts + the post-restore sanity
+/// probe, never declared — a bump may only force replay, never a hot restore.
+const SNAPSHOT_FORMAT_VERSION: &str = "1";
+
 impl DurableObject for KernelDO {
     fn new(state: State, env: Env) -> Self {
         let sql = state.storage().sql();
@@ -143,6 +148,11 @@ impl DurableObject for KernelDO {
         let _ = sql.exec("ALTER TABLE snap_manifest ADD COLUMN base_seq INTEGER;", None);
         let _ = sql.exec("ALTER TABLE snap_manifest ADD COLUMN delta_seq INTEGER;", None);
         let _ = sql.exec("ALTER TABLE snap_manifest ADD COLUMN snap_mode TEXT;", None);
+        // Snapshot-format groundwork: a semantic layout epoch alongside engine_hash (fable design —
+        // a manual salt may only FORCE replay, never force a hot restore). Recorded for future
+        // layout-compatible hot-restore gating; the post-restore sanity probe is the live safety net.
+        let _ = sql.exec("ALTER TABLE snap_manifest ADD COLUMN layout_version TEXT;", None);
+        write_meta(&sql, "snapFormat", SNAPSHOT_FORMAT_VERSION);
         sql.exec(
             "CREATE TABLE IF NOT EXISTS delta_chunks (
                 seq INTEGER PRIMARY KEY, payload BLOB, indices BLOB, grain INTEGER
@@ -670,7 +680,7 @@ impl KernelDO {
             } else {
                 let label = if is_r2 { "r2-restore" } else { "sqlite-restore" };
                 let delta_list = self.read_delta_chain(m.delta_seq)?;
-                let src = JsFuture::from(glue.restore_w4(
+                match JsFuture::from(glue.restore_w4(
                     gz,
                     delta_list.as_ref(),
                     &m.engine_hash,
@@ -682,9 +692,27 @@ impl KernelDO {
                     m.used_heap as f64,
                 ))
                 .await
-                .map_err(to_err)?;
-                timings_json = glue.last_restore_timings();
-                src.as_string().unwrap_or_else(|| label.into())
+                {
+                    Ok(src) => {
+                        timings_json = glue.last_restore_timings();
+                        src.as_string().unwrap_or_else(|| label.into())
+                    }
+                    Err(_) => {
+                        // SANITY-PROBE FALLBACK: the hot byte-blit failed its post-restore canary/GC
+                        // probe (possible image corruption) — discard and replay the oplog tail into
+                        // a fresh instance. Always correct; pure cells re-run, host effects fed back.
+                        let journal = self.read_oplog();
+                        let _ = JsFuture::from(glue.replay_journal(
+                            journal.as_ref(),
+                            &cfg_str,
+                            &m.kv_json,
+                        ))
+                        .await
+                        .map_err(to_err)?;
+                        timings_json = glue.last_restore_timings();
+                        "sanity-fallback-replay".to_string()
+                    }
+                }
             }
         } else {
             let src = JsFuture::from(glue.create_fresh(&cfg_str))

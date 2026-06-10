@@ -68,6 +68,7 @@ interface EngineExports {
   kv_import(ptr: number, len: number): void;
   eval_begin(ptr: number, len: number, budget: bigint, growCapPages: number): number;
   eval_resume(ptr: number, len: number): number;
+  run_gc(): void;
 }
 
 interface WasiImports {
@@ -488,6 +489,27 @@ class GlueKernel {
     this._fenceCell = cell;
   }
 
+  // _sanityProbe: post-restore integrity check before a hot-blitted session goes live. Runs a full
+  // GC sweep (whole-heap structural walk; faults on a corrupt object header) then evals the snapshot
+  // canary (exercises shape lookup, string, closure env, funcref dispatch). Returns false on any
+  // fault/mismatch → the DO discards this instance and falls back to E6 oplog replay (always correct).
+  // A canary-absent snapshot (pre-canary build) returns ok=true for back-compat.
+  _sanityProbe(): boolean {
+    try {
+      const ex = this._ex();
+      try { ex.run_gc(); } catch { return false; }
+      const src = '(function(){try{var c=globalThis.__engram_canary; if(!c) return 1; return (c.s==="engram-canary"&&typeof c.f==="function"&&c.f()===43)?1:0;}catch(e){return 0;}})()';
+      const bb = TEXT_ENC.encode(src);
+      this._writeScratch(bb);
+      const st = ex.eval_begin(ex.scratch_ptr(), bb.length, BigInt(1_000_000), 0);
+      if (st !== 0) return false; // not DONE (fault / host-call / budget) => unsafe
+      const res = JSON.parse(this._readResult());
+      return !!(res && res.ok && res.value === 1);
+    } catch {
+      return false;
+    }
+  }
+
   // _applyFsProvider: tell the in-VM fs router which provider is active (it reads
   // globalThis.__fsProvider). Called after create/restore. 'vfs' = in-heap; else host-backed.
   _applyFsProvider(): void {
@@ -707,6 +729,9 @@ class GlueKernel {
     if (kvJson && kvJson !== "{}") this._importKv(kvJson);
     this._lastImage = image.slice();
     this._applyFsProvider();
+    if (!this._sanityProbe()) {
+      throw new Error("RestoreSanityError: post-blit canary/GC probe failed (possible image corruption)");
+    }
     this.lastTimings = { gunzipMs, instantiateMs: 0, growCount, neededPages: needPages, deltas: deltas.length };
     return label || "sqlite-restore";
   }
