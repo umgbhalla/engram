@@ -60,6 +60,8 @@ extern "C" {
         label: &str,
         kv_json: &str,
         used_heap: f64,
+        expect_crc: f64,
+        expect_len: f64,
     ) -> js_sys::Promise;
     #[wasm_bindgen(method, js_name = lastRestoreTimings)]
     fn last_restore_timings(this: &GlueKernel) -> String;
@@ -75,6 +77,8 @@ extern "C" {
     fn dump(this: &GlueKernel) -> js_sys::Promise;
     #[wasm_bindgen(method, js_name = dumpW4)]
     fn dump_w4(this: &GlueKernel, force_full: bool) -> js_sys::Promise;
+    #[wasm_bindgen(method, js_name = commitDump)]
+    fn commit_dump(this: &GlueKernel);
     #[wasm_bindgen(method, js_name = lastCellHostResults)]
     fn last_cell_host_results(this: &GlueKernel) -> String;
     #[wasm_bindgen(method, js_name = replayJournal)]
@@ -158,6 +162,10 @@ impl DurableObject for KernelDO {
         // a manual salt may only FORCE replay, never force a hot restore). Recorded for future
         // layout-compatible hot-restore gating; the post-restore sanity probe is the live safety net.
         store.exec_ignore("ALTER TABLE snap_manifest ADD COLUMN layout_version TEXT;", None);
+        // W4 reconstruction checksum: CRC32 of the FULL image the committed chain reconstructs to
+        // (base+deltas incl. the manifest's tail row). restoreW4 recomputes + rejects a mismatch =>
+        // oplog replay fallback. Nullable for pre-CRC snapshots (the glue skips the check then).
+        store.exec_ignore("ALTER TABLE snap_manifest ADD COLUMN final_crc INTEGER;", None);
         write_meta(&store, "snapFormat", SNAPSHOT_FORMAT_VERSION);
         store
             .exec(
@@ -701,6 +709,8 @@ impl KernelDO {
                     label,
                     &m.kv_json,
                     m.used_heap as f64,
+                    m.final_crc as f64,
+                    m.size_raw as f64,
                 ))
                 .await
                 {
@@ -768,6 +778,7 @@ impl KernelDO {
         let rng_calls = num_field(&dump, "rngCalls").unwrap_or(0.0) as i64;
         let grain = num_field(&dump, "grain").unwrap_or(256.0) as i64;
         let n_changed = num_field(&dump, "nChanged").unwrap_or(0.0) as i64;
+        let image_crc = num_field(&dump, "imageCrc").unwrap_or(0.0) as i64;
         let kv_json = str_field(&dump, "kvJson").unwrap_or_else(|| "{}".to_string());
 
         let mut bytes = vec![0u8; gz.length() as usize];
@@ -807,7 +818,7 @@ impl KernelDO {
             let base_r2_key = pm.r2_key.clone();
             let base_engine = pm.engine_hash.clone();
             let base_n_chunks = pm.n_chunks;
-            let base_size_raw = pm.size_raw;
+            let _base_size_raw = pm.size_raw; // superseded: delta tail stores its own reconstructed size_raw
             let base_size_gz = pm.size_gz;
             let oplog_seq = delta_seq_new + 1;
             let store = self.store();
@@ -823,15 +834,17 @@ impl KernelDO {
                 store.exec(
                     "INSERT INTO snap_manifest
                         (id,cell,epoch,n_chunks,size_raw,size_gz,engine_hash,clock_calls,rng_calls,
-                         store,r2_key,created_ms,kv_json,used_heap,delta_seq,snap_mode)
-                     VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
+                         store,r2_key,created_ms,kv_json,used_heap,delta_seq,snap_mode,final_crc)
+                     VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
                     Some(vec![
                         cell.into(), epoch.into(), base_n_chunks.into(),
-                        base_size_raw.into(), base_size_gz.into(), base_engine.clone().into(),
+                        // size_raw is the FULL reconstructed image length of THIS delta tail (the
+                        // glue's imageLen), NOT the base length — restoreW4's CRC is over size_raw.
+                        size_raw.into(), base_size_gz.into(), base_engine.clone().into(),
                         clock_calls.into(), rng_calls.into(), base_store.clone().into(),
                         base_r2_key.clone().into(), now_ms().into(), kv_json.clone().into(),
                         used_heap.into(), (delta_seq_new + 1).into(),
-                        "delta".to_string().into(),
+                        "delta".to_string().into(), image_crc.into(),
                     ]),
                 )?;
                 store.exec("INSERT INTO meta(k,v) VALUES('committedCell',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v;",
@@ -839,6 +852,9 @@ impl KernelDO {
                 Ok(())
             };
             txn()?;
+            // W4 commit-ordering: the delta row is now the committed chain tail — promote the staged
+            // candidate to the live delta base so the NEXT diff is against exactly this image.
+            glue.commit_dump();
             return Ok(json!({
                 "ok": true, "cell": cell, "store": base_store, "mode": "delta",
                 "nChunks": base_n_chunks, "deltaSeq": delta_seq_new + 1, "nChanged": n_changed,
@@ -885,14 +901,14 @@ impl KernelDO {
             kstore.exec(
                 "INSERT INTO snap_manifest
                     (id,cell,epoch,n_chunks,size_raw,size_gz,engine_hash,clock_calls,rng_calls,
-                     store,r2_key,created_ms,kv_json,used_heap,delta_seq,snap_mode)
-                 VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
+                     store,r2_key,created_ms,kv_json,used_heap,delta_seq,snap_mode,final_crc)
+                 VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
                 Some(vec![
                     cell.into(), epoch.into(), n_chunks.into(),
                     size_raw.into(), size_gz.into(), get_engine_hash().into(),
                     clock_calls.into(), rng_calls.into(), store.clone().into(),
                     r2_key_for_manifest.clone().into(), now_ms().into(), kv_json.clone().into(),
-                    used_heap.into(), 0i64.into(), "full".to_string().into(),
+                    used_heap.into(), 0i64.into(), "full".to_string().into(), image_crc.into(),
                 ]),
             )?;
             kstore.exec("INSERT INTO meta(k,v) VALUES('committedCell',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v;",
@@ -900,6 +916,8 @@ impl KernelDO {
             Ok(n_chunks)
         };
         let n_chunks = txn()?;
+        // W4 commit-ordering: the full base is committed — promote the staged image to the live base.
+        glue.commit_dump();
 
         if let Some(old) = old_r2_key {
             if old != new_r2_key {
@@ -938,10 +956,12 @@ impl KernelDO {
             size_raw: Option<i64>,
             #[serde(default)]
             size_gz: Option<i64>,
+            #[serde(default)]
+            final_crc: Option<i64>,
         }
         let rows: Vec<Row> = store
             .query_typed(
-                "SELECT cell,epoch,n_chunks,engine_hash,clock_calls,rng_calls,store,r2_key,kv_json,used_heap,delta_seq,size_raw,size_gz
+                "SELECT cell,epoch,n_chunks,engine_hash,clock_calls,rng_calls,store,r2_key,kv_json,used_heap,delta_seq,size_raw,size_gz,final_crc
                  FROM snap_manifest WHERE id=1 LIMIT 1;",
                 None,
             )
@@ -960,6 +980,7 @@ impl KernelDO {
             delta_seq: r.delta_seq.unwrap_or(0),
             size_raw: r.size_raw.unwrap_or(0),
             size_gz: r.size_gz.unwrap_or(0),
+            final_crc: r.final_crc.unwrap_or(0),
         })
     }
 
@@ -1091,6 +1112,7 @@ struct Manifest {
     delta_seq: i64,
     size_raw: i64,
     size_gz: i64,
+    final_crc: i64,
 }
 
 #[event(fetch)]

@@ -129,6 +129,10 @@ interface DumpResult extends DumpCommon {
   imageLen: number;
   nChanged: number;
   indicesGz: Uint8Array | null;
+  // CRC32 of the FULL reconstructed image this dump represents (delta => base+chain incl. this row).
+  // The DO carries it in the manifest; restoreW4 recomputes after reconstruction and throws a
+  // RestoreSanityError on mismatch => oplog replay fallback. W4 defense-in-depth (task #15).
+  imageCrc: number;
 }
 
 interface SerializeResult {
@@ -438,6 +442,12 @@ class GlueKernel {
   lastTimings: RestoreTimings;
   _fetchAllow: boolean | string[];
   _lastImage: Uint8Array | null;
+  // W4 COMMIT-ORDERING: the just-dumped candidate image. dumpW4/dump compute it but DO NOT promote
+  // it to _lastImage — the DO calls commitDump() AFTER its SQL txn commits, only then does it become
+  // the new delta base. This closes the desync where a dump whose row never became the committed
+  // chain tail (re-route to full / failed txn) left _lastImage ahead of the stored chain, so the
+  // NEXT delta diffed against a base that no longer matched the store (the W4 module-drop bug).
+  _pendingImage: Uint8Array | null;
   _stdlibLoaded?: string[];
   _cellHostResults?: HostResult[];
   _replayHostResults?: HostResult[] | null;
@@ -465,6 +475,7 @@ class GlueKernel {
     // W4: the previous committed image, retained host-side (NOT in the VM heap), so the next
     // checkpoint can byte-diff against it. Dropped on evict; re-derived on cold wake (base+deltas).
     this._lastImage = null;
+    this._pendingImage = null;
     this._hostSender = null;
   }
 
@@ -671,7 +682,9 @@ class GlueKernel {
     configJson: string,
     label: string,
     kvJson: string,
-    usedHeap: number
+    usedHeap: number,
+    expectCrc: number,
+    expectLen: number
   ): Promise<string> {
     this._applyConfig(configJson);
     const t0 = Date.now();
@@ -709,6 +722,24 @@ class GlueKernel {
       }
     }
     const gunzipMs = Date.now() - t0;
+    // W4 RECONSTRUCTION CHECKSUM (defense-in-depth, task #15): the DO carries the dump's
+    // reconstructed-image CRC32 in the manifest. Recompute over the bytes the chain produced and
+    // reject a mismatch BEFORE blitting => the DO's catch falls back to oplog replay (always
+    // correct), converting any silent W4 desync into a caught, recoverable fallback. expectLen<=0
+    // (older snapshots) or expectCrc===0 skips the check (backward-compatible).
+    const wantLen = Number.isFinite(expectLen) && expectLen > 0 ? expectLen | 0 : 0;
+    const wantCrc = (expectCrc >>> 0);
+    if (wantLen > 0 && wantCrc !== 0) {
+      if (image.byteLength < wantLen) {
+        throw new Error("RestoreSanityError: reconstructed image " + image.byteLength +
+          "B shorter than recorded " + wantLen + "B (W4 chain incomplete)");
+      }
+      const got = crc32(image.subarray(0, wantLen));
+      if (got !== wantCrc) {
+        throw new Error("RestoreSanityError: W4 reconstruction CRC mismatch (got " + got +
+          " want " + wantCrc + ", len " + wantLen + ") — chain desync, falling back to oplog replay");
+      }
+    }
     // W5 RESTORE admission on the reconstructed image.
     const recordedUsed = Number.isFinite(usedHeap) && usedHeap > 0 ? usedHeap | 0 : 0;
     if (recordedUsed > MAX_RESTORE_USED_BYTES)
@@ -1129,9 +1160,11 @@ class GlueKernel {
   async dump(): Promise<DumpResult> {
     const { raw, usedHeap, bufferBytes, scrubbed } = this._serializeForDump();
     const gz = await gzip(raw);
-    this._lastImage = raw.slice();
+    // W4 commit-ordering: stage; commitDump() promotes to _lastImage only after the DO txn commits.
+    this._pendingImage = raw.slice();
     return { gz, sizeGz: gz.length, mode: "full", grain: DELTA_GRAIN_BYTES, imageLen: raw.length,
-      nChanged: 0, indicesGz: null, ...this._dumpCommon(usedHeap, bufferBytes, scrubbed, raw) };
+      nChanged: 0, indicesGz: null, imageCrc: crc32(raw),
+      ...this._dumpCommon(usedHeap, bufferBytes, scrubbed, raw) };
   }
 
   // W4 BYTE-DELTA dump (docs/W4-BYTEDELTA-PLAN.md). Diffs the current raw image vs the retained
@@ -1148,11 +1181,16 @@ class GlueKernel {
     // image FIRST (free prev), gzip raw to a single full base, and do NOT retain a new _lastImage —
     // peak memory is ~raw + gz. Emits mode:"full" (the DO full path resets the oplog tail).
     if (raw.byteLength > LARGE_BUFFER_NO_RETAIN_BYTES) {
+      // No-retain: this image is too big to keep host-side. Compute crc BEFORE freeing, store a
+      // full base, and clear BOTH bases — the next dump is forced full too (prev=null => canDelta
+      // false), keeping the chain self-consistent. commitDump() is still called but finds no pending.
+      const imageCrc = crc32(raw);
       this._lastImage = null;
+      this._pendingImage = null;
       prev = null;
       const gz = await gzip(raw);
       return { mode: "full", gz, indicesGz: null, nChanged: 0, grain: DELTA_GRAIN_BYTES,
-        imageLen: raw.byteLength, sizeGz: gz.byteLength, ...common };
+        imageLen: raw.byteLength, sizeGz: gz.byteLength, imageCrc, ...common };
     }
     // W4 (growth-tolerant): the WASM linear buffer is MONOTONIC and commonly grows by whole 64KB
     // pages between cells; allow a delta when the current buffer is the SAME size or LARGER than
@@ -1193,21 +1231,35 @@ class GlueKernel {
       const fullGz = await gzip(raw);
       const deltaBlobsFit = payGz.byteLength <= DELTA_MAX_BLOB_BYTES && idxGz.byteLength <= DELTA_MAX_BLOB_BYTES;
       if (deltaBlobsFit && deltaStored < fullGz.byteLength * DELTA_FALLBACK_PCT) {
-        this._lastImage = raw.slice();
+        // STAGE the candidate base; commitDump() promotes it ONLY after the DO appends this delta
+        // row + bumps delta_seq. imageCrc = crc of the FULL image this delta reconstructs to.
+        this._pendingImage = raw.slice();
         return { mode: "delta", gz: payGz, indicesGz: idxGz, nChanged: changed.length, grain,
-          imageLen: raw.byteLength, sizeGz: deltaStored, ...common };
+          imageLen: raw.byteLength, sizeGz: deltaStored, imageCrc: crc32(raw), ...common };
       }
       // dense — fall through to full base, reuse fullGz.
-      this._lastImage = raw.slice();
+      this._pendingImage = raw.slice();
       return { mode: "full", gz: fullGz, indicesGz: null, nChanged: 0, grain: DELTA_GRAIN_BYTES,
-        imageLen: raw.byteLength, sizeGz: fullGz.byteLength, ...common };
+        imageLen: raw.byteLength, sizeGz: fullGz.byteLength, imageCrc: crc32(raw), ...common };
     }
 
     // FULL (W5-compacted) base. Resets the delta chain.
-    this._lastImage = raw.slice();
+    this._pendingImage = raw.slice();
     const gz = await gzip(raw);
     return { mode: "full", gz, indicesGz: null, nChanged: 0, grain: DELTA_GRAIN_BYTES,
-      imageLen: raw.byteLength, sizeGz: gz.byteLength, ...common };
+      imageLen: raw.byteLength, sizeGz: gz.byteLength, imageCrc: crc32(raw), ...common };
+  }
+
+  // W4 commit-ordering hook: the DO calls this AFTER its checkpoint SQL txn commits successfully,
+  // promoting the staged candidate image to the live delta base. If the txn never ran or threw, the
+  // DO does NOT call this, so _lastImage stays pinned to the last COMMITTED chain tail — the next
+  // delta is guaranteed to diff against the image the stored chain reconstructs to. This is the
+  // primary fix for the W4 module-drop desync. Idempotent; a no-op when nothing is staged.
+  commitDump(): void {
+    if (this._pendingImage) {
+      this._lastImage = this._pendingImage;
+      this._pendingImage = null;
+    }
   }
 
   _exportKv(): string {
@@ -1308,4 +1360,24 @@ async function gunzip(u8: Uint8Array): Promise<Uint8Array> {
   w.write(u8);
   w.close();
   return new Uint8Array(await new Response(ds.readable).arrayBuffer());
+}
+
+// CRC32 (IEEE 802.3, table-driven) over a byte buffer. Used as the W4 reconstruction checksum:
+// the DO stores the dump's reconstructed-image CRC in the manifest; restoreW4 recomputes it after
+// applying base+deltas and rejects (=> oplog replay) on mismatch. Returns an unsigned 32-bit int.
+let _CRC_TABLE: Uint32Array | null = null;
+function crc32(buf: Uint8Array): number {
+  let t = _CRC_TABLE;
+  if (!t) {
+    t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      t[n] = c >>> 0;
+    }
+    _CRC_TABLE = t;
+  }
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) crc = (crc >>> 8) ^ t[(crc ^ buf[i]) & 0xff];
+  return (crc ^ 0xffffffff) >>> 0;
 }
