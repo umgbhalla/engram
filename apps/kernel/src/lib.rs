@@ -24,10 +24,14 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use worker::{
-    durable_object, event, wasm_bindgen, wasm_bindgen_futures, DurableObject, Env, Method, Request,
-    Response, Result, State, WebSocket, WebSocketIncomingMessage, WebSocketPair,
+    durable_object, event, wasm_bindgen, wasm_bindgen_futures, Delay, DurableObject, Env, Method,
+    Request, Response, Result, State, WebSocket, WebSocketIncomingMessage, WebSocketPair,
     WebSocketRequestResponsePair,
 };
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 #[wasm_bindgen(module = "/src/kernel-glue.mjs")]
 extern "C" {
@@ -174,7 +178,12 @@ fn extract_token(req: &Request) -> (String, bool) {
 }
 
 const CHUNK_BYTES: usize = 64 * 1024;
-const SQLITE_HOT_MAX: usize = 2 * 1024 * 1024;
+// R2TAIL HOT-TIER: keep the restore-critical base image in DO SQLite (64KB chunked rows) up to
+// this ceiling, spilling to R2 ONLY for genuinely large images. Raised 2MB -> 8MB so the vast
+// majority of sessions never touch R2 on the hot restore path (removes the transient-R2 data-loss
+// exposure for them entirely). DO SQLite total is generous; per-value cap is satisfied by 64KB
+// chunking. Symmetric on write (checkpoint) and read (ensure_glue) — both key off `m.store`.
+const SQLITE_HOT_MAX: usize = 8 * 1024 * 1024;
 /// DO SQLite caps a single bound value at ~2MB. Any TEXT/BLOB we bind in a checkpoint txn must
 /// stay below this or the INSERT throws SQLITE_TOOBIG mid-commit (aborting the staged transaction
 /// and risking a torn manifest). The E6 oplog `src` is the only unbounded text we bind; clamp it.
@@ -548,6 +557,100 @@ impl KernelDO {
         format!("benchrustf/{}/e{}-c{}.qjs.gz", self.do_id, epoch, cell)
     }
 
+    /// Circuit-breaker: is R2 currently considered degraded (skip it, go straight to oplog replay)?
+    /// State persists across DO requests in `meta`; cooldown uses wall-clock (advances between turns).
+    fn r2_breaker_open(&self) -> bool {
+        let store = self.store();
+        let open_until = read_int(&store, R2_BREAKER_OPEN_UNTIL_KEY, 0);
+        open_until > 0 && (now_ms() as i64) < open_until
+    }
+
+    fn r2_breaker_record_failure(&self) {
+        let store = self.store();
+        let fails = read_int(&store, R2_BREAKER_FAILS_KEY, 0) + 1;
+        write_meta(&store, R2_BREAKER_FAILS_KEY, &fails.to_string());
+        if fails >= R2_BREAKER_TRIP_AT {
+            let open_until = (now_ms() + R2_BREAKER_COOLDOWN_MS) as i64;
+            write_meta(&store, R2_BREAKER_OPEN_UNTIL_KEY, &open_until.to_string());
+            console_log(&format!(
+                "[r2-breaker] OPEN after {fails} consecutive failures; cooldown {}ms",
+                R2_BREAKER_COOLDOWN_MS as i64
+            ));
+        }
+    }
+
+    fn r2_breaker_record_success(&self) {
+        let store = self.store();
+        if read_int(&store, R2_BREAKER_FAILS_KEY, 0) != 0
+            || read_int(&store, R2_BREAKER_OPEN_UNTIL_KEY, 0) != 0
+        {
+            write_meta(&store, R2_BREAKER_FAILS_KEY, "0");
+            write_meta(&store, R2_BREAKER_OPEN_UNTIL_KEY, "0");
+        }
+    }
+
+    /// Resilient R2 GET for the snapshot overflow image: retry-with-(deterministic)-backoff +
+    /// per-attempt timeout, distinguishing a transient failure (→ retry, then `Exhausted` keeping the
+    /// session intact) from a durable miss (404-class → `Missing`). Never bubbles a 500 that the
+    /// client would read as "no session, create fresh". Determinism preserved (fixed backoffs, R2
+    /// reads add no entropy). The image body is read whole (range/streamed read deferred — see #10
+    /// notes; SQLITE_HOT_MAX=8MB keeps most images off this path entirely).
+    async fn r2_get_resilient(&self, key: &str) -> R2Read {
+        for attempt in 0..R2_GET_ATTEMPTS {
+            if attempt > 0 {
+                let backoff = R2_GET_BACKOFF_MS
+                    .get(attempt - 1)
+                    .copied()
+                    .unwrap_or(*R2_GET_BACKOFF_MS.last().unwrap());
+                Delay::from(Duration::from_millis(backoff)).await;
+            }
+            let bucket = match self.env.bucket("SNAPSHOTS") {
+                Ok(b) => b,
+                Err(e) => {
+                    console_log(&format!("[r2-get] bucket bind failed (attempt {attempt}): {e:?}"));
+                    continue;
+                }
+            };
+            // Race the GET (head + body read) against a per-attempt timeout.
+            let fut = async {
+                let obj = bucket.get(key).execute().await?;
+                let obj = match obj {
+                    Some(o) => o,
+                    None => return Ok::<Option<Uint8Array>, worker::Error>(None), // durable miss
+                };
+                let body = match obj.body() {
+                    Some(b) => b,
+                    None => return Ok(None),
+                };
+                let bytes = body.bytes().await?;
+                let arr = Uint8Array::new_with_length(bytes.len() as u32);
+                arr.copy_from(&bytes);
+                Ok(Some(arr))
+            };
+            match race_timeout(fut, R2_GET_TIMEOUT_MS).await {
+                Some(Ok(Some(arr))) => {
+                    self.r2_breaker_record_success();
+                    return R2Read::Got(arr);
+                }
+                Some(Ok(None)) => {
+                    // Durable miss: NOT transient. Don't burn retries; recover via oplog replay.
+                    console_log(&format!("[r2-get] durable miss for key {key}"));
+                    self.r2_breaker_record_success();
+                    return R2Read::Missing;
+                }
+                Some(Err(e)) => {
+                    console_log(&format!("[r2-get] transient error attempt {attempt}: {e:?}"));
+                }
+                None => {
+                    console_log(&format!("[r2-get] timeout (>{}ms) attempt {attempt}", R2_GET_TIMEOUT_MS));
+                }
+            }
+        }
+        self.r2_breaker_record_failure();
+        console_log(&format!("[r2-get] EXHAUSTED {R2_GET_ATTEMPTS} attempts for key {key}"));
+        R2Read::Exhausted
+    }
+
     /// No-ws entry (HTTP /frame / facet proxy path). Host callbacks are unavailable
     /// here (no held client socket), so a non-fetch host.<name> call rejects cleanly.
     async fn handle(&self, msg: serde_json::Value) -> Result<serde_json::Value> {
@@ -831,30 +934,55 @@ impl KernelDO {
         let manifest = self.read_manifest();
         let source = if let Some(m) = manifest {
             let is_r2 = m.store == "r2";
-            let gz = if is_r2 {
-                let bucket = self.env.bucket("SNAPSHOTS")?;
-                let obj = bucket
-                    .get(&m.r2_key)
-                    .execute()
-                    .await?
-                    .ok_or_else(|| worker::Error::RustError("r2 overflow missing".into()))?;
-                let body = obj
-                    .body()
-                    .ok_or_else(|| worker::Error::RustError("r2 body missing".into()))?;
-                let bytes = body.bytes().await?;
-                let arr = Uint8Array::new_with_length(bytes.len() as u32);
-                arr.copy_from(&bytes);
-                arr
+            // R2 OVERFLOW RESTORE (issue #10): a transient R2 hiccup MUST NOT bubble a 500 that the
+            // client reads as "no session" and answers with a state-wiping {t:create}. Read R2 with
+            // retry/backoff/timeout + circuit-breaker; on a durable miss OR exhausted retries OR an
+            // open breaker, keep the session INTACT and recover via the oplog-replay path below
+            // (never create-fresh). `gz=None` signals "could not load the byte image — replay".
+            let mut r2_replay_reason: Option<&'static str> = None;
+            let gz: Option<Uint8Array> = if is_r2 {
+                if self.r2_breaker_open() {
+                    console_log("[r2-get] breaker OPEN — skipping R2, routing to oplog replay");
+                    r2_replay_reason = Some("r2-breaker-open-replay");
+                    None
+                } else {
+                    match self.r2_get_resilient(&m.r2_key).await {
+                        R2Read::Got(arr) => Some(arr),
+                        R2Read::Missing => {
+                            r2_replay_reason = Some("r2-missing-replay");
+                            None
+                        }
+                        R2Read::Exhausted => {
+                            r2_replay_reason = Some("r2-unavailable-replay");
+                            None
+                        }
+                    }
+                }
             } else {
-                self.read_chunks(m.n_chunks)?
+                Some(self.read_chunks(m.n_chunks)?)
             };
             read_ms = now_ms() - t0;
 
+            // R2-UNAVAILABLE FALLBACK: byte image unreadable but the session is durable — recover by
+            // replaying the committed oplog tail into a fresh instance (no re-fire of host effects).
+            // This is the data-loss fix: failure mode is "temporarily recovered via replay", NOT "gone".
+            if is_r2 && gz.is_none() {
+                let journal = self.read_oplog();
+                let _ = JsFuture::from(glue.replay_journal(
+                    journal.as_ref(),
+                    &cfg_str,
+                    &m.kv_json,
+                ))
+                .await
+                .map_err(to_err)?;
+                timings_json = glue.last_restore_timings();
+                r2_replay_reason.unwrap_or("r2-unavailable-replay").to_string()
+            }
             // E6 ENGINE-MIGRATION: if the committed snapshot was written by a DIFFERENT engine
             // build, the byte-blit image is invalid (different layout). Replay the oplog tail into
             // a FRESH instance under the same config instead of wedging. Pure cells re-run; host
             // effects are fed back from the recorded oplog (no re-fire).
-            if !m.engine_hash.is_empty() && m.engine_hash != get_engine_hash() {
+            else if !m.engine_hash.is_empty() && m.engine_hash != get_engine_hash() {
                 let journal = self.read_oplog();
                 let _ = JsFuture::from(glue.replay_journal(
                     journal.as_ref(),
@@ -869,7 +997,7 @@ impl KernelDO {
                 let label = if is_r2 { "r2-restore" } else { "sqlite-restore" };
                 let delta_list = self.read_delta_chain(m.delta_seq)?;
                 match JsFuture::from(glue.restore_w4(
-                    gz,
+                    gz.expect("gz image present on the non-replay restore path"),
                     delta_list.as_ref(),
                     &m.engine_hash,
                     m.clock_calls as f64,
@@ -1362,6 +1490,65 @@ fn write_meta<S: KernelStore>(store: &S, k: &str, v: &str) {
             Some(vec![k.into(), v.into()]),
         )
         .expect("write meta");
+}
+
+// ── R2 RESTORE RESILIENCE (issue #10: transient R2 hiccup on the >SQLITE_HOT_MAX overflow
+//    restore path used to bubble a 500 → client reconnect+{t:create} → fresh-over-durable WIPE).
+//    Constants govern the retry/timeout/circuit-breaker wrapped around the single R2 GET. ───────
+const R2_GET_ATTEMPTS: usize = 4;
+// Deterministic (jitter-free — determinism invariant) exponential-ish backoff between attempts.
+const R2_GET_BACKOFF_MS: [u64; 3] = [50, 150, 400];
+// Per-attempt wall-clock ceiling: a single hung GET must not eat the whole DO request budget.
+const R2_GET_TIMEOUT_MS: u64 = 4000;
+// Circuit breaker: after this many CONSECUTIVE exhausted R2 reads, skip R2 entirely (go straight to
+// oplog-replay) until the cooldown elapses — avoids stacking multi-second timeouts on a degraded R2.
+const R2_BREAKER_TRIP_AT: i64 = 3;
+const R2_BREAKER_COOLDOWN_MS: f64 = 30_000.0;
+const R2_BREAKER_FAILS_KEY: &str = "r2BreakerFails";
+const R2_BREAKER_OPEN_UNTIL_KEY: &str = "r2BreakerOpenUntil";
+
+/// Outcome of a resilient R2 read attempt set.
+enum R2Read {
+    /// Body bytes obtained.
+    Got(Uint8Array),
+    /// The key is durably absent (404-class) — NOT a transient failure; recover via oplog replay.
+    Missing,
+    /// All retries exhausted on transient errors/timeouts — session is INTACT (do NOT wipe);
+    /// caller must route to oplog-replay / typed-retryable, never to create-fresh.
+    Exhausted,
+}
+
+/// A 2-future select: resolves with the first branch to complete. Used to race an R2 GET against a
+/// `Delay` timeout without pulling in the `futures` crate. Left = the work, Right = the timeout.
+struct Select2<A, B> {
+    a: Pin<Box<A>>,
+    b: Pin<Box<B>>,
+}
+enum Either<TA, TB> {
+    Left(TA),
+    Right(TB),
+}
+impl<A: Future, B: Future> Future for Select2<A, B> {
+    type Output = Either<A::Output, B::Output>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Poll::Ready(v) = self.a.as_mut().poll(cx) {
+            return Poll::Ready(Either::Left(v));
+        }
+        if let Poll::Ready(v) = self.b.as_mut().poll(cx) {
+            return Poll::Ready(Either::Right(v));
+        }
+        Poll::Pending
+    }
+}
+async fn race_timeout<F: Future>(work: F, timeout_ms: u64) -> Option<F::Output> {
+    let sel = Select2 {
+        a: Box::pin(work),
+        b: Box::pin(Delay::from(Duration::from_millis(timeout_ms))),
+    };
+    match sel.await {
+        Either::Left(v) => Some(v),
+        Either::Right(_) => None,
+    }
 }
 
 fn now_ms() -> f64 {
