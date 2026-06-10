@@ -1,7 +1,7 @@
 {
   "name": "@engram/sdk",
   "version": "2.0.0-rc.0",
-  "description": "Clean, ergonomic TypeScript client for the durable Engram kernel \u2014 durable JS REPL sessions over WebSocket (kernel) or HTTP (cloud), with typed results and errors.",
+  "description": "Clean, ergonomic TypeScript client for the durable Engram kernel — durable JS REPL sessions over WebSocket (kernel) or HTTP (cloud), with typed results and errors.",
   "type": "module",
   "main": "./dist/index.mjs",
   "module": "./dist/index.mjs",
@@ -10,6 +10,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.mjs"
+    },
+    "./effect": {
+      "types": "./dist/effect.d.ts",
+      "import": "./dist/effect.mjs"
     }
   },
   "files": [
@@ -20,7 +24,7 @@
   "sideEffects": false,
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "tsc --noEmit && esbuild src/index.ts --bundle --format=esm --platform=neutral --target=es2022 --external:node:* --outfile=dist/index.mjs && tsc --emitDeclarationOnly --outDir dist",
+    "build": "tsc --noEmit && esbuild src/index.ts --bundle --format=esm --platform=neutral --target=es2022 --external:node:* --outfile=dist/index.mjs && esbuild src/effect.ts --bundle --format=esm --platform=neutral --target=es2022 --external:node:* --external:effect --outfile=dist/effect.mjs && tsc --emitDeclarationOnly --outDir dist",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -35,8 +39,17 @@
   "dependencies": {
     "ws": "^8.21.0"
   },
+  "peerDependencies": {
+    "effect": "^4.0.0-beta.70"
+  },
+  "peerDependenciesMeta": {
+    "effect": {
+      "optional": true
+    }
+  },
   "devDependencies": {
-    "typescript": "^5.7.2",
-    "esbuild": "^0.24.0"
+    "effect": "^4.0.0-beta.70",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.7.2"
   }
 }

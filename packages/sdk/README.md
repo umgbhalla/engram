@@ -330,6 +330,27 @@ presets.sandboxed(["api.x.com"]) // locked egress allowlist (or sandboxed() to b
 const config = defineConfig({ ...presets.nodeFull(), cellBudgetTicks: 2000 }); // throws on bad fields
 ```
 
+### Effect v4 layer — `@engram/sdk/effect` (optional)
+
+For substrates built on [Effect v4](https://github.com/Effect-TS/effect-smol), an optional entry
+wraps the SDK into Effect values — typed error channel ({@link EngramError} subclasses), scoped
+auto-closing sessions, and composition. `effect` is an **optional peer dependency**; the base
+export has zero Effect dependency.
+
+```ts
+import { Effect } from "effect";
+import { acquireSession, evalEffect, clientEvalEffect } from "@engram/sdk/effect";
+
+const program = Effect.scoped(Effect.gen(function* () {
+  const s = yield* acquireSession({ url, session: "demo" }); // closed when the scope ends
+  return (yield* evalEffect(s, "1 + 1")).value;              // a failed cell -> Effect error channel
+}));
+await Effect.runPromise(program); // 2
+```
+
+Exports: `connectEffect`, `acquireSession` (scoped), `evalEffect`, `clientSessionEffect`,
+`clientEvalEffect`. See [`examples/effect-layer.ts`](./examples/effect-layer.ts).
+
 ---
 
 ## Roadmap (not in v2 core yet)
