@@ -4,12 +4,17 @@
   "type": "module",
   "scripts": {
     "build:engine": "node scripts/build-engine.mjs && node scripts/engine-hash.mjs",
+    "build:worker": "bun x tsc -p tsconfig.json && node scripts/build-ts.ts && node scripts/build-engine.ts && node scripts/engine-hash.ts && worker-build --release",
     "deploy": "wrangler deploy",
+    "deploy:alchemy": "npm run build:worker && alchemy deploy",
+    "dev:alchemy": "npm run build:worker && alchemy dev",
+    "destroy:alchemy": "alchemy destroy",
     "dry-run": "wrangler deploy --dry-run --outdir=.wrangler-dry"
   },
   "//": "ws is a devDependency (live-test client only). worker-build 0.8.3 merges a top-level `dependencies` block into the wasm-bindgen snippet package.json and mis-parses it (see apps/kernel/package.json + docs/results/v0.md) — so NEVER put a `dependencies` key here.",
   "devDependencies": {
     "@cloudflare/workers-types": "^4",
+    "alchemy": "^0.93.9",
     "ts-blank-space": "^0.9.0",
     "ws": "^8.21.0"
   }
