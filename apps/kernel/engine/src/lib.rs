@@ -128,11 +128,22 @@ pub extern "C" fn scratch_reserve(len: usize) -> *const u8 {
 // allocator for reuse). wasm linear memory does not shrink, so this does not lower memory.size, but
 // it lets the next big payload reuse freed space instead of growing further, and keeps a kernel
 // that only runs small cells from ever holding a big buffer.
+//
+// W5/Tier-2: ZERO the released region BEFORE truncating. The freed bytes (a stale fetch/eval body,
+// often incompressible) otherwise persist in monotonic linear memory at their high-water-mark and
+// permanently inflate every later snapshot's gzip — a one-time large host.fetch would bloat the
+// stored image for the session's life. Zeroing lets the snapshot's gzip reclaim the freed pages
+// (raw memory.size stays put; the STORED/compressed image shrinks). Pure dead-byte scrub: the glue
+// re-reads scratch_ptr()/scratch_cap() per use and never reads scratch across cells, so no
+// VM-visible state, determinism, or restore semantics can change.
 #[no_mangle]
 pub extern "C" fn scratch_release() {
     SCRATCH.with(|s| {
         let mut v = s.borrow_mut();
         if v.len() > SCRATCH_FLOOR {
+            for b in &mut v[SCRATCH_FLOOR..] {
+                *b = 0;
+            }
             v.truncate(SCRATCH_FLOOR);
             v.shrink_to_fit();
         }
