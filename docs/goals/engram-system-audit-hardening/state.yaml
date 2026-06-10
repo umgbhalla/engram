@@ -1,0 +1,401 @@
+# GoalBuddy v2 state.yaml
+# Board truth lives here. goal.md is the editable charter; notes/ holds long receipts only.
+
+version: 2
+
+goal:
+  title: "Engram System Audit and Hardening"
+  slug: "engram-system-audit-hardening"
+  kind: audit
+  tranche: "Audit deployed/runtime truth, test/CI reliability, and product/code correctness; then continuously complete safe verified improvement slices until the full original outcome is complete."
+  status: active
+  intake:
+    original_request: "Audit and test infra, existing deployed and code, everything; goal mode; extract anything efficiently possible without breaking any feature; dynamic task creation."
+    interpreted_outcome: "Build a GoalBuddy execution board that audits Engram end to end and then safely implements the highest-value verified improvements."
+    input_shape: audit
+    audience: "Engram owner/operator and maintainers"
+    authority: requested
+    proof_type: review
+    completion_proof: "Final Judge/PM audit shows deployed/runtime confidence, test/CI reliability, and product/code correctness were audited; required fixes were completed or blocked with receipts; verification is current."
+    likely_misfire: "Stopping after broad discovery, generic architecture advice, or one safe cleanup without proving deployed behavior and verification coverage."
+    blind_spots_considered:
+      - "Deployed Cloudflare resources may drift from repo docs or local expectations."
+      - "Credentials or production access may be missing; those block only the affected live checks."
+      - "Architecture improvements can break feature behavior unless scoped and verified."
+      - "Test commands may be slow, flaky, or require local services."
+      - "The named improve-codebase-architecture skill must be scheduled for /goal execution, not loaded during prep."
+    existing_plan_facts:
+      - "Use a local live visual board."
+      - "Cover runtime/deploy confidence, test/CI reliability, and product/code correctness."
+      - "Proceed across all of those areas."
+      - "Record improve-codebase-architecture as a required later skill."
+
+rules:
+  pm_owns_state: true
+  one_active_task: true
+  max_write_workers: 1
+  no_implementation_without_worker_or_pm_task: true
+  no_completion_without_judge_or_pm_audit: true
+  planning_is_not_completion: true
+  queued_required_worker_blocks_completion: true
+  continuous_until_full_outcome: true
+  missing_input_or_credentials_do_not_stop_goal: true
+  preserve_and_validate_existing_plan: true
+  intake_misfire_must_be_audited: true
+
+agents:
+  scout: bundled_not_installed
+  worker: bundled_not_installed
+  judge: bundled_not_installed
+
+visual_board:
+  selected: local
+  local:
+    status: live
+    url: "http://goalbuddy.localhost:41737/engram-system-audit-hardening/"
+    command: "npx goalbuddy board docs/goals/engram-system-audit-hardening"
+  github_projects:
+    status: not_requested
+    url: null
+    command: "npx goalbuddy extend github-projects"
+    missing: []
+
+active_task: T009
+
+tasks:
+  - id: T001
+    type: scout
+    assignee: Scout
+    status: done
+    reasoning_hint: default
+    objective: "Map deployed/runtime confidence for Engram without making changes."
+    inputs:
+      - "AGENTS.md and project docs that describe deployed workers and verification paths"
+      - "Repo deploy scripts, wrangler configs, package scripts, and smoke/eval harnesses"
+      - "Existing local environment variables only when needed for read-only status checks"
+    constraints:
+      - "Read-only."
+      - "Do not edit implementation files."
+      - "Do not deploy, mutate Cloudflare resources, prune storage, or touch production state."
+      - "Prefer repo-native scripts and exact command output over assumptions."
+      - "Accept concurrent outside changes and do not revert them."
+    expected_output:
+      - "Current deployed-surface map with file/script evidence"
+      - "Read-only live checks that are available and unavailable"
+      - "Runtime/deploy risks ranked by impact and confidence"
+      - "Spawned candidate tasks for safe follow-up"
+    receipt:
+      result: done
+      note: notes/T001-deployed-runtime-map.md
+      summary: "Mapped current deployed/runtime surface. Live read-only checks succeeded for Cloudflare account access, deployments, kernel/cloud health, UI/docs 200s, R2 bucket presence, and cloud auth gating. Key risks: stale local Wrangler versus repo minimum, deployed docs resource-name drift, deploy:all excludes docs, kernel health is minimal, and tenant/admin live checks remain owner-gated."
+      evidence:
+        - apps/kernel/wrangler.jsonc
+        - apps/cloud/wrangler.jsonc
+        - apps/ui/wrangler.jsonc
+        - apps/docs/wrangler.jsonc
+        - apps/kernel/src/lib.rs
+        - apps/cloud/src/supervisor.ts
+        - apps/docs/src/content/docs/reference/deployed.md
+        - scripts/deploy.ts
+      spawned_tasks:
+        - "Candidate: add deploy/runtime preflight for Wrangler version and live smoke."
+        - "Candidate: reconcile deployed-resource docs with current resource names."
+        - "Candidate: decide whether root deploy:all should include docs or document exclusion."
+        - "Candidate: add credential-aware live smoke that skips unavailable owner-gated checks."
+  - id: T002
+    type: scout
+    assignee: Scout
+    status: done
+    reasoning_hint: default
+    objective: "Map test, CI, and verification infrastructure for reliability and coverage gaps."
+    inputs:
+      - "package scripts, bun/npm configs, test directories, CI configs, smoke harnesses, docs/TODO.md"
+      - "Recent verification artifacts already present in repo docs"
+    constraints:
+      - "Read-only unless the PM later activates a Worker task."
+      - "Run inexpensive local discovery commands first."
+      - "If tests are expensive or need credentials/services, document exact blockers instead of forcing them."
+    expected_output:
+      - "Verification command inventory"
+      - "Fast gate recommendation"
+      - "Slow/live gate recommendation"
+      - "Flaky, missing, stale, or duplicated test infra findings"
+      - "Spawned candidate tasks for safe fixes"
+    receipt:
+      result: done
+      note: notes/T002-test-ci-map.md
+      summary: "Mapped test/CI reliability. All no-write package/kernel typechecks passed, but there is no CI workflow, no root aggregate check, many smoke defaults target retired/scratch workers, and current live smoke coverage is not packaged as a safe operator gate."
+      evidence:
+        - package.json
+        - apps/kernel/package.json
+        - apps/cloud/package.json
+        - apps/ui/package.json
+        - packages/sdk/package.json
+        - packages/cli/package.json
+        - tests/kernel
+        - tests/kernel-rust
+        - tests/sdk
+        - tests/ui
+        - tests/scale
+        - scripts/e2e-ui.ts
+        - docs/TODO.md
+      commands:
+        - cmd: "bun run --filter @engram/sdk typecheck"
+          status: pass
+        - cmd: "bun run --filter @engram/cli typecheck"
+          status: pass
+        - cmd: "bun run --filter @engram/ui-app typecheck"
+          status: pass
+        - cmd: "bun run --filter @engram/cloud-app typecheck"
+          status: pass
+        - cmd: "cd apps/kernel && bun x tsc -p tsconfig.json"
+          status: pass
+      spawned_tasks:
+        - "Candidate: add root no-write check/typecheck aggregate."
+        - "Candidate: add current safe live smoke harness for kernel/cloud/UI/docs."
+        - "Candidate: mark archive smoke scripts or require explicit current endpoints."
+        - "Candidate: add CI for the fast no-write gate if in scope."
+        - "Candidate: refresh stale docs/TODO.md."
+  - id: T003
+    type: scout
+    assignee: Scout
+    status: done
+    reasoning_hint: default
+    objective: "Map product/code correctness and architecture improvement opportunities without changing behavior."
+    inputs:
+      - "Current monorepo source layout and docs"
+      - "Named later skill requirement: improve-codebase-architecture"
+      - "Existing status docs and tests"
+    constraints:
+      - "Read-only."
+      - "Do not load or apply improve-codebase-architecture unless the later active task explicitly calls for it."
+      - "Prefer small behavior-preserving improvement candidates with strong verification."
+      - "Flag stale docs or claims separately from code defects."
+    expected_output:
+      - "Architecture and correctness map"
+      - "Highest-leverage low-risk improvement candidates"
+      - "Candidate Worker tasks with likely allowed_files and verify commands"
+      - "Findings that require owner approval before live changes"
+    receipt:
+      result: done
+      note: notes/T003-product-code-map.md
+      summary: "Mapped product/code correctness. Current UI default is fixed to engram-kernel, but scripts/e2e-ui.ts is stale against the assets-only UI and deleted bench endpoint; deployed docs still name old R2/AE resources; package/docs identity drift remains; no urgent behavior bug was proven in current app code."
+      evidence:
+        - scripts/e2e-ui.ts
+        - apps/ui/src/main.ts
+        - apps/ui/index.html
+        - apps/docs/src/content/docs/reference/deployed.md
+        - apps/docs/src/content/docs/how-it-works/architecture.md
+        - apps/kernel/ARCHITECTURE.md
+        - apps/kernel/package.json
+        - apps/cloud/package-lock.json
+      spawned_tasks:
+        - "Candidate: repair scripts/e2e-ui.ts for current engram-kernel/assets-only UI behavior."
+        - "Candidate: reconcile current deployed resource names in docs."
+        - "Candidate: add root no-write check script using proven green typechecks."
+        - "Candidate: Judge package identity drift before touching lockfiles."
+  - id: T004
+    type: judge
+    assignee: Judge
+    status: done
+    reasoning_hint: high
+    objective: "Synthesize Scout findings and select the first safe implementation or recovery slice."
+    inputs:
+      - "T001 receipt"
+      - "T002 receipt"
+      - "T003 receipt"
+    constraints:
+      - "Do not implement."
+      - "Prefer high-confidence, reversible, behavior-preserving work with direct verification."
+      - "If live credentials or production mutation are needed, block that slice and choose a safe local workaround."
+      - "When architecture improvement is selected, explicitly decide whether to load improve-codebase-architecture for the Worker or a dedicated Judge task."
+    expected_output:
+      - "Decision"
+      - "Exact Worker objective"
+      - "allowed_files"
+      - "verify"
+      - "stop_if"
+      - "Deferred or blocked tasks with reasons"
+      - "New dynamic tasks to add before or after the Worker"
+    receipt:
+      result: done
+      decision: "Do the root no-write check script first. It is the safest high-confidence improvement because T002 already proved all component typechecks pass, it does not touch runtime behavior, and it gives every later slice a repeatable local gate."
+      next_allowed_task: T005
+      exact_worker_objective: "Add a root package.json check script that runs SDK, CLI, UI, cloud, and kernel TypeScript no-emit checks without writing build artifacts."
+      allowed_files:
+        - package.json
+      verify:
+        - "bun run check"
+        - "git diff -- package.json"
+      stop_if:
+        - "Need files outside package.json."
+        - "The script would run build/deploy/live-smoke commands instead of no-write checks."
+        - "bun run check fails for a reason not already understood."
+      deferred_tasks:
+        - "Repair current live UI/kernel E2E script."
+        - "Reconcile deployed-resource docs."
+        - "Add safe current live smoke harness."
+        - "Consider CI after root local gate exists."
+  - id: T005
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: default
+    objective: "Add a root package.json check script that runs SDK, CLI, UI, cloud, and kernel TypeScript no-emit checks without writing build artifacts."
+    allowed_files:
+      - package.json
+    verify:
+      - "bun run check"
+      - "git diff -- package.json"
+    stop_if:
+      - "Need files outside allowed_files."
+      - "Behavior is ambiguous or the change would alter public/deployed behavior without approval."
+      - "Verification fails twice for the same reason."
+      - "Credentials, production mutation, or destructive operations are required."
+      - "Concurrent outside changes overlap the intended edit in a way that cannot be safely merged."
+    receipt:
+      result: done
+      changed_files:
+        - package.json
+      commands:
+        - cmd: "bun run check"
+          status: pass
+        - cmd: "git diff -- package.json"
+          status: pass
+      summary: "Added a root no-write check script that runs SDK, CLI, UI, cloud, and kernel TypeScript no-emit checks. Verification passed."
+  - id: T006
+    type: judge
+    assignee: Judge
+    status: done
+    reasoning_hint: default
+    objective: "Audit the completed Worker slice and decide whether to continue, spawn new tasks, or run final audit."
+    inputs:
+      - "T005 receipt"
+      - "Current diff and verification results"
+      - "Original broad owner outcome"
+    constraints:
+      - "Do not implement."
+      - "Treat one slice as a checkpoint, not completion, unless it truly proves the whole original outcome."
+      - "If safe local follow-up work remains, create or activate the next Worker/Judge/Scout task."
+    expected_output:
+      - "slice_complete: true | false"
+      - "full_outcome_complete: true | false"
+      - "missing evidence"
+      - "next task if not complete"
+    receipt:
+      result: done
+      slice_complete: true
+      full_outcome_complete: false
+      summary: "The root check slice is complete and verified, but the broader audit/hardening outcome remains incomplete. T002/T003 found a broken current E2E path and stale deployed-resource docs; continue with the E2E repair next because it strengthens verification before docs cleanup."
+      next_task: T007
+      missing_evidence:
+        - "Current UI/kernel E2E script passing against engram-ui and engram-kernel."
+        - "Deployed-resource docs reconciled with live configs."
+        - "Final audit covering all Scout findings and Worker receipts."
+  - id: T007
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: default
+    objective: "Repair scripts/e2e-ui.ts so it targets the current engram-kernel/assets-only UI behavior instead of deleted bench-worker assumptions."
+    allowed_files:
+      - scripts/e2e-ui.ts
+    verify:
+      - "bun run --filter @engram/sdk typecheck && bun run --filter @engram/cli typecheck && bun run --filter @engram/ui-app typecheck && bun run --filter @engram/cloud-app typecheck && cd apps/kernel && bun x tsc -p tsconfig.json"
+      - "node scripts/e2e-ui.ts"
+      - "git diff -- scripts/e2e-ui.ts"
+    stop_if:
+      - "Need files outside scripts/e2e-ui.ts."
+      - "The current kernel lacks a protocol hook the script requires and the repair would need product-code changes."
+      - "The script would require owner-gated API keys or production mutations outside a throwaway test session."
+      - "Verification fails twice for the same reason."
+    receipt:
+      result: done
+      changed_files:
+        - scripts/e2e-ui.ts
+      commands:
+        - cmd: "bun run --filter @engram/sdk typecheck && bun run --filter @engram/cli typecheck && bun run --filter @engram/ui-app typecheck && bun run --filter @engram/cloud-app typecheck && cd apps/kernel && bun x tsc -p tsconfig.json"
+          status: pass
+        - cmd: "node scripts/e2e-ui.ts"
+          status: pass
+        - cmd: "git diff -- scripts/e2e-ui.ts"
+          status: pass
+      summary: "Repaired the UI/kernel E2E script for the current Engram deployment. It now defaults to engram-kernel, validates the assets-only UI shell and bundled JS E2E hook, treats the old wedgeTest hook as optional, asserts large-source socket survival instead of an obsolete ProtocolSizeError shape, clears request timers, and passes live against engram-ui/engram-kernel."
+  - id: T008
+    type: judge
+    assignee: Judge
+    status: done
+    reasoning_hint: default
+    objective: "Audit the repaired UI/kernel E2E slice and decide the next safe task."
+    inputs:
+      - "T007 receipt"
+      - "Current diff and verification results"
+      - "T001-T003 findings"
+    constraints:
+      - "Do not implement."
+      - "Treat this as a checkpoint unless the full outcome is proven complete."
+    expected_output:
+      - "slice_complete: true | false"
+      - "full_outcome_complete: true | false"
+      - "missing evidence"
+      - "next task if not complete"
+    receipt:
+      result: done
+      slice_complete: true
+      full_outcome_complete: false
+      summary: "The current UI/kernel E2E repair is complete and live-verified. The full outcome is still incomplete because the root package scripts do not expose the repaired E2E or a no-write check gate: package.json still points e2e:ui at scripts/e2e-ui.mjs and no current check script exists after concurrent package.json changes."
+      next_task: T009
+      missing_evidence:
+        - "Root package script for current no-write check."
+        - "Root package script for repaired UI/kernel E2E."
+        - "Deployed-resource docs reconciled."
+  - id: T009
+    type: worker
+    assignee: Worker
+    status: active
+    reasoning_hint: default
+    objective: "Fix root package scripts so the current no-write check and repaired UI/kernel E2E are discoverable and runnable."
+    allowed_files:
+      - package.json
+    verify:
+      - "bun run check"
+      - "bun run e2e:ui"
+      - "git diff -- package.json"
+    stop_if:
+      - "Need files outside package.json."
+      - "The package script would deploy, build artifacts unnecessarily, or require owner-gated credentials."
+      - "The E2E script itself needs more changes."
+    receipt: null
+  - id: T999
+    type: judge
+    assignee: Judge
+    status: queued
+    reasoning_hint: high
+    objective: "Final audit: decide whether the full Engram system audit and hardening tranche is complete."
+    inputs:
+      - "All done task receipts"
+      - "Last verification"
+      - "Current dirty diff"
+      - "Original user request"
+    constraints:
+      - "Do not implement."
+      - "Reject completion if required Worker work is still queued or active."
+      - "Reject completion if deployed/runtime, test/CI, or product/code correctness was not covered or explicitly blocked with evidence."
+      - "Reject completion if the broader original outcome still has safe local follow-up slices."
+    expected_output:
+      - "complete | not_complete"
+      - "full_outcome_complete: true | false"
+      - "Coverage of deployed/runtime, test/CI, and product/code correctness"
+      - "Missing evidence"
+      - "Next task if not complete"
+    receipt: null
+
+checks:
+  dirty_fingerprint: unknown
+  last_verification:
+    result: pass
+    task: T007
+    commands:
+      - "bun run --filter @engram/sdk typecheck && bun run --filter @engram/cli typecheck && bun run --filter @engram/ui-app typecheck && bun run --filter @engram/cloud-app typecheck && cd apps/kernel && bun x tsc -p tsconfig.json"
+      - "node scripts/e2e-ui.ts"
+      - "git diff -- scripts/e2e-ui.ts"
