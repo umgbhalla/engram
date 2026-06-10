@@ -21,7 +21,7 @@
 //!   0 = DONE  (result JSON is in RESULT)
 //!   1 = HOST_CALL pending (request JSON in HOSTCALL; shim must call eval_resume)
 
-use rquickjs::{Context, Ctx, Function, Runtime, Value};
+use rquickjs::{Context, Ctx, Function, Module, Object, Runtime, Value};
 use std::cell::{Cell, RefCell};
 
 thread_local! {
@@ -310,7 +310,7 @@ try {
 // Minimal non-localized-but-functional NumberFormat/DateTimeFormat/Collator/PluralRules.
 try {
   if (typeof globalThis.Intl === 'undefined') {
-    function NumberFormat(loc, opts){ this._o = opts || {}; }
+    function NumberFormat(loc, opts){ if (!(this instanceof NumberFormat)) return new NumberFormat(loc, opts); this._o = opts || {}; }
     NumberFormat.prototype.format = function(n){
       var o=this._o; n=Number(n);
       if(o.style==='percent'){ return String(n*100)+'%'; }
@@ -322,12 +322,12 @@ try {
       return s;
     };
     NumberFormat.prototype.resolvedOptions=function(){ return Object.assign({locale:'en-US',numberingSystem:'latn'}, this._o); };
-    function DateTimeFormat(loc, opts){ this._o = opts || {}; }
+    function DateTimeFormat(loc, opts){ if (!(this instanceof DateTimeFormat)) return new DateTimeFormat(loc, opts); this._o = opts || {}; }
     DateTimeFormat.prototype.format=function(d){ d=(d==null)?new Date():(d instanceof Date?d:new Date(d)); return d.toISOString(); };
     DateTimeFormat.prototype.resolvedOptions=function(){ return Object.assign({locale:'en-US',timeZone:'UTC'}, this._o); };
-    function Collator(){}
+    function Collator(loc, opts){ if (!(this instanceof Collator)) return new Collator(loc, opts); }
     Collator.prototype.compare=function(a,b){ a=String(a); b=String(b); return a<b?-1:(a>b?1:0); };
-    function PluralRules(){}
+    function PluralRules(loc, opts){ if (!(this instanceof PluralRules)) return new PluralRules(loc, opts); }
     PluralRules.prototype.select=function(n){ return Number(n)===1?'one':'other'; };
     globalThis.Intl = { NumberFormat:NumberFormat, DateTimeFormat:DateTimeFormat, Collator:Collator, PluralRules:PluralRules, getCanonicalLocales:function(l){ return Array.isArray(l)?l.slice():[l]; } };
   }
@@ -1828,8 +1828,44 @@ globalThis.__nodeCompat = {
   builtins: ['assert','buffer','crypto','events','fs','fs/promises','http','https','os','path','querystring','stream','stream/promises','string_decoder','url','util','util/types','zlib'].filter(function(v,i,a){ return a.indexOf(v) === i; }),
   globals: ['Buffer','TextEncoder','TextDecoder','URL','URLSearchParams','Headers','Request','Response','Blob','File','FormData','AbortController','AbortSignal','structuredClone','crypto','fetch','queueMicrotask','setTimeout','setImmediate','process','console','performance'],
   stdlib: ['fs (in-heap VFS, sync + promises + createReadStream/createWriteStream + readdir withFileTypes Dirent)', 'path (full posix)', 'stream (Readable/Writable/Duplex/Transform/PassThrough + pipeline/finished)', 'util.inspect/format/types/promisify', 'assert (structural deepStrictEqual)', 'Buffer (full read/write matrix)', 'crypto (randomBytes/randomUUID/randomInt + createHash sha256|sha1|md5 + createHmac + scryptSync)', 'zlib (gzip/gunzip/deflate/inflate sync+async; pure-JS DEFLATE; NO brotli)', 'url (legacy parse/format/resolve + WHATWG URL/URLSearchParams)', 'http/https (CLIENT request/get over host.fetch; NO server)', 'WHATWG fetch: fetch()->Response + Request/Response/Headers/Blob/File/FormData/AbortController'],
-  use: "await use('pkgname') — fetch+eval a self-contained CJS/UMD npm bundle from a CDN (esm.sh ?bundle&cjs, then jsDelivr). Async; pin a version with use('pkg@1.2.3'); override the URL with use('pkg', {url}). ESM-only packages surface an actionable error suggesting the esm.sh ?bundle CJS build. Use this for any npm package not in builtins.",
-  excluded: ['net','tls','http-server','https-server','child_process','cluster','worker_threads','dgram','v8','vm','repl'],
+  use: "await use('pkgname') — fetch+eval a self-contained npm bundle from a CDN. CJS-first (esm.sh ?bundle&cjs, then jsDelivr/unpkg); an ESM-only package is now loaded for real via the ESM-as-Module path (esm.sh ?bundle is declared+evaluated as a QuickJS Module and its namespace is returned). Async; pin a version with use('pkg@1.2.3'); override the URL with use('pkg', {url}). Use this for any npm package not in builtins.",
+  // IMPLEMENTATION-TRUTH exclusion list: ONLY intrinsically-impossible modules. vm/dns/perf_hooks/
+  // module are SHIMMED (see __builtins) and were wrongly listed before. Anything here throws a
+  // uniform NotSupportedError from require() with the constraint + the alternative.
+  excluded: ['net','tls','http-server','https-server','child_process','cluster','worker_threads','dgram','v8','inspector','repl'],
+  // Machine-readable capability manifest an agent can read to plan without trial-and-error.
+  // available: fully-working builtins. degraded: present but with a documented limitation.
+  // excludedReasons: intrinsically-unavailable modules + WHY + the alternative to use instead.
+  get capabilities(){
+    var B = globalThis.__builtins || {};
+    var avail = Object.keys(B).filter(function(k){ return k.indexOf('node:') !== 0 && k.indexOf('/') < 0; }).sort();
+    return {
+      available: avail,
+      degraded: {
+        'http/https': 'CLIENT-ONLY over the mediated host.fetch; createServer throws NotSupportedError (no listen).',
+        'dns': 'resolves over DNS-over-HTTPS (cloudflare-dns.com via host.fetch), not a real resolver; needs the host on the fetch allowlist.',
+        'zlib': 'pure-JS gzip/deflate/raw (sync + microtask-async); brotli* throws NotSupportedError (no static dictionary).',
+        'crypto': 'createHash supports sha256/sha1/md5 only; randomBytes/randomUUID/randomInt are SEEDED (deterministic), not CSPRNG.',
+        'fs': 'in-heap virtual filesystem (durable across hibernate), NOT the host disk.',
+        'vm': 'single QuickJS realm; runInNewContext injects ctx keys as fn args — NO security/context isolation boundary.',
+        'perf_hooks': 'performance over the SEEDED monotone clock; PerformanceObserver is a no-op.',
+        'timers': 'setTimeout/setImmediate fire on the microtask queue ignoring the delay; setInterval is a no-op (no wall clock).',
+      },
+      excludedReasons: {
+        'net': 'raw TCP sockets — no networking primitives in the isolate. Alternative: fetch()/http(s) client over the mediated host.fetch.',
+        'tls': 'raw TLS sockets — no networking primitives. Alternative: https client over host.fetch.',
+        'dgram': 'UDP sockets — no networking primitives. No alternative.',
+        'http-server': 'cannot listen() — this is a compute + mediated-fetch sandbox, not a server. Alternative: http/https CLIENT request/get.',
+        'https-server': 'cannot listen(). Alternative: http/https CLIENT.',
+        'child_process': 'no process spawning in the isolate. Alternative: do the work in-VM or via host.fetch to a service.',
+        'cluster': 'no multi-process. Alternative: none (single-threaded deterministic VM).',
+        'worker_threads': 'no threads (single-threaded WASM). Alternative: none.',
+        'v8': 'no V8 engine internals (this is QuickJS). Alternative: none.',
+        'inspector': 'no debugging inspector protocol. Alternative: console.* + structured value previews.',
+        'repl': 'the kernel IS the REPL; nesting a node REPL is unsupported. Alternative: eval cells directly.',
+      },
+    };
+  },
   caveats: [
     'Deterministic sandbox: Date.now()/Math.random() are SEEDED (reproducible across restore), not wall-clock/entropy.',
     'Timers are IMMEDIATE: setTimeout/setImmediate fire on the microtask queue ignoring the delay; setInterval is a no-op. No wall-clock timers.',
@@ -1859,11 +1895,21 @@ globalThis.require = function(name){
   var base = n.split('/').pop();
   if (globalThis.__mods[base] !== undefined) return globalThis.__mods[base];
   var avail = Object.keys(globalThis.__builtins).filter(function(k){ return k.indexOf('node:') !== 0 && k.indexOf('/') < 0; }).sort().join(', ');
-  var excluded = (globalThis.__nodeCompat && globalThis.__nodeCompat.excluded) || [];
-  var hint = excluded.indexOf(n) >= 0
-    ? " — module '" + n + "' is architecturally EXCLUDED from this deterministic sandbox (no networking/process/threads). See globalThis.__nodeCompat.caveats."
-    : " — not a built-in. Available builtins: [" + avail + "]. For an npm package, `await use('" + base + "')` it first (the VM cannot synchronously fetch).";
-  throw new Error("require('" + raw + "')" + hint);
+  var nc = globalThis.__nodeCompat || {};
+  var excluded = nc.excluded || [];
+  if (excluded.indexOf(n) >= 0) {
+    // UNIFORM excluded-module shape: a NotSupportedError naming the constraint + the alternative,
+    // pulled from the machine-readable capability manifest so the message matches __nodeCompat.
+    var reason = (nc.capabilities && nc.capabilities.excludedReasons && nc.capabilities.excludedReasons[n])
+      || 'intrinsically unavailable in this deterministic single-threaded sandbox (no networking/process/threads).';
+    var err = new Error("require('" + raw + "'): module '" + n + "' is not supported — " + reason);
+    err.name = 'NotSupportedError';
+    err.code = 'ERR_NOT_SUPPORTED';
+    throw err;
+  }
+  var e2 = new Error("require('" + raw + "'): not a built-in. Available builtins: [" + avail + "]. For an npm package, `await use('" + base + "')` it first (the VM cannot synchronously fetch).");
+  e2.code = 'MODULE_NOT_FOUND';
+  throw e2;
 };
 
 // ===== IN-HEAP VIRTUAL FILESYSTEM — a SYNCHRONOUS, Node-like `fs` =====
@@ -2094,6 +2140,64 @@ globalThis.use = async function(name, opts){
     // frame cannot parse. Surface an ACTIONABLE error naming the cause + the esm.sh ?bundle fix.
     var isEsm = /\b(export\s+(default|const|function|class|\{|\*)|import\s+[\s\S]*?from|import\s*\()/.test(src);
     if (isEsm) {
+      // REAL ESM-as-Module path (Design A): the fetched bundle is genuine ESM (export/import
+      // syntax) that the CJS frame cannot parse. esm.sh ?bundle inlines the entire dep graph,
+      // so it is import-free and can be declared+evaluated as a self-contained QuickJS Module
+      // via the native __esmEval. We fetch the ESM build (NO &cjs), follow the one-hop esm.sh
+      // facade `export * from "/...bundle.mjs"`, eval it, and read the live namespace off
+      // globalThis.__esm. This survives snapshot (heap object) and is cached in __mods so a
+      // cold wake / require() resolves with no re-fetch. Additive: only reached after the
+      // CJS-first path fails, so packages that work today are UNAFFECTED.
+      if (typeof globalThis.__esmEval === 'function') {
+        try {
+          var esmSrc = src;
+          // facade hop: a 3-line `export * from "/pkg@ver/es2022/name.bundle.mjs"` points at the
+          // truly inlined file. Follow exactly one hop to the deep import-free bundle.
+          var facade = esmSrc.match(/export\s*\*\s*from\s*["']([^"']+\.m?js)["']\s*;?/);
+          if (facade && facade[1] && /^\//.test(facade[1]) && esmSrc.replace(/\s+/g,'').length < 400) {
+            var deepUrl = 'https://esm.sh' + facade[1];
+            var rf = await globalThis.host.fetch(deepUrl);
+            if (rf && rf.ok) { esmSrc = decodeFull(rf); usedUrl = deepUrl; }
+          }
+          var esmName = 'esm:' + name;
+          var statusJson = globalThis.__esmEval(esmName, esmSrc);
+          var status = JSON.parse(statusJson);
+          if (status && status.ok) {
+            var ns = (globalThis.__esm && globalThis.__esm[esmName]) || undefined;
+            if (ns !== undefined) {
+              // Materialize a PLAIN-OBJECT copy of the namespace's own-enumerable exports. The live
+              // QuickJS module-namespace is a FROZEN exotic object backed by the module's environment
+              // record; that exotic does NOT reliably survive the W4 byte-delta heap snapshot the way
+              // a plain object does (verified: a live namespace was dropped on cold-restore while a
+              // plain CJS object persisted). Copying into a plain object (live-binding getters
+              // resolve to their now-final values for an import-free bundle) makes the loaded module
+              // durable across hibernate/cold-restore exactly like a CJS use(). We DELETE the exotic
+              // from __esm afterward so nothing un-snapshottable lingers in the heap.
+              var val0 = {};
+              try {
+                var ks = Object.keys(ns);
+                for (var ki = 0; ki < ks.length; ki++) { val0[ks[ki]] = ns[ks[ki]]; }
+                // include a `default` export if present but non-enumerable on the namespace.
+                if (val0.default === undefined) { try { var d = ns.default; if (d !== undefined) val0.default = d; } catch(_d){} }
+              } catch(__ce){ val0 = ns; /* fall back to the live namespace if copy fails */ }
+              // If the only meaningful export is `default` (CJS-interop default), expose it directly
+              // so `(await use('pkg'))` is the value, matching CJS use() ergonomics.
+              var ok2 = Object.keys(val0);
+              if (ok2.length === 1 && ok2[0] === 'default' && val0.default && (typeof val0.default === 'object' || typeof val0.default === 'function')) {
+                val0 = val0.default;
+              }
+              try { if (globalThis.__esm) delete globalThis.__esm[esmName]; } catch(_de){}
+              globalThis.__mods[name] = val0;
+              var baseE = String(name).split('@')[0].split('/').pop();
+              if (baseE && globalThis.__mods[baseE] === undefined) globalThis.__mods[baseE] = val0;
+              return val0;
+            }
+          } else if (status && status.error) {
+            // remember the engine-side reason; fall through to the regex transform, then error.
+            lastErr = new Error(status.error);
+          }
+        } catch(__ee){ lastErr = __ee; /* fall through to regex transform / actionable error */ }
+      }
       // LAST-RESORT best-effort ESM->CJS transform. esm.sh ?bundle inlines deps, so the source is
       // usually import-free; rewrite export forms to module.exports and re-eval in the CJS frame.
       try {
@@ -2113,7 +2217,7 @@ globalThis.use = async function(name, opts){
           return val2;
         }
       } catch(__et){ /* fall through to the actionable error */ }
-      throw new Error('use("' + name + '"): the bundle from ' + usedUrl + ' is ES MODULE syntax (export/import), which this CJS loader cannot eval (best-effort export->CJS transform also failed). Retry with a CJS build: use("' + name + '", { url: "https://esm.sh/' + name + '?bundle&cjs" }), or pick a package that ships a UMD/CJS bundle.');
+      throw new Error('use("' + name + '"): the bundle from ' + usedUrl + ' is ES MODULE syntax (export/import). The real ESM-as-Module path' + (lastErr ? ' failed (' + (lastErr.message || lastErr) + ')' : ' was unavailable') + ' and the best-effort export->CJS transform also failed. Likely a residual peer/import not inlined by esm.sh ?bundle. Retry pinning a version use("' + name + '@x.y.z"), force a peer with the esm.sh &deps= URL via use("' + name + '", { url }), or pick a package that ships a self-contained bundle.');
     }
     throw new Error('use("' + name + '"): bundle from ' + usedUrl + ' failed to compile: ' + (e && e.message || e));
   }
@@ -2293,6 +2397,73 @@ fn inject_host_fns(ctx: &Ctx) {
     })
     .unwrap();
     g.set("__hostCall", hostcall).unwrap();
+
+    // __esmEval(name, src): declare+evaluate a SELF-CONTAINED ESM source (no remaining
+    // `import`s — esm.sh ?bundle inlines the whole dep graph) as a real QuickJS Module,
+    // settle its evaluation promise (incl. any top-level await that resolves purely in-VM),
+    // and stash the live module namespace on globalThis.__esm[name]. Returns a small JSON
+    // status string: {"ok":true} or {"ok":false,"error":"..."}. Never panics. Adds zero
+    // entropy (compilation is pure; the only nondeterminism — the network fetch — already
+    // happened in JS through the mediated host.fetch and is oplog-recorded). The namespace
+    // object lives in the heap -> snapshot-persists like every other value, no re-fetch on
+    // cold restore.
+    let esm_eval = Function::new(ctx.clone(), |ctx: Ctx<'_>, name: String, src: String| -> String {
+        // declare (compile-only)
+        let decl = match Module::declare(ctx.clone(), name.clone(), src) {
+            Ok(d) => d,
+            Err(_) => return esm_err(&ctx, "declare"),
+        };
+        // evaluate -> (module, promise)
+        let (module, promise) = match decl.eval() {
+            Ok(t) => t,
+            Err(_) => return esm_err(&ctx, "eval"),
+        };
+        // settle: finish() drives the job queue until resolve/reject. A self-contained
+        // bundle never parks on a host call, so WouldBlock here means an unresolved
+        // top-level await / residual import we cannot satisfy without a loader.
+        match promise.finish::<()>() {
+            Ok(()) => {}
+            Err(rquickjs::Error::WouldBlock) => {
+                return esm_err_msg("ESM top-level await did not settle in-VM (residual async/import; the bundle is not self-contained)");
+            }
+            Err(_) => return esm_err(&ctx, "module top-level"),
+        }
+        // read the live namespace and stash it on globalThis.__esm[name]
+        let ns: Object = match module.namespace() {
+            Ok(n) => n,
+            Err(_) => return esm_err(&ctx, "namespace"),
+        };
+        let g = ctx.globals();
+        let esm_reg: Object = match g.get::<_, Object>("__esm") {
+            Ok(o) => o,
+            Err(_) => {
+                let o = Object::new(ctx.clone()).unwrap();
+                let _ = g.set("__esm", o.clone());
+                o
+            }
+        };
+        if esm_reg.set(name.as_str(), ns).is_err() {
+            return esm_err_msg("failed to stash module namespace");
+        }
+        String::from("{\"ok\":true}")
+    })
+    .unwrap();
+    g.set("__esmEval", esm_eval).unwrap();
+}
+
+// Build a typed JSON error string for __esmEval, draining the pending QuickJS exception
+// (mirrors the eval error frame). Never panics.
+fn esm_err(ctx: &Ctx, phase: &str) -> String {
+    let msg = ctx
+        .catch()
+        .as_exception()
+        .and_then(|e| e.message())
+        .unwrap_or_else(|| "unknown error".into());
+    esm_err_msg(&format!("{} error: {}", phase, msg))
+}
+
+fn esm_err_msg(msg: &str) -> String {
+    format!("{{\"ok\":false,\"error\":{}}}", json_str(msg))
 }
 
 fn build_runtime() -> (Runtime, Context) {
