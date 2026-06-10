@@ -28,3 +28,6 @@ scratch/
 .claude/
 v1-spike-ws/
 v1-spike-wasm/
+
+# Alchemy IaC local state
+.alchemy/

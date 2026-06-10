@@ -25,12 +25,16 @@
  */
 import alchemy from "alchemy";
 import { AnalyticsEngineDataset, DurableObjectNamespace, R2Bucket, Worker } from "alchemy/cloudflare";
+import { R2RestStateStore } from "alchemy/state";
 
 const app = await alchemy("engram-kernel", {
   // Encrypts secrets in the Alchemy state file. Override in CI/prod via env.
   password: process.env.ALCHEMY_PASSWORD ?? "dev-only-password",
   // ALCHEMY_LOCAL=1 keeps every resource off the network (in-memory IaC shape).
   local: process.env.ALCHEMY_LOCAL === "1" || undefined,
+  // State lives in R2 (not local .alchemy files) so the IaC state is durable + shareable.
+  // Bucket must already exist (created out-of-band: `wrangler r2 bucket create engram-alchemy-state`).
+  stateStore: (scope) => new R2RestStateStore(scope, { bucketName: "engram-alchemy-state", prefix: "engram-kernel/" }),
 });
 
 // ---- Durable Object ---------------------------------------------------------
@@ -52,7 +56,13 @@ export const worker = await Worker("engram-kernel", {
   name: "engram-kernel",
   adopt: true,
   entrypoint: "./entry.ts",
-  url: false,
+  // workers.dev route ON (the SDK/CLI connect over wss://engram-kernel.<sub>.workers.dev).
+  // Setting this false disables the subdomain route and breaks every client. Keep true.
+  url: true,
+  // Custom domain: SDK/CLI can also connect over wss://engram.umgbhalla.xyz. The zone lives on
+  // this account; Alchemy auto-resolves it and provisions the worker custom-domain (DNS + edge cert).
+  // Requires the API token to have Workers Routes + Zone DNS edit on the umgbhalla.xyz zone.
+  domains: ["engram.umgbhalla.xyz"],
   compatibilityDate: "2025-05-01",
   compatibilityFlags: ["nodejs_compat"],
   observability: { enabled: true },
