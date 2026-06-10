@@ -15,8 +15,8 @@ Engram is a Bun-workspace monorepo (`apps/*` + `packages/*`). The on-disk folder
 | `engram-ui` | The notebook SPA (Vite + TypeScript), served via Workers Assets. [Live demo →](https://engram-ui.umg-bhalla88.workers.dev) |
 | `engram-docs` | This documentation site (Astro Starlight, static, Workers Assets). |
 
-Supporting Cloudflare resources: R2 `montydyn-snapshots` (large-image overflow) and Analytics
-Engine dataset `montydyn_kernel` (per-op telemetry). Worker Loader and facets require the Workers
+Supporting Cloudflare resources: R2 `engram-snapshots` (large-image overflow) and Analytics
+Engine dataset `engram_kernel` (per-op telemetry). Worker Loader and facets require the Workers
 **Paid** plan.
 
 ## Packages

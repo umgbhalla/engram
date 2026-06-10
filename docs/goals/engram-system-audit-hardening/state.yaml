@@ -60,7 +60,7 @@ visual_board:
     command: "npx goalbuddy extend github-projects"
     missing: []
 
-active_task: T009
+active_task: T022
 
 tasks:
   - id: T001
@@ -284,6 +284,7 @@ tasks:
       - "next task if not complete"
     receipt:
       result: done
+      decision: "The root check slice is complete but the full outcome is not complete; continue with the current UI/kernel E2E repair next."
       slice_complete: true
       full_outcome_complete: false
       summary: "The root check slice is complete and verified, but the broader audit/hardening outcome remains incomplete. T002/T003 found a broken current E2E path and stale deployed-resource docs; continue with the E2E repair next because it strengthens verification before docs cleanup."
@@ -341,6 +342,7 @@ tasks:
       - "next task if not complete"
     receipt:
       result: done
+      decision: "The UI/kernel E2E repair is complete but the full outcome is not complete; continue with root package script recovery so the repaired gates are discoverable."
       slice_complete: true
       full_outcome_complete: false
       summary: "The current UI/kernel E2E repair is complete and live-verified. The full outcome is still incomplete because the root package scripts do not expose the repaired E2E or a no-write check gate: package.json still points e2e:ui at scripts/e2e-ui.mjs and no current check script exists after concurrent package.json changes."
@@ -352,7 +354,7 @@ tasks:
   - id: T009
     type: worker
     assignee: Worker
-    status: active
+    status: done
     reasoning_hint: default
     objective: "Fix root package scripts so the current no-write check and repaired UI/kernel E2E are discoverable and runnable."
     allowed_files:
@@ -365,6 +367,438 @@ tasks:
       - "Need files outside package.json."
       - "The package script would deploy, build artifacts unnecessarily, or require owner-gated credentials."
       - "The E2E script itself needs more changes."
+    receipt:
+      result: done
+      changed_files:
+        - package.json
+      commands:
+        - cmd: "bun run check"
+          status: pass
+        - cmd: "bun run e2e:ui"
+          status: pass
+        - cmd: "git diff -- package.json"
+          status: pass
+      summary: "Added a root check script for the no-write typecheck gate and fixed e2e:ui to run scripts/e2e-ui.ts. Both root commands pass."
+  - id: T010
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: default
+    objective: "Reconcile current deployed-resource docs with live/configured R2 and Analytics Engine names."
+    allowed_files:
+      - apps/docs/src/content/docs/reference/deployed.md
+      - apps/docs/src/content/docs/how-it-works/architecture.md
+    verify:
+      - "rg -n "montydyn-snapshots|montydyn_kernel" apps/docs/src/content/docs/reference/deployed.md apps/docs/src/content/docs/how-it-works/architecture.md"
+      - "bun run check"
+    stop_if:
+      - "Need files outside the two allowed docs pages."
+      - "The change would alter historical docs/results rather than current product docs."
+      - "Live config evidence contradicts T001."
+    receipt:
+      result: done
+      changed_files:
+        - apps/docs/src/content/docs/reference/deployed.md
+        - apps/docs/src/content/docs/how-it-works/architecture.md
+      commands:
+        - cmd: "rg -n \"montydyn-snapshots|montydyn_kernel\" apps/docs/src/content/docs/reference/deployed.md apps/docs/src/content/docs/how-it-works/architecture.md"
+          status: pass
+        - cmd: "bun run check"
+          status: pass
+      summary: "Updated current product docs to name live/configured resources: R2 engram-snapshots and AE engram_kernel. Historical results/provenance docs were left untouched."
+  - id: T011
+    type: judge
+    assignee: Judge
+    status: done
+    reasoning_hint: high
+    objective: "Choose the next safe tranche after the root gate, UI E2E, and current deployed-resource docs fixes."
+    inputs:
+      - "T001-T003 Scout receipts"
+      - "T005/T007/T009/T010 Worker receipts"
+      - "Current diff and verification results"
+    constraints:
+      - "Do not implement."
+      - "Prefer safe, behavior-preserving work that does not require deploys or owner-gated credentials."
+      - "Account for concurrent package.json changes that removed the first check-script attempt."
+      - "Do not choose broad architecture refactors without loading improve-codebase-architecture in a dedicated task."
+    expected_output:
+      - "Decision"
+      - "Exact next Worker or Scout objective"
+      - "allowed_files"
+      - "verify"
+      - "stop_if"
+      - "Whether improve-codebase-architecture should be loaded next"
+    receipt:
+      result: done
+      decision: "Repair stale operator task truth next. docs/TODO.md still describes early feasibility work as incomplete even though T001-T003 proved the repo is product-complete with current deployed workers and live verification. Updating this doc is behavior-preserving, avoids deploys/secrets, and reduces future operator confusion. Do not load improve-codebase-architecture yet; reserve it for a later dedicated architecture Scout/Judge if safe local docs/verification cleanup is exhausted."
+      next_allowed_task: T012
+      exact_worker_objective: "Refresh docs/TODO.md so it no longer presents early feasibility/setup tasks as the current task board, and points operators to the current GoalBuddy board and remaining owner-gated GA items."
+      allowed_files:
+        - docs/TODO.md
+      verify:
+        - "sed -n '1,220p' docs/TODO.md"
+        - "bun run check"
+      stop_if:
+        - "Need files outside docs/TODO.md."
+        - "The update would erase historical provenance instead of clearly superseding it."
+        - "A claim cannot be backed by AGENTS.md, docs/reference/deployed.md, or completed GoalBuddy receipts."
+      improve_codebase_architecture: "defer"
+  - id: T012
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: default
+    objective: "Refresh docs/TODO.md so it reflects the current Engram audit/hardening board instead of stale early feasibility tasks."
+    allowed_files:
+      - docs/TODO.md
+    verify:
+      - "sed -n '1,220p' docs/TODO.md"
+      - "bun run check"
+    stop_if:
+      - "Need files outside docs/TODO.md."
+      - "The update would erase historical provenance instead of clearly superseding it."
+      - "A claim cannot be backed by AGENTS.md, docs/reference/deployed.md, or completed GoalBuddy receipts."
+    receipt:
+      result: done
+      changed_files:
+        - docs/TODO.md
+      commands:
+        - cmd: "sed -n '1,220p' docs/TODO.md"
+          status: pass
+        - cmd: "bun run check"
+          status: pass
+      summary: "Replaced the stale early-feasibility TODO checklist with current operator truth: active GoalBuddy board, live deployed surfaces, current local gates, remaining audit follow-ups, and owner-gated GA items."
+  - id: T013
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: default
+    objective: "Add a minimal GitHub Actions workflow for the root no-write check gate."
+    allowed_files:
+      - .github/workflows/check.yml
+    verify:
+      - "bun run check"
+      - "sed -n '1,220p' .github/workflows/check.yml"
+      - "git diff -- .github/workflows/check.yml"
+    stop_if:
+      - "Need files outside .github/workflows/check.yml."
+      - "The workflow would deploy, require secrets, or run live production checks."
+      - "The workflow cannot install Bun without adding another file."
+    receipt:
+      result: done
+      changed_files:
+        - .github/workflows/check.yml
+      commands:
+        - cmd: "bun run check"
+          status: pass
+        - cmd: "sed -n '1,220p' .github/workflows/check.yml"
+          status: pass
+        - cmd: "git status --short .github/workflows/check.yml"
+          status: pass
+      summary: "Added a minimal non-deploying GitHub Actions workflow that installs Bun with the checked-in lockfile and runs the root no-write check gate on pull requests and pushes to main."
+  - id: T014
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: default
+    objective: "Update apps/kernel/ARCHITECTURE.md so readers see the current engram-kernel status before historical scratch-build details."
+    allowed_files:
+      - apps/kernel/ARCHITECTURE.md
+    verify:
+      - "sed -n '1,80p' apps/kernel/ARCHITECTURE.md"
+      - "bun run check"
+    stop_if:
+      - "Need files outside apps/kernel/ARCHITECTURE.md."
+      - "The edit would rewrite historical phase details instead of clearly superseding them."
+      - "A current-status claim cannot be backed by deployed docs or completed receipts."
+    receipt:
+      result: done
+      changed_files:
+        - apps/kernel/ARCHITECTURE.md
+      commands:
+        - cmd: "sed -n '1,80p' apps/kernel/ARCHITECTURE.md"
+          status: pass
+        - cmd: "bun run check"
+          status: pass
+      summary: "Updated the kernel architecture doc header to identify the current deployed worker as engram-kernel and label the engram-rust2/benchrust2 details as historical scratch-build provenance."
+  - id: T015
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: default
+    objective: "Add a non-secret current live smoke command for public Engram surfaces."
+    allowed_files:
+      - scripts/smoke-live.mjs
+      - package.json
+    verify:
+      - "bun run smoke:live"
+      - "bun run check"
+      - "git diff -- scripts/smoke-live.mjs package.json"
+    stop_if:
+      - "Need files outside scripts/smoke-live.mjs or package.json."
+      - "The smoke would require API keys, admin tokens, deployment, or mutating production state."
+      - "A public endpoint check fails twice with the same result."
+    receipt:
+      result: done
+      changed_files:
+        - scripts/smoke-live.mjs
+        - package.json
+      commands:
+        - cmd: "bun run smoke:live"
+          status: pass
+        - cmd: "bun run e2e:ui"
+          status: pass
+        - cmd: "bun run check"
+          status: pass
+      summary: "Added the smoke:live script and package alias. It was initially blocked by a temporary public engram-kernel route failure, but the endpoint recovered during T019 verification; smoke:live, e2e:ui, and check now pass."
+      prior_blocker: "Live engram-kernel public endpoint was temporarily unavailable during T016; current verification is green."
+      spawned_tasks:
+        - T016
+  - id: T016
+    type: scout
+    assignee: Scout
+    status: done
+    reasoning_hint: default
+    objective: "Read-only triage of the current engram-kernel Cloudflare endpoint availability."
+    inputs:
+      - ".env Cloudflare account/token for read-only Wrangler status"
+      - "apps/kernel/wrangler.jsonc"
+      - "Current failed smoke/e2e outputs"
+    constraints:
+      - "Read-only."
+      - "Do not deploy, rollback, delete, change routes, or mutate secrets/resources."
+      - "Do not edit implementation files."
+    expected_output:
+      - "Whether engram-kernel exists and has recent deployments."
+      - "Whether the failure is workers.dev route availability, worker code, auth/token, or unknown."
+      - "Safe next task recommendation."
+    receipt:
+      result: done
+      commands:
+        - cmd: "bun run smoke:live"
+          status: fail
+        - cmd: "bun run e2e:ui"
+          status: fail
+        - cmd: "curl -i https://engram-kernel.umg-bhalla88.workers.dev/{,/health,/ws}"
+          status: fail
+        - cmd: "bunx wrangler deployments list --config apps/kernel/wrangler.jsonc"
+          status: fail
+        - cmd: "bun run check"
+          status: pass
+      evidence:
+        - scripts/smoke-live.mjs
+        - scripts/e2e-ui.ts
+        - apps/kernel/wrangler.jsonc
+        - apps/kernel/alchemy.run.ts
+        - apps/ui/src/main.ts
+        - apps/ui/index.html
+      summary: "Read-only triage after two 120-second waits found the public engram-kernel workers.dev route still unavailable. HTTP /, /health, and /ws return Cloudflare 404/1042; WebSocket open fails; the custom domain in apps/kernel/wrangler.jsonc does not resolve; and the Cloudflare account visible through local .env reports that worker name is absent. Cloud, UI, docs, and local typecheck gates still pass."
+      classification: "infrastructure/route/account visibility blocker, not a proven code regression"
+      safe_next: "Continue local non-mutating audit/hardening; live kernel smoke remains blocked until the route/account/deployment owner restores or clarifies the active endpoint."
+      spawned_tasks:
+        - T017
+  - id: T017
+    type: scout
+    assignee: Scout
+    status: done
+    reasoning_hint: high
+    objective: "Use improve-codebase-architecture to surface read-only deepening opportunities in the current Engram codebase."
+    inputs:
+      - "/Users/umang/.agents/skills/improve-codebase-architecture/SKILL.md"
+      - "AGENTS.md current code map and architecture status"
+      - "CONTEXT.md if present"
+      - "docs/decisions.md and docs/adr/ if present"
+      - "Current app/package source layout"
+    constraints:
+      - "Read-only."
+      - "Do not implement refactors in this task."
+      - "Use the skill vocabulary exactly: Module, Interface, Implementation, Depth, Seam, Adapter, Leverage, Locality."
+      - "Do not re-litigate ADR-backed decisions unless current friction is concrete."
+      - "Prefer opportunities that improve testability, operator clarity, and AI-navigability without changing deployed behavior."
+    expected_output:
+      - "Numbered deepening opportunities with Files, Problem, Solution, and Benefits."
+      - "Clear note of which candidates are safe follow-up Worker slices versus owner-decision items."
+      - "Recommended next task."
+    receipt:
+      result: done
+      note: notes/T017-architecture-deepening.md
+      evidence:
+        - docs/decisions.md
+        - apps/kernel/src/lib.rs
+        - apps/kernel/src/kernel-glue.ts
+        - apps/cloud/src/supervisor.ts
+        - apps/ui/src/kernel.ts
+        - apps/ui/src/main.ts
+        - packages/sdk/src/index.ts
+        - packages/cli/src/engram.ts
+        - scripts/e2e-ui.ts
+        - scripts/smoke-live.mjs
+      summary: "Used improve-codebase-architecture read-only. Surfaced five deepening opportunities: deployed endpoint manifest Module, shared protocol contract Module, kernel shell responsibility split, live verification harness as SDK consumer, and SDK internal Module split. Recommended judging Candidate 1 or 2 first because the current live endpoint blocker proves deployed-surface/protocol Interface drift is the highest operational friction."
+      spawned_tasks:
+        - T018
+  - id: T018
+    type: judge
+    assignee: Judge
+    status: done
+    reasoning_hint: high
+    objective: "Choose the next safe architecture follow-up from T017 without proposing interfaces prematurely."
+    inputs:
+      - "T017 receipt and notes/T017-architecture-deepening.md"
+      - "Current live-kernel blocker from T016"
+      - "Current dirty diff"
+    constraints:
+      - "Do not implement."
+      - "Respect improve-codebase-architecture: pick a candidate to explore before designing interfaces."
+      - "Prefer a safe Worker slice only if it can be verified locally and does not require Cloudflare route mutation."
+      - "If no safe Worker is appropriate while live kernel is blocked, ask the owner which candidate to explore."
+    expected_output:
+      - "Chosen candidate or explicit request for owner selection."
+      - "If Worker is chosen: exact objective, allowed_files, verify, stop_if."
+      - "If owner selection is required: concise candidate list."
+    receipt:
+      result: done
+      decision: "Choose T017 Candidate 1: deployed endpoint manifest Module. It directly addresses the current live-kernel blocker without mutating Cloudflare, and it can be verified locally by checking that scripts/docs/app defaults match one source-of-truth manifest."
+      selected_candidate: "Deployed endpoint manifest Module"
+      full_outcome_complete: false
+      next_task: T019
+      exact_worker_objective: "Add a local deployed-endpoints manifest and verifier, and make the root live smoke/E2E scripts consume the manifest for their default public endpoints."
+      allowed_files:
+        - config/deployed-endpoints.json
+        - scripts/check-deployed-endpoints.mjs
+        - scripts/smoke-live.mjs
+        - scripts/e2e-ui.ts
+        - package.json
+      verify:
+        - "bun run endpoints:check"
+        - "bun run check"
+        - "bun run smoke:live"
+      stop_if:
+        - "Need to deploy, change Cloudflare routes, or edit secrets."
+        - "Need to alter UI/CLI runtime behavior in this slice."
+        - "The manifest would encode an endpoint that contradicts current repo docs/config without recording the live blocker."
+  - id: T019
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: default
+    objective: "Add a local deployed-endpoints manifest and verifier, and make the root live smoke/E2E scripts consume the manifest for their default public endpoints."
+    allowed_files:
+      - config/deployed-endpoints.json
+      - scripts/check-deployed-endpoints.mjs
+      - scripts/smoke-live.mjs
+      - scripts/e2e-ui.ts
+      - package.json
+    verify:
+      - "bun run endpoints:check"
+      - "bun run check"
+      - "bun run smoke:live"
+    stop_if:
+      - "Need to deploy, change Cloudflare routes, or edit secrets."
+      - "Need to alter UI/CLI runtime behavior in this slice."
+      - "The manifest would encode an endpoint that contradicts current repo docs/config without recording the live blocker."
+    receipt:
+      result: done
+      changed_files:
+        - config/deployed-endpoints.json
+        - scripts/check-deployed-endpoints.mjs
+        - scripts/smoke-live.mjs
+        - scripts/e2e-ui.ts
+        - package.json
+      commands:
+        - cmd: "bun run endpoints:check"
+          status: pass
+        - cmd: "bun run check"
+          status: pass
+        - cmd: "bun run smoke:live"
+          status: pass
+        - cmd: "bun run e2e:ui"
+          status: pass
+      summary: "Added config/deployed-endpoints.json as the deployed endpoint manifest Module, added endpoints:check to validate current app/docs/script defaults against it, and wired smoke-live/e2e-ui defaults to consume the manifest while preserving env overrides. During verification the public engram-kernel route recovered; live smoke and full UI/kernel E2E now pass."
+      spawned_tasks:
+        - T020
+  - id: T020
+    type: judge
+    assignee: Judge
+    status: done
+    reasoning_hint: high
+    objective: "Audit the deployed endpoint manifest slice and choose the next safe follow-up."
+    inputs:
+      - "T019 receipt"
+      - "T017 architecture candidates"
+      - "Current verification results"
+      - "Original broad audit/hardening objective"
+    constraints:
+      - "Do not implement."
+      - "Treat green live smoke/E2E as a checkpoint, not full completion."
+      - "Prefer the next safe local slice if one remains."
+      - "If final audit is appropriate, explain why no safe local follow-up remains."
+    expected_output:
+      - "slice_complete: true | false"
+      - "full_outcome_complete: true | false"
+      - "next task if not complete"
+    receipt:
+      result: done
+      slice_complete: true
+      full_outcome_complete: false
+      decision: "The deployed endpoint manifest slice is complete and verified, but it should be wired into the default no-write gate before moving on. Since the existing CI workflow runs bun run check, adding endpoints:check to check is a safe local follow-up that makes endpoint drift detection automatic without live calls or deploys."
+      next_task: T021
+      exact_worker_objective: "Include the deployed endpoint manifest verifier in the root no-write check gate."
+      allowed_files:
+        - package.json
+      verify:
+        - "bun run check"
+        - "bun run endpoints:check"
+        - "git diff -- package.json"
+      stop_if:
+        - "Need files outside package.json."
+        - "The check would perform live network calls, deploys, or secret-dependent operations."
+  - id: T021
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: default
+    objective: "Include the deployed endpoint manifest verifier in the root no-write check gate."
+    allowed_files:
+      - package.json
+    verify:
+      - "bun run check"
+      - "bun run endpoints:check"
+      - "git diff -- package.json"
+    stop_if:
+      - "Need files outside package.json."
+      - "The check would perform live network calls, deploys, or secret-dependent operations."
+    receipt:
+      result: done
+      changed_files:
+        - package.json
+      commands:
+        - cmd: "bun run check"
+          status: pass
+        - cmd: "bun run endpoints:check"
+          status: pass
+        - cmd: "git diff -- package.json"
+          status: pass
+      summary: "Included the deployed endpoint manifest verifier in the root no-write check gate. Since the CI workflow runs bun run check, endpoint manifest drift is now covered by the existing non-deploying CI path."
+      spawned_tasks:
+        - T999
+        - T022
+  - id: T022
+    type: worker
+    assignee: Worker
+    status: active
+    reasoning_hint: default
+    objective: "Reconcile the deployed endpoint manifest/checker with the current Alchemy-owned kernel route and R2-backed IaC state."
+    allowed_files:
+      - config/deployed-endpoints.json
+      - scripts/check-deployed-endpoints.mjs
+      - docs/goals/engram-system-audit-hardening/state.yaml
+    verify:
+      - "bun run endpoints:check"
+      - "bun run check"
+      - "curl -sS -i --max-time 10 https://engram-kernel.umg-bhalla88.workers.dev/health"
+    stop_if:
+      - "Need to deploy, change Cloudflare routes, edit Alchemy state, or touch secrets."
+      - "The custom domain needs to be asserted live before Cloudflare finishes certificate issuance."
     receipt: null
   - id: T999
     type: judge
@@ -394,8 +828,7 @@ checks:
   dirty_fingerprint: unknown
   last_verification:
     result: pass
-    task: T007
+    task: T021
     commands:
-      - "bun run --filter @engram/sdk typecheck && bun run --filter @engram/cli typecheck && bun run --filter @engram/ui-app typecheck && bun run --filter @engram/cloud-app typecheck && cd apps/kernel && bun x tsc -p tsconfig.json"
-      - "node scripts/e2e-ui.ts"
-      - "git diff -- scripts/e2e-ui.ts"
+      - "bun run endpoints:check"
+      - "bun run check"

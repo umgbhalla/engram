@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "updated": "2026-06-10",
+  "public": {
+    "kernel": {
+      "worker": "engram-kernel",
+      "defaultWs": "wss://engram-kernel.umg-bhalla88.workers.dev",
+      "workersDevHttp": "https://engram-kernel.umg-bhalla88.workers.dev",
+      "workersDevWs": "wss://engram-kernel.umg-bhalla88.workers.dev",
+      "wsPath": "/ws",
+      "healthPath": "/health",
+      "env": {
+        "cli": "ENGRAM_ENDPOINT",
+        "smoke": "ENGRAM_KERNEL_WS",
+        "e2e": "KERNEL_ENDPOINT"
+      },
+      "priorRouteIncident": "2026-06-10 GoalBuddy T016: workers.dev temporarily returned Cloudflare 404/1042 before recovering during T019 verification."
+    },
+    "cloud": {
+      "worker": "engram-cloud",
+      "http": "https://engram-cloud.umg-bhalla88.workers.dev",
+      "healthPath": "/health",
+      "usagePath": "/usage",
+      "env": "ENGRAM_CLOUD_URL"
+    },
+    "ui": {
+      "worker": "engram-ui",
+      "http": "https://engram-ui.umg-bhalla88.workers.dev",
+      "healthPath": "/healthz",
+      "env": "ENGRAM_UI_URL"
+    },
+    "docs": {
+      "worker": "engram-docs",
+      "http": "https://engram-docs.umg-bhalla88.workers.dev",
+      "env": "ENGRAM_DOCS_URL"
+    }
+  },
+  "resources": {
+    "r2Snapshots": "engram-snapshots",
+    "analyticsEngine": "engram_kernel"
+  }
+}

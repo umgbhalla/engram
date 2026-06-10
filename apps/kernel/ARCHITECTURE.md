@@ -1,7 +1,14 @@
-# engram-rust2 — Rust kernel build (Phase 1a + 1b)
+# engram-kernel — Rust kernel architecture
 
-Deployed: `engram-rust2` (https://engram-rust2.umg-bhalla88.workers.dev), R2 prefix `benchrust2/`.
-Live suites: functional **24/24**, parity5 **9/9**, **Phase-1b features 18/18**, guard-probe 16/17
+Current deployed worker: `engram-kernel` (https://engram-kernel.umg-bhalla88.workers.dev).
+This app is the production single-tenant hibernating REPL kernel. It is built as a Rust Durable
+Object shell driving the rquickjs WASM engine through a thin JS WASI / Cloudflare plumbing layer,
+with snapshots stored in DO SQLite and R2 `engram-snapshots` overflow.
+
+The notes below include the `engram-rust2` scratch-build provenance from the Rust cutover. Treat
+that name and the `benchrust2/` prefix as historical, not current deployment identity.
+
+Historical scratch live suites: functional **24/24**, parity5 **9/9**, **Phase-1b features 18/18**, guard-probe 16/17
 (the 1 is the documented post-double-bomb >45MB wedged-buffer clean-reject — socket alive, not a kill),
 E6 engine-migration replay **PASS**.
 

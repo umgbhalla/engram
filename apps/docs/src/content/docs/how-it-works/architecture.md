@@ -21,7 +21,7 @@ checkpoint commit-ordering; the WASM interpreter owns the live namespace.
   (`engram-snapshots`) overflow only above ~2 MB gz.
 - **I/O boundary** = all host imports (network / time / random) cross a single controlled boundary,
   where non-determinism and handle-reconnect are handled.
-- **Observability** = Analytics Engine (`montydyn_kernel` dataset) per-op metering.
+- **Observability** = Analytics Engine (`engram_kernel` dataset) per-op metering.
 
 ## Session lifecycle
 

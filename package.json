@@ -6,12 +6,14 @@
     "packages/*"
   ],
   "scripts": {
-    "check": "bun run --filter @engram/sdk typecheck && bun run --filter @engram/cli typecheck && bun run --filter @engram/ui-app typecheck && bun run --filter @engram/cloud-app typecheck && cd apps/kernel && bun x tsc -p tsconfig.json",
+    "check": "node scripts/check-deployed-endpoints.mjs && bun run --filter @engram/sdk typecheck && bun run --filter @engram/cli typecheck && bun run --filter @engram/ui-app typecheck && bun run --filter @engram/cloud-app typecheck && cd apps/kernel && bun x tsc -p tsconfig.json",
     "deploy:kernel": "wrangler deploy -c apps/kernel/wrangler.jsonc",
     "deploy:cloud": "wrangler deploy -c apps/cloud/wrangler.jsonc",
     "deploy:ui": "bun run --filter @engram/ui-app build && wrangler deploy -c apps/ui/wrangler.jsonc",
     "deploy:all": "bun scripts/deploy.ts",
     "e2e:ui": "node scripts/e2e-ui.ts",
+    "endpoints:check": "node scripts/check-deployed-endpoints.mjs",
+    "smoke:live": "node scripts/smoke-live.mjs",
     "build:sdk": "bun run --filter @engram/sdk build",
     "build:cli": "bun run --filter @engram/cli build",
     "build:ui": "bun run --filter @engram/ui-app build"

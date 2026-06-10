@@ -1,27 +1,44 @@
-# TODO / Task board
+# TODO / Task Board
 
-Mirror of harness task list. Multi-agent: claim a task, branch `exp/<n>-<slug>`, PR.
+This file used to mirror the early feasibility harness. That checklist is now historical:
+Engram has shipped the JS/Rust kernel, multi-tenant cloud, SDK/CLI, UI, and docs surface. The
+frozen proof trail lives in `docs/results/`, `docs/experiments.md`, and the ADR/design docs.
 
-## Phase 0 — Setup
-- [x] Repo scaffold, CLAUDE.md/AGENTS.md, .gitignore, .env.example
-- [ ] Drop CF creds into `.env` (USER action)
-- [ ] Initial commit + branch strategy
+Current machine-truth board for the active audit/hardening tranche:
 
-## Phase 1 — Feasibility (research workflow `wkfcx55zi` running)
-- [ ] Land feasibility study → `docs/feasibility.md`
-- [ ] Land phased experiment plan → `docs/experiments.md`
-- [ ] Record key decisions → `docs/decisions.md` (ADRs)
+```text
+docs/goals/engram-system-audit-hardening/state.yaml
+```
 
-## Phase 2 — JS kernel experiments (after creds)
-- [ ] EXP-1: snapshot/restore a WASM linear memory locally (no CF) — prove the core bet
-- [ ] EXP-2: Boa (or QuickJS-wasm) eval cells against a persisted context, local
-- [ ] EXP-3: run WASM kernel inside a Durable Object, snapshot→SQLite/R2
-- [ ] EXP-4: DO WebSocket hibernation + resume kernel from snapshot; measure cold-wake
-- [ ] EXP-5: configurable idle policy (warm vs sleep), latency/cost numbers
+## Current Verified Surface
 
-## Phase 3 — Python kernel
-- [ ] Port pattern to RustPython / Pyodide
+- `engram-kernel`: live hibernating REPL kernel.
+- `engram-cloud`: live multi-tenant supervisor with auth/metering.
+- `engram-ui`: live notebook SPA.
+- `engram-docs`: live static docs site.
+- Supporting resources: R2 `engram-snapshots`, Analytics Engine `engram_kernel`.
 
-## Backlog / open
-- [ ] Dynamic Worker Loader role for per-tenant kernel loading
-- [ ] Rivet ActorCore portability spike
+## Current Local Gates
+
+- `bun run check` — no-write TypeScript checks for SDK, CLI, UI, cloud, and kernel.
+- `bun run e2e:ui` — live UI/kernel E2E against `engram-ui` and `engram-kernel` using a throwaway session.
+
+## Active Audit / Hardening Follow-Ups
+
+- Continue the GoalBuddy board until its final Judge/PM audit proves the full audit/hardening tranche complete.
+- Decide whether to add CI for `bun run check`.
+- Decide whether to package a broader current live smoke for `engram-kernel`, `engram-cloud`, `engram-ui`, and `engram-docs`.
+- Review remaining package/docs identity drift, especially historical scratch names in package metadata and architecture docs.
+- Use `improve-codebase-architecture` only in a dedicated architecture Scout/Judge task before any broad refactor.
+
+## Owner-Gated GA Items
+
+- Publish `@engram/sdk` / CLI packages to npm.
+- Run scale validation at 1000s of concurrent sessions.
+- Prune stale R2 keys when an R2 S3 token is available.
+
+## Historical Note
+
+The old Phase 0/1/2 feasibility checklist is superseded. Do not use it to infer current status.
+Use `apps/docs/src/content/docs/reference/deployed.md`, `docs/PRODUCT.md`, and the GoalBuddy
+state file above for current operator truth.

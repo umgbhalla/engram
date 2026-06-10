@@ -1,7 +1,14 @@
 #!/usr/bin/env node
 
-const UI_URL = process.env.UI_URL || "https://engram-ui.umg-bhalla88.workers.dev";
-const KERNEL_ENDPOINT = process.env.KERNEL_ENDPOINT || "wss://engram-kernel.umg-bhalla88.workers.dev";
+import { readFileSync } from "node:fs";
+
+const manifest = JSON.parse(
+  readFileSync(new URL("../config/deployed-endpoints.json", import.meta.url), "utf8"),
+);
+const publicEndpoints = manifest.public;
+
+const UI_URL = process.env.UI_URL || publicEndpoints.ui.http;
+const KERNEL_ENDPOINT = process.env.KERNEL_ENDPOINT || publicEndpoints.kernel.defaultWs;
 const WS = globalThis.WebSocket;
 
 if (!WS) {
