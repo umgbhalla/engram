@@ -13,9 +13,12 @@
 //! Protocol over WS/HTTP (JSON), parity with engram-kernel:
 //!   {t:create,config} {t:eval,src} {t:ping} {t:gen} {t:reset} {t:evict} + /health
 
+mod store;
+
 use js_sys::{Reflect, Uint8Array};
 use serde_json::json;
 use std::cell::RefCell;
+use store::{DoSqlStore, KernelStore};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
@@ -123,11 +126,13 @@ const SNAPSHOT_FORMAT_VERSION: &str = "1";
 
 impl DurableObject for KernelDO {
     fn new(state: State, env: Env) -> Self {
-        let sql = state.storage().sql();
-        sql.exec("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);", None)
+        let store = DoSqlStore::new(state.storage().sql());
+        store
+            .exec("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);", None)
             .expect("create meta");
-        sql.exec(
-            "CREATE TABLE IF NOT EXISTS snap_manifest (
+        store
+            .exec(
+                "CREATE TABLE IF NOT EXISTS snap_manifest (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 cell INTEGER, epoch INTEGER, n_chunks INTEGER,
                 size_raw INTEGER, size_gz INTEGER, engine_hash TEXT,
@@ -135,42 +140,45 @@ impl DurableObject for KernelDO {
                 store TEXT, r2_key TEXT, created_ms INTEGER,
                 kv_json TEXT, used_heap INTEGER
             );",
-            None,
-        )
-        .expect("create snap_manifest");
-        sql.exec(
-            "CREATE TABLE IF NOT EXISTS snap_chunks (seq INTEGER PRIMARY KEY, data BLOB);",
-            None,
-        )
-        .expect("create snap_chunks");
+                None,
+            )
+            .expect("create snap_manifest");
+        store
+            .exec(
+                "CREATE TABLE IF NOT EXISTS snap_chunks (seq INTEGER PRIMARY KEY, data BLOB);",
+                None,
+            )
+            .expect("create snap_chunks");
         // W4 byte-delta: the committed snapshot is a full (W5-compacted) BASE plus a chain of
         // per-cell byte-deltas. Manifest gains base_seq/delta_seq/snap_mode + ctx columns.
-        let _ = sql.exec("ALTER TABLE snap_manifest ADD COLUMN base_seq INTEGER;", None);
-        let _ = sql.exec("ALTER TABLE snap_manifest ADD COLUMN delta_seq INTEGER;", None);
-        let _ = sql.exec("ALTER TABLE snap_manifest ADD COLUMN snap_mode TEXT;", None);
+        store.exec_ignore("ALTER TABLE snap_manifest ADD COLUMN base_seq INTEGER;", None);
+        store.exec_ignore("ALTER TABLE snap_manifest ADD COLUMN delta_seq INTEGER;", None);
+        store.exec_ignore("ALTER TABLE snap_manifest ADD COLUMN snap_mode TEXT;", None);
         // Snapshot-format groundwork: a semantic layout epoch alongside engine_hash (fable design —
         // a manual salt may only FORCE replay, never force a hot restore). Recorded for future
         // layout-compatible hot-restore gating; the post-restore sanity probe is the live safety net.
-        let _ = sql.exec("ALTER TABLE snap_manifest ADD COLUMN layout_version TEXT;", None);
-        write_meta(&sql, "snapFormat", SNAPSHOT_FORMAT_VERSION);
-        sql.exec(
-            "CREATE TABLE IF NOT EXISTS delta_chunks (
+        store.exec_ignore("ALTER TABLE snap_manifest ADD COLUMN layout_version TEXT;", None);
+        write_meta(&store, "snapFormat", SNAPSHOT_FORMAT_VERSION);
+        store
+            .exec(
+                "CREATE TABLE IF NOT EXISTS delta_chunks (
                 seq INTEGER PRIMARY KEY, payload BLOB, indices BLOB, grain INTEGER
             );",
-            None,
-        )
-        .expect("create delta_chunks");
+                None,
+            )
+            .expect("create delta_chunks");
         // E6 oplog: per-cell {src, hostResults} appended for the crash tail + engine-migration
         // replay. Bounded to the cells since the last full base (cleared on base reset).
-        sql.exec(
-            "CREATE TABLE IF NOT EXISTS oplog (seq INTEGER PRIMARY KEY, cell INTEGER, src TEXT, host_results TEXT);",
-            None,
-        )
-        .expect("create oplog");
+        store
+            .exec(
+                "CREATE TABLE IF NOT EXISTS oplog (seq INTEGER PRIMARY KEY, cell INTEGER, src TEXT, host_results TEXT);",
+                None,
+            )
+            .expect("create oplog");
 
-        let cur = read_int(&sql, "generation", 0);
+        let cur = read_int(&store, "generation", 0);
         let generation = cur + 1;
-        write_meta(&sql, "generation", &generation.to_string());
+        write_meta(&store, "generation", &generation.to_string());
         let do_id = state.id().to_string();
 
         Self {
@@ -352,6 +360,13 @@ impl KernelDO {
         Ok(())
     }
 
+    /// The kernel's durable store, behind the `KernelStore` seam. Today this is the CF DO SQLite
+    /// backend (`DoSqlStore`); swapping to Rivet/Postgres/test means returning a different impl
+    /// here — no call site changes. This is the single point that names the CF-proprietary handle.
+    fn store(&self) -> DoSqlStore {
+        DoSqlStore::new(self.state.storage().sql())
+    }
+
     fn r2_key_for(&self, cell: i64, epoch: i64) -> String {
         format!("benchrustf/{}/e{}-c{}.qjs.gz", self.do_id, epoch, cell)
     }
@@ -370,13 +385,13 @@ impl KernelDO {
         let t = msg.get("t").and_then(|v| v.as_str()).unwrap_or("");
         match t {
             "gen" => {
-                let sql = self.state.storage().sql();
+                let store = self.store();
                 Ok(json!({
                     "ok": true, "t": "gen",
                     "generation": self.generation,
                     "inMemory": self.glue.borrow().is_some(),
-                    "epoch": read_int(&sql, "epoch", 0),
-                    "committedCell": read_int(&sql, "committedCell", -1),
+                    "epoch": read_int(&store, "epoch", 0),
+                    "committedCell": read_int(&store, "committedCell", -1),
                     "engineHash": get_engine_hash(),
                     "version": "rust-v0.9.3",
                 }))
@@ -420,8 +435,7 @@ impl KernelDO {
                 // engine-migration journal replay works without a real redeploy.
                 let taken = self.glue.borrow_mut().take();
                 if let Some(g) = taken { g.drop_kernel(); }
-                let sql = self.state.storage().sql();
-                sql.exec("UPDATE snap_manifest SET engine_hash='STALE-ENGINE-HASH' WHERE id=1;", None).ok();
+                self.store().exec_ignore("UPDATE snap_manifest SET engine_hash='STALE-ENGINE-HASH' WHERE id=1;", None);
                 Ok(json!({"ok": true, "t": "_forceEngineMismatch", "generation": self.generation}))
             }
             "health" => Ok(json!({"ok": true, "t": "health", "generation": self.generation})),
@@ -432,8 +446,7 @@ impl KernelDO {
     async fn create_critical(&self, msg: &serde_json::Value) -> Result<serde_json::Value> {
         let cfg = msg.get("config").cloned().unwrap_or_else(|| json!({}));
         let cfg_str = serde_json::to_string(&cfg).unwrap_or_else(|_| "{}".into());
-        let sql = self.state.storage().sql();
-        write_meta(&sql, "config", &cfg_str);
+        write_meta(&self.store(), "config", &cfg_str);
         let info = self.ensure_glue().await?;
         let mut dp = Datapoint::new("create");
         dp.restore_source = info.source.clone();
@@ -460,9 +473,9 @@ impl KernelDO {
         // first-eval config (only if none yet)
         if !before {
             if let Some(cfg) = msg.get("config") {
-                if read_str(&self.state.storage().sql(), "config").is_none() {
+                if read_str(&self.store(), "config").is_none() {
                     let cfg_str = serde_json::to_string(cfg).unwrap_or_else(|_| "{}".into());
-                    write_meta(&self.state.storage().sql(), "config", &cfg_str);
+                    write_meta(&self.store(), "config", &cfg_str);
                 }
             }
         }
@@ -499,9 +512,8 @@ impl KernelDO {
         // Promise; the glue awaits it from the eval pump. Keyed under <prefix><path> in the
         // configured bucket binding. provider == vfs (default) clears the handler (in-heap fs).
         {
-            let sql = self.state.storage().sql();
             let cfg: serde_json::Value = serde_json::from_str(
-                &read_str(&sql, "config").unwrap_or_else(|| "{}".into()),
+                &read_str(&self.store(), "config").unwrap_or_else(|| "{}".into()),
             )
             .unwrap_or_else(|_| json!({}));
             let fsv = cfg
@@ -537,8 +549,7 @@ impl KernelDO {
         // FETCH FENCE: install the deterministic (doId, cell) identity so host.fetch can derive a
         // stable Idempotency-Key per (session, cell, in-cell fetch ordinal); replay reproduces it.
         {
-            let sql = self.state.storage().sql();
-            let cell_now = read_int(&sql, "committedCell", -1) + 1;
+            let cell_now = read_int(&self.store(), "committedCell", -1) + 1;
             let glue = clone_glue(self.glue.borrow().as_ref().unwrap());
             glue.set_fence_context(&self.do_id, cell_now as f64);
         }
@@ -558,9 +569,9 @@ impl KernelDO {
             serde_json::from_str(&eval_json).unwrap_or_else(|_| json!({"ok": true, "value": eval_json}));
 
         // allocate the next cell inside the critical section, then checkpoint.
-        let sql = self.state.storage().sql();
-        let cell = read_int(&sql, "committedCell", -1) + 1;
-        let epoch = read_int(&sql, "epoch", 0);
+        let store = self.store();
+        let cell = read_int(&store, "committedCell", -1) + 1;
+        let epoch = read_int(&store, "epoch", 0);
         let ckpt = match self.checkpoint(cell, epoch, src).await {
             Ok(v) => v,
             Err(e) => json!({ "ok": false, "error": format!("{e}") }),
@@ -612,19 +623,19 @@ impl KernelDO {
                 None
             }
         });
-        let sql = self.state.storage().sql();
-        sql.exec("DELETE FROM snap_chunks;", None).ok();
-        sql.exec("DELETE FROM delta_chunks;", None).ok();
-        sql.exec("DELETE FROM oplog;", None).ok();
-        sql.exec("DELETE FROM snap_manifest;", None).ok();
+        let store = self.store();
+        store.exec_ignore("DELETE FROM snap_chunks;", None);
+        store.exec_ignore("DELETE FROM delta_chunks;", None);
+        store.exec_ignore("DELETE FROM oplog;", None);
+        store.exec_ignore("DELETE FROM snap_manifest;", None);
         if let Ok(bucket) = self.env.bucket("SNAPSHOTS") {
             if let Some(k) = r2_key {
                 let _ = bucket.delete(&k).await;
             }
         }
-        let epoch = read_int(&sql, "epoch", 0) + 1;
-        write_meta(&sql, "epoch", &epoch.to_string());
-        write_meta(&sql, "committedCell", "-1");
+        let epoch = read_int(&store, "epoch", 0) + 1;
+        write_meta(&store, "epoch", &epoch.to_string());
+        write_meta(&store, "committedCell", "-1");
         Ok(json!({"ok": true, "t": "reset", "epoch": epoch, "generation": self.generation}))
     }
 
@@ -636,7 +647,7 @@ impl KernelDO {
         }
         let t0 = now_ms();
         let glue = new_glue_kernel();
-        let cfg_str = read_str(&self.state.storage().sql(), "config").unwrap_or_else(|| "{}".into());
+        let cfg_str = read_str(&self.store(), "config").unwrap_or_else(|| "{}".into());
         let mut read_ms = 0.0_f64;
         let mut timings_json = String::from("{}");
 
@@ -799,32 +810,32 @@ impl KernelDO {
             let base_size_raw = pm.size_raw;
             let base_size_gz = pm.size_gz;
             let oplog_seq = delta_seq_new + 1;
-            let sql = self.state.storage().sql();
+            let store = self.store();
             let txn = || -> Result<()> {
-                sql.exec(
+                store.exec(
                     "INSERT INTO delta_chunks(seq, payload, indices, grain) VALUES (?,?,?,?);",
-                    vec![delta_seq_new.into(), bytes.clone().into(), idx_bytes.clone().into(), grain.into()],
+                    Some(vec![delta_seq_new.into(), bytes.clone().into(), idx_bytes.clone().into(), grain.into()]),
                 )?;
                 // append oplog tail row.
-                sql.exec("INSERT INTO oplog(seq,cell,src,host_results) VALUES (?,?,?,?);",
-                    vec![oplog_seq.into(), cell.into(), src.into(), host_results.clone().into()])?;
-                sql.exec("DELETE FROM snap_manifest;", None)?;
-                sql.exec(
+                store.exec("INSERT INTO oplog(seq,cell,src,host_results) VALUES (?,?,?,?);",
+                    Some(vec![oplog_seq.into(), cell.into(), src.into(), host_results.clone().into()]))?;
+                store.exec("DELETE FROM snap_manifest;", None)?;
+                store.exec(
                     "INSERT INTO snap_manifest
                         (id,cell,epoch,n_chunks,size_raw,size_gz,engine_hash,clock_calls,rng_calls,
                          store,r2_key,created_ms,kv_json,used_heap,delta_seq,snap_mode)
                      VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
-                    vec![
+                    Some(vec![
                         cell.into(), epoch.into(), base_n_chunks.into(),
                         base_size_raw.into(), base_size_gz.into(), base_engine.clone().into(),
                         clock_calls.into(), rng_calls.into(), base_store.clone().into(),
                         base_r2_key.clone().into(), now_ms().into(), kv_json.clone().into(),
                         used_heap.into(), (delta_seq_new + 1).into(),
                         "delta".to_string().into(),
-                    ],
+                    ]),
                 )?;
-                sql.exec("INSERT INTO meta(k,v) VALUES('committedCell',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v;",
-                    vec![cell.to_string().into()])?;
+                store.exec("INSERT INTO meta(k,v) VALUES('committedCell',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v;",
+                    Some(vec![cell.to_string().into()]))?;
                 Ok(())
             };
             txn()?;
@@ -850,42 +861,42 @@ impl KernelDO {
             ("sqlite".to_string(), String::new())
         };
 
-        let sql = self.state.storage().sql();
+        let kstore = self.store();
         let r2_key_for_manifest = new_r2_key.clone();
         let txn = || -> Result<i64> {
-            sql.exec("DELETE FROM snap_chunks;", None)?;
-            sql.exec("DELETE FROM delta_chunks;", None)?;
-            sql.exec("DELETE FROM oplog;", None)?;
-            sql.exec("DELETE FROM snap_manifest;", None)?;
+            kstore.exec("DELETE FROM snap_chunks;", None)?;
+            kstore.exec("DELETE FROM delta_chunks;", None)?;
+            kstore.exec("DELETE FROM oplog;", None)?;
+            kstore.exec("DELETE FROM snap_manifest;", None)?;
             let n_chunks = if to_r2 {
                 0i64
             } else {
                 let mut seq = 0i64;
                 for chunk in bytes.chunks(CHUNK_BYTES) {
-                    sql.exec("INSERT INTO snap_chunks(seq,data) VALUES (?,?);",
-                        vec![seq.into(), chunk.to_vec().into()])?;
+                    kstore.exec("INSERT INTO snap_chunks(seq,data) VALUES (?,?);",
+                        Some(vec![seq.into(), chunk.to_vec().into()]))?;
                     seq += 1;
                 }
                 seq
             };
             // oplog: a full base is a fresh recovery point — seed the tail with THIS cell.
-            sql.exec("INSERT INTO oplog(seq,cell,src,host_results) VALUES (0,?,?,?);",
-                vec![cell.into(), src.into(), host_results.clone().into()])?;
-            sql.exec(
+            kstore.exec("INSERT INTO oplog(seq,cell,src,host_results) VALUES (0,?,?,?);",
+                Some(vec![cell.into(), src.into(), host_results.clone().into()]))?;
+            kstore.exec(
                 "INSERT INTO snap_manifest
                     (id,cell,epoch,n_chunks,size_raw,size_gz,engine_hash,clock_calls,rng_calls,
                      store,r2_key,created_ms,kv_json,used_heap,delta_seq,snap_mode)
                  VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
-                vec![
+                Some(vec![
                     cell.into(), epoch.into(), n_chunks.into(),
                     size_raw.into(), size_gz.into(), get_engine_hash().into(),
                     clock_calls.into(), rng_calls.into(), store.clone().into(),
                     r2_key_for_manifest.clone().into(), now_ms().into(), kv_json.clone().into(),
                     used_heap.into(), 0i64.into(), "full".to_string().into(),
-                ],
+                ]),
             )?;
-            sql.exec("INSERT INTO meta(k,v) VALUES('committedCell',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v;",
-                vec![cell.to_string().into()])?;
+            kstore.exec("INSERT INTO meta(k,v) VALUES('committedCell',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v;",
+                Some(vec![cell.to_string().into()]))?;
             Ok(n_chunks)
         };
         let n_chunks = txn()?;
@@ -906,7 +917,7 @@ impl KernelDO {
     }
 
     fn read_manifest(&self) -> Option<Manifest> {
-        let sql = self.state.storage().sql();
+        let store = self.store();
         #[derive(serde::Deserialize)]
         struct Row {
             cell: i64,
@@ -928,14 +939,12 @@ impl KernelDO {
             #[serde(default)]
             size_gz: Option<i64>,
         }
-        let rows: Vec<Row> = sql
-            .exec(
+        let rows: Vec<Row> = store
+            .query_typed(
                 "SELECT cell,epoch,n_chunks,engine_hash,clock_calls,rng_calls,store,r2_key,kv_json,used_heap,delta_seq,size_raw,size_gz
                  FROM snap_manifest WHERE id=1 LIMIT 1;",
                 None,
             )
-            .ok()?
-            .to_array()
             .ok()?;
         rows.into_iter().next().map(|r| Manifest {
             cell: r.cell,
@@ -960,21 +969,20 @@ impl KernelDO {
         if delta_seq <= 0 {
             return Ok(out);
         }
-        let sql = self.state.storage().sql();
-        let cursor = sql
-            .exec("SELECT payload, indices, grain FROM delta_chunks ORDER BY seq ASC;", None)
+        let rows = self
+            .store()
+            .query_raw("SELECT payload, indices, grain FROM delta_chunks ORDER BY seq ASC;", None)
             .map_err(|e| worker::Error::RustError(format!("read deltas: {e:?}")))?;
         let mut count = 0i64;
-        for row in cursor.raw() {
-            let row = row.map_err(|e| worker::Error::RustError(format!("delta row: {e:?}")))?;
+        for row in rows {
             let mut payload: Option<Vec<u8>> = None;
             let mut indices: Option<Vec<u8>> = None;
             let mut grain: i64 = 256;
             for (i, val) in row.into_iter().enumerate() {
                 match (i, val) {
-                    (0, worker::SqlStorageValue::Blob(b)) => payload = Some(b),
-                    (1, worker::SqlStorageValue::Blob(b)) => indices = Some(b),
-                    (2, worker::SqlStorageValue::Integer(n)) => grain = n,
+                    (0, store::StoreValue::Blob(b)) => payload = Some(b),
+                    (1, store::StoreValue::Blob(b)) => indices = Some(b),
+                    (2, store::StoreValue::Integer(n)) => grain = n,
                     _ => {}
                 }
             }
@@ -1003,13 +1011,11 @@ impl KernelDO {
     // {src, hostResults}. Used for engine-migration replay on an engine-hash mismatch.
     fn read_oplog(&self) -> js_sys::Array {
         let out = js_sys::Array::new();
-        let sql = self.state.storage().sql();
         #[derive(serde::Deserialize)]
         struct Row { src: String, host_results: String }
-        let rows: Vec<Row> = sql
-            .exec("SELECT src, host_results FROM oplog ORDER BY seq ASC;", None)
-            .ok()
-            .and_then(|r| r.to_array().ok())
+        let rows: Vec<Row> = self
+            .store()
+            .query_typed("SELECT src, host_results FROM oplog ORDER BY seq ASC;", None)
             .unwrap_or_default();
         for r in rows {
             let obj = js_sys::Object::new();
@@ -1022,15 +1028,14 @@ impl KernelDO {
     }
 
     fn read_chunks(&self, n_chunks: i64) -> Result<Uint8Array> {
-        let sql = self.state.storage().sql();
-        let cursor = sql
-            .exec("SELECT data FROM snap_chunks ORDER BY seq ASC;", None)
+        let rows = self
+            .store()
+            .query_raw("SELECT data FROM snap_chunks ORDER BY seq ASC;", None)
             .map_err(|e| worker::Error::RustError(format!("read chunks: {e:?}")))?;
         let mut blobs: Vec<Vec<u8>> = Vec::new();
-        for row in cursor.raw() {
-            let row = row.map_err(|e| worker::Error::RustError(format!("chunk row: {e:?}")))?;
+        for row in rows {
             for val in row {
-                if let worker::SqlStorageValue::Blob(b) = val {
+                if let store::StoreValue::Blob(b) = val {
                     blobs.push(b);
                 }
             }
@@ -1111,38 +1116,35 @@ fn restore_timings_value(info: &RestoreInfo) -> serde_json::Value {
     json!({ "readMs": info.read_ms, "totalServerMs": info.total_server_ms, "glue": glue })
 }
 
-fn read_int(sql: &worker::SqlStorage, k: &str, dflt: i64) -> i64 {
+fn read_int<S: KernelStore>(store: &S, k: &str, dflt: i64) -> i64 {
     #[derive(serde::Deserialize)]
     struct Row {
         v: String,
     }
-    let rows: Vec<Row> = sql
-        .exec("SELECT v FROM meta WHERE k=? LIMIT 1;", vec![k.into()])
-        .ok()
-        .and_then(|r| r.to_array().ok())
+    let rows: Vec<Row> = store
+        .query_typed("SELECT v FROM meta WHERE k=? LIMIT 1;", Some(vec![k.into()]))
         .unwrap_or_default();
     rows.first().and_then(|r| r.v.parse().ok()).unwrap_or(dflt)
 }
 
-fn read_str(sql: &worker::SqlStorage, k: &str) -> Option<String> {
+fn read_str<S: KernelStore>(store: &S, k: &str) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct Row {
         v: String,
     }
-    let rows: Vec<Row> = sql
-        .exec("SELECT v FROM meta WHERE k=? LIMIT 1;", vec![k.into()])
-        .ok()
-        .and_then(|r| r.to_array().ok())
+    let rows: Vec<Row> = store
+        .query_typed("SELECT v FROM meta WHERE k=? LIMIT 1;", Some(vec![k.into()]))
         .unwrap_or_default();
     rows.into_iter().next().map(|r| r.v)
 }
 
-fn write_meta(sql: &worker::SqlStorage, k: &str, v: &str) {
-    sql.exec(
-        "INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v;",
-        vec![k.into(), v.into()],
-    )
-    .expect("write meta");
+fn write_meta<S: KernelStore>(store: &S, k: &str, v: &str) {
+    store
+        .exec(
+            "INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v;",
+            Some(vec![k.into(), v.into()]),
+        )
+        .expect("write meta");
 }
 
 fn now_ms() -> f64 {
