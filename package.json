@@ -14,6 +14,7 @@
     "e2e:ui": "node scripts/e2e-ui.ts",
     "endpoints:check": "node scripts/check-deployed-endpoints.mjs",
     "smoke:live": "node scripts/smoke-live.mjs",
+    "telemetry:probe": "node scripts/telemetry-probe.mjs",
     "build:sdk": "bun run --filter @engram/sdk build",
     "build:cli": "bun run --filter @engram/cli build",
     "build:ui": "bun run --filter @engram/ui-app build"
