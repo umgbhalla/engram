@@ -31,3 +31,6 @@ v1-spike-wasm/
 
 # Alchemy IaC local state
 .alchemy/
+
+# local comparison harness output
+tests/compare-cf/run*-stderr.log
