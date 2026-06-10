@@ -92,8 +92,13 @@ type HostResult =
 interface KernelConfig {
   rngSeed?: number;
   typescript?: boolean;
+  // egress allowlist. UNSET ⇒ ALLOW-ALL egress (default); false ⇒ block all; [hosts] ⇒ hostname
+  // allowlist. A blocked host rejects with FetchBlockedError (socket stays alive).
   fetch?: boolean | string[];
-  modules?: boolean | string[];
+  // stdlib preload. UNSET / "default" ⇒ the sensible default set (STDLIB_META.defaults); false ⇒
+  // bare VM (no preload); true ⇒ all curated modules minus optIn; [names] ⇒ defaults + the named
+  // extras (additive; optIn modules allowed when explicitly named). Anything else: await use('pkg').
+  modules?: boolean | "default" | string[];
   cellBudgetTicks?: number;
   cellGrowCapPages?: number;
   maxHostCallsPerCell?: number;
@@ -419,17 +424,30 @@ function stdlibBundle(): Record<string, string> {
   try { __stdlibBundleCache = raw ? JSON.parse(raw) : {}; } catch { __stdlibBundleCache = {}; }
   return __stdlibBundleCache as Record<string, string>;
 }
-const STDLIB_NAMES: string[] = (() => { const m = globalThis.__STDLIB_META; return (m && Array.isArray(m.modules)) ? m.modules : []; })();
-const STDLIB_OPTIN: string[] = (() => { const m = globalThis.__STDLIB_META; return (m && Array.isArray(m.optIn)) ? m.optIn : []; })();
-// Normalize config.modules -> concrete name list. true=all defaults (opt-in EXCLUDED);
-// [names]=explicit subset (opt-in allowed if named); false/undefined=none.
-function resolveStdlibModules(cfgModules: boolean | string[] | undefined): string[] {
+// Catalog accessors read globalThis.__STDLIB_META LAZILY (not at module-eval time): the entry
+// module stamps __STDLIB_META AFTER the worker shim (and this glue) module is already evaluated
+// (ES import hoisting), so a top-level const would capture an empty catalog. Reading per-call fixes
+// the no-config default-preload (which is why `modules:undefined -> defaults` was silently empty).
+function stdlibNames(): string[] { const m = globalThis.__STDLIB_META; return (m && Array.isArray(m.modules)) ? m.modules : []; }
+function stdlibOptIn(): string[] { const m = globalThis.__STDLIB_META; return (m && Array.isArray(m.optIn)) ? m.optIn : []; }
+// The sensible default preload set (heavy libs excluded; see STDLIB_META.defaults). Loaded when
+// config.modules is UNSET so a no-config session gets IDs/dates/schema-validation/utility for free.
+function stdlibDefaults(): string[] { const m = globalThis.__STDLIB_META; return (m && Array.isArray((m as { defaults?: string[] }).defaults)) ? (m as { defaults: string[] }).defaults : []; }
+// Normalize config.modules -> concrete name list.
+//   false                -> [] (bare VM, explicit opt-out)
+//   undefined | "default" -> the sensible default set (NEW: a no-config session is no longer bare)
+//   true                 -> all curated modules minus optIn
+//   [names]              -> defaults + the named extras (additive; optIn allowed when named)
+function resolveStdlibModules(cfgModules: boolean | "default" | string[] | undefined): string[] {
   const bundle = stdlibBundle();
   const available = new Set(Object.keys(bundle));
-  const optIn = new Set(STDLIB_OPTIN);
-  if (cfgModules === true) return STDLIB_NAMES.filter((n) => available.has(n) && !optIn.has(n));
-  if (Array.isArray(cfgModules)) return cfgModules.filter((n) => available.has(n));
-  return [];
+  const optIn = new Set(stdlibOptIn());
+  const defaults = stdlibDefaults().filter((n) => available.has(n));
+  if (cfgModules === false) return [];
+  if (cfgModules === undefined || cfgModules === "default") return defaults;
+  if (cfgModules === true) return stdlibNames().filter((n) => available.has(n) && !optIn.has(n));
+  if (Array.isArray(cfgModules)) return Array.from(new Set([...defaults, ...cfgModules.filter((n) => available.has(n))]));
+  return defaults;
 }
 
 class GlueKernel {
@@ -534,6 +552,29 @@ class GlueKernel {
     } catch { /* non-fatal: defaults to 'vfs' in the bootstrap */ }
   }
 
+  // _seedStdlibMeta: stamp the baked STDLIB_META catalog (default set + opt-in + versions) into the
+  // VM as globalThis.__stdlibMeta so the engine's __nodeCompat.modules getter + help() can report
+  // which modules exist, their versions, and whether each is preloaded. Pure deterministic data
+  // write (no entropy); idempotent; re-applied on every create AND restore so a cold-woken VM (which
+  // re-runs BOOTSTRAP but NOT this glue-side seed) reports the catalog too.
+  _seedStdlibMeta(): void {
+    try {
+      const m = globalThis.__STDLIB_META;
+      if (!m) return;
+      const payload = {
+        all: Array.isArray(m.modules) ? m.modules : [],
+        default: Array.isArray((m as { defaults?: string[] }).defaults) ? (m as { defaults: string[] }).defaults : [],
+        optIn: Array.isArray(m.optIn) ? m.optIn : [],
+        versions: m.versions || {},
+      };
+      const ex = this._ex();
+      const src = "globalThis.__stdlibMeta=(" + JSON.stringify(payload) + ");0";
+      const b = TEXT_ENC.encode(src);
+      this._writeScratch(b);
+      ex.eval_begin(ex.scratch_ptr(), b.length, BigInt(200000), 0);
+    } catch { /* non-fatal: __nodeCompat.modules falls back to a static list */ }
+  }
+
   _newInstance(rngSeed: number): WebAssembly.Instance {
     const { wasi, setMem } = makeWasi(rngSeed);
     const inst = new WebAssembly.Instance(ENGINE_MODULE(), {
@@ -568,7 +609,10 @@ class GlueKernel {
     // TypeScript strip: default TRUE (stripping valid JS is a safe near no-op); {typescript:false}
     // disables. Persisted via configJson across cold restore (same path as clock/rngSeed).
     this.tsEnabled = cfg.typescript !== false;
-    // fetch allowlist: true=all, false=none, [hosts]=hostnames.
+    // fetch egress allowlist (EXPLICIT CONTRACT): config.fetch UNSET ⇒ ALLOW-ALL egress (the
+    // default — host.fetch reaches any public URL, which is what use()/CDN loads rely on);
+    // true ⇒ allow all; false ⇒ block all; [hosts] ⇒ hostname allowlist. A blocked host rejects
+    // with FetchBlockedError (see _doFetch; socket stays alive). config can still RESTRICT egress.
     this._fetchAllow = cfg.fetch === undefined ? true : cfg.fetch;
     return cfg;
   }
@@ -581,11 +625,12 @@ class GlueKernel {
     // persist (survive hibernation, no re-inject). Subset chosen by config.modules.
     this._injectStdlib(cfg.modules);
     this._applyFsProvider();
+    this._seedStdlibMeta();
     this.lastTimings = { instantiateMs: 0, growCount: 0 };
     return "fresh";
   }
 
-  _injectStdlib(cfgModules: boolean | string[] | undefined): void {
+  _injectStdlib(cfgModules: boolean | "default" | string[] | undefined): void {
     this._stdlibLoaded = [];
     const modules = resolveStdlibModules(cfgModules);
     if (!modules.length) return;
@@ -602,8 +647,20 @@ class GlueKernel {
       const iife = bundle[name];
       if (typeof iife !== "string") continue;
       try {
-        // eval the IIFE in GLOBAL scope; it self-installs globalThis.<name>. Generous budget.
-        const wrapped = "(0,eval)(" + JSON.stringify(iife) + ");0";
+        // eval the IIFE in GLOBAL scope; it self-installs globalThis.<name>. Then REGISTER it into
+        // globalThis.__stdmods[name] (the require-ONLY preloaded-stdlib map the engine require()
+        // checks after __builtins+__mods) so require('<name>') resolves the curated bundle. We do
+        // NOT touch __mods — that is use()'s ESM cache, and registering a bare-function global
+        // (nanoid) there would make use('nanoid') return the function instead of the {nanoid}
+        // namespace. __stdmods keeps require() working while leaving use()'s real ESM path intact.
+        // Map common name->global-var mismatches (js-yaml->jsyaml etc.). preloaded flags in
+        // __nodeCompat.modules read both __mods and __stdmods (engine getter updated).
+        const nameJson = JSON.stringify(name);
+        const wrapped =
+          "(0,eval)(" + JSON.stringify(iife) + ");" +
+          "(function(){var __n=" + nameJson + ";globalThis.__stdmods=globalThis.__stdmods||{};" +
+          "var g=globalThis[__n];if(g===undefined){var alt=__n.replace(/-/g,'');g=globalThis[alt];}" +
+          "if(g!==undefined&&globalThis.__stdmods[__n]===undefined)globalThis.__stdmods[__n]=g;})();0";
         const srcBytes = TEXT_ENC.encode(wrapped);
         this._writeScratch(srcBytes);
         const st = ex.eval_begin(ex.scratch_ptr(), srcBytes.length, BigInt(5_000_000), 0);
@@ -666,6 +723,7 @@ class GlueKernel {
     // W4: retain the reconstructed image so the next warm checkpoint diffs against it.
     this._lastImage = raw.slice();
     this._applyFsProvider();
+    this._seedStdlibMeta();
     this.lastTimings = { gunzipMs, instantiateMs: 0, growCount, neededPages: needPages };
     return label || "sqlite-restore";
   }
@@ -760,6 +818,7 @@ class GlueKernel {
     if (kvJson && kvJson !== "{}") this._importKv(kvJson);
     this._lastImage = image.slice();
     this._applyFsProvider();
+    this._seedStdlibMeta();
     if (!this._sanityProbe()) {
       throw new Error("RestoreSanityError: post-blit canary/GC probe failed (possible image corruption)");
     }
@@ -1278,7 +1337,7 @@ class GlueKernel {
   // stdlib injection: report which modules were injected at create (the esbuilt bundle evaled
   // into the VM). The actual catalog is wired by lib.rs via the STDLIB bundle Text module.
   stdlibInfo(): string {
-    return JSON.stringify({ loaded: this._stdlibLoaded || [], available: STDLIB_NAMES, optIn: STDLIB_OPTIN });
+    return JSON.stringify({ loaded: this._stdlibLoaded || [], available: stdlibNames(), optIn: stdlibOptIn(), defaults: stdlibDefaults() });
   }
   // E6 ENGINE-MIGRATION journal replay (docs E6). On an engine-hash mismatch at cold wake, the
   // byte-blit image is invalid (a different engine layout), so the DO replays the retained cell

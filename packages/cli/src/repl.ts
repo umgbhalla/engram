@@ -364,6 +364,7 @@ class Spinner {
 
 const DOT_COMMANDS = [
   ".help",
+  ".caps",
   ".exit",
   ".clear",
   ".reset",
@@ -503,9 +504,28 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
     const arg = rest.join(" ");
     switch (cmd) {
       case ".help":
+        if (arg === "caps" || arg === "env" || arg === "modules") {
+          // Surface the in-VM capability manifest. Prefer the formatted help() string; fall back to
+          // a JSON dump of __nodeCompat so it still works against an older kernel.
+          const probe =
+            "(typeof help==='function') ? help() : JSON.stringify(globalThis.__nodeCompat ? " +
+            "{builtins:__nodeCompat.capabilities.available, excluded:__nodeCompat.excluded, " +
+            "modules:__nodeCompat.modules, network:__nodeCompat.network, esm:__nodeCompat.esm, " +
+            "examples:__nodeCompat.examples} : 'no manifest', null, 2)";
+          const r = await session.eval(probe, { throwOnError: false }).catch(() => null);
+          if (r && r.ok) {
+            const s = typeof r.value === "string" ? r.value : (r.valuePreview ?? "");
+            console.log(String(s));
+          } else {
+            console.log(c.red("could not read capabilities from the kernel"));
+          }
+          return true;
+        }
         console.log(
           [
             c.dim(".help") + "            show this help",
+            c.dim(".help caps") + "       VM capabilities: builtins, stdlib modules, network, esm, examples",
+            c.dim(".caps") + "            alias for .help caps",
             c.dim(".exit") + "            close session and exit",
             c.dim(".clear") + "           clear the screen",
             c.dim(".reset") + "           reset the REMOTE session (drops namespace)",
@@ -517,6 +537,8 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
           ].join("\n"),
         );
         return true;
+      case ".caps":
+        return handleDot(".help caps");
       case ".exit":
         wantExit = true;
         rl.close();

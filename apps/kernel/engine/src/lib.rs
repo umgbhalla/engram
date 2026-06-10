@@ -1829,6 +1829,50 @@ globalThis.__nodeCompat = {
   globals: ['Buffer','TextEncoder','TextDecoder','URL','URLSearchParams','Headers','Request','Response','Blob','File','FormData','AbortController','AbortSignal','structuredClone','crypto','fetch','queueMicrotask','setTimeout','setImmediate','process','console','performance'],
   stdlib: ['fs (in-heap VFS, sync + promises + createReadStream/createWriteStream + readdir withFileTypes Dirent)', 'path (full posix)', 'stream (Readable/Writable/Duplex/Transform/PassThrough + pipeline/finished)', 'util.inspect/format/types/promisify', 'assert (structural deepStrictEqual)', 'Buffer (full read/write matrix)', 'crypto (randomBytes/randomUUID/randomInt + createHash sha256|sha1|md5 + createHmac + scryptSync)', 'zlib (gzip/gunzip/deflate/inflate sync+async; pure-JS DEFLATE; NO brotli)', 'url (legacy parse/format/resolve + WHATWG URL/URLSearchParams)', 'http/https (CLIENT request/get over host.fetch; NO server)', 'WHATWG fetch: fetch()->Response + Request/Response/Headers/Blob/File/FormData/AbortController'],
   use: "await use('pkgname') — fetch+eval a self-contained npm bundle from a CDN. CJS-first (esm.sh ?bundle&cjs, then jsDelivr/unpkg); an ESM-only package is now loaded for real via the ESM-as-Module path (esm.sh ?bundle is declared+evaluated as a QuickJS Module and its namespace is returned). Async; pin a version with use('pkg@1.2.3'); override the URL with use('pkg', {url}). Use this for any npm package not in builtins.",
+  // Injectable npm stdlib (esbuilt Text-module bundles eval'd into the heap). `preloaded` reflects
+  // whether the bundle is ALREADY in the heap (config.modules default set, an explicit config, or a
+  // prior use()). Anything not preloaded is reachable via `await use('name')`. Once loaded a module
+  // snapshot-persists (survives hibernate/cold-restore). The catalog is seeded by the glue as
+  // globalThis.__stdlibMeta (default[], optIn[], versions{}); a static fallback covers an unseeded VM.
+  get modules(){
+    var loaded = globalThis.__mods || {};
+    var std = globalThis.__stdmods || {};
+    var meta = globalThis.__stdlibMeta || { default: ['nanoid','uuid','dayjs','zod'],
+      optIn: ['mathjs','isomorphic-git','isomorphic-git-http'], all: ['lodash','dayjs','nanoid','uuid','zod'], versions: {} };
+    function has(n){ return Object.prototype.hasOwnProperty.call(loaded, n) || Object.prototype.hasOwnProperty.call(std, n); }
+    function row(n, optIn){ return { name: n, version: (meta.versions||{})[n] || null, preloaded: has(n), optIn: !!optIn }; }
+    var allLoaded = {}; Object.keys(loaded).forEach(function(k){ allLoaded[k]=1; }); Object.keys(std).forEach(function(k){ allLoaded[k]=1; });
+    return {
+      default: (meta.default||[]).map(function(n){ return row(n, false); }),
+      optIn: (meta.optIn||[]).map(function(n){ return row(n, true); }),
+      loaded: Object.keys(allLoaded).sort(),
+      note: "the default set is eval'd into the heap at create when config.modules is UNSET; config.modules:false opts out to a bare VM; an explicit list is additive to the defaults; optIn (e.g. mathjs) only when named. Anything else: await use('pkg').",
+    };
+  },
+  // Network/egress posture. Egress is MEDIATED through host.fetch (which also backs global fetch(),
+  // the http/https client, DNS-over-HTTPS, and use()). The allowlist is enforced HOST-SIDE from
+  // config.fetch; the VM cannot read the live list, so this states the MODEL, not the entries.
+  network: {
+    egress: 'allow-all-by-default',
+    via: 'host.fetch — also backs global fetch(), the http/https client, DNS-over-HTTPS, and use().',
+    allowlist: 'enforced host-side from config.fetch — UNSET or true = allow ALL hosts (default); false = block all; [hostnames] = allowlist. A blocked host rejects with FetchBlockedError (socket stays alive).',
+    inbound: 'none — this is not a server (no net/tls/http-server/listen).',
+  },
+  esm: {
+    supported: true,
+    available: typeof globalThis.__esmEval === 'function',
+    note: "use('pkg') loads CJS first; an ESM-only bundle is declared+evaluated as a real QuickJS Module via __esmEval and its namespace returned. import/export at the top level of a CELL is not parsed — use() instead.",
+  },
+  // Copy-paste runnable one-liners so a driving model sees the shape without trial-and-error.
+  examples: {
+    require: "const _ = require('lodash'); _.chunk([1,2,3,4], 2)",
+    use: "const { nanoid } = await use('nanoid'); nanoid()",
+    fetch: "const r = await fetch('https://api.example.com/x'); await r.json()",
+    fs: "const fs = require('fs'); fs.writeFileSync('/t.txt','hi'); fs.readFileSync('/t.txt','utf8')",
+    crypto: "require('crypto').createHash('sha256').update('x').digest('hex')",
+    hashAsync: "await crypto.subtle.digest('SHA-512', new TextEncoder().encode('x'))",
+    topLevelReturn: "const x = 41; return x + 1;",
+  },
   // IMPLEMENTATION-TRUTH exclusion list: ONLY intrinsically-impossible modules. vm/dns/perf_hooks/
   // module are SHIMMED (see __builtins) and were wrongly listed before. Anything here throws a
   // uniform NotSupportedError from require() with the constraint + the alternative.
@@ -1882,6 +1926,31 @@ globalThis.__nodeCompat = {
   ],
 };
 
+// help(): human-readable one-call summary of the sandbox surface — mirrors __nodeCompat but
+// formatted. Returns a STRING (prints cleanly as a cell value); for machine consumption read
+// __nodeCompat. Re-installs on every fresh instance + cold restore (it lives in BOOTSTRAP).
+globalThis.help = function help(){
+  var nc = globalThis.__nodeCompat, caps = nc.capabilities, mods = nc.modules, L = [];
+  L.push('Engram VM — deterministic QuickJS sandbox (snapshot-durable across hibernate).');
+  L.push('');
+  L.push('builtins (require): ' + caps.available.join(', '));
+  L.push('excluded: ' + nc.excluded.join(', ') + '  (each throws NotSupportedError with the reason+alternative)');
+  L.push('');
+  L.push('stdlib modules (npm, in-heap; * = preloaded now):');
+  L.push('  default: ' + mods.default.map(function(m){ return m.name + (m.preloaded ? '*' : ''); }).join(', '));
+  L.push('  opt-in:  ' + mods.optIn.map(function(m){ return m.name + (m.preloaded ? '*' : ''); }).join(', ') + '   (load via await use())');
+  if (mods.loaded.length) L.push('  loaded:  ' + mods.loaded.join(', '));
+  L.push('');
+  L.push('network: egress ' + nc.network.egress + ' via host.fetch — ' + nc.network.allowlist);
+  L.push('esm: ' + (nc.esm.supported ? "supported (await use('pkg'))" : 'no'));
+  L.push('');
+  L.push('examples:');
+  Object.keys(nc.examples).forEach(function(k){ L.push('  ' + k + ': ' + nc.examples[k]); });
+  L.push('');
+  L.push('caveats: ' + nc.caveats.length + ' (read __nodeCompat.caveats) — seeded clock/RNG, immediate timers, in-heap fs.');
+  return L.join('\n');
+};
+
 // require(name): sync resolver. Built-ins + already-loaded packages (use() cache). Throws a clear,
 // ENUMERATED error for anything not preloaded (the VM has no SYNC host IO, so require can't fetch).
 // Strips a leading 'node:' and bare relative paths fall through to the cache by basename.
@@ -1892,8 +1961,14 @@ globalThis.require = function(name){
   if (globalThis.__builtins[n] !== undefined) return globalThis.__builtins[n];
   if (globalThis.__mods[raw] !== undefined) return globalThis.__mods[raw];
   if (globalThis.__mods[n] !== undefined) return globalThis.__mods[n];
+  // preloaded curated stdlib (require-ONLY; the glue registers the default set here so
+  // require('lodash') resolves without consuming use()'s ESM cache — see kernel-glue _injectStdlib).
+  var SM = globalThis.__stdmods || {};
+  if (SM[raw] !== undefined) return SM[raw];
+  if (SM[n] !== undefined) return SM[n];
   var base = n.split('/').pop();
   if (globalThis.__mods[base] !== undefined) return globalThis.__mods[base];
+  if (SM[base] !== undefined) return SM[base];
   var avail = Object.keys(globalThis.__builtins).filter(function(k){ return k.indexOf('node:') !== 0 && k.indexOf('/') < 0; }).sort().join(', ');
   var nc = globalThis.__nodeCompat || {};
   var excluded = nc.excluded || [];

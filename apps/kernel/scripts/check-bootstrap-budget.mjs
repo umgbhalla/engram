@@ -36,6 +36,11 @@ const CEILINGS = {
   // Bundled stdlib text (src/stdlib.bundle.txt). Injected into the QuickJS heap
   // at create-time; too large pushes past the safe snapshot ceiling (~18 MB raw).
   STDLIB_BUNDLE_BYTES: 1_220_000,
+
+  // The DEFAULT stdlib preload set (STDLIB_META.defaults) — eval'd into EVERY no-config
+  // session's heap, so its combined source is a permanent per-snapshot tax. Keep it well
+  // below MAX_STDLIB_SOURCE_BYTES (500 KB hard cap in kernel-glue.ts). Raise deliberately.
+  DEFAULT_STDLIB_BYTES: 220_000,
 };
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -117,6 +122,25 @@ if (stdlibSize !== null) {
   rows.push(mkrow("stdlib.bundle.txt", stdlibSize, CEILINGS.STDLIB_BUNDLE_BYTES));
 } else {
   console.warn("  SKIP │ src/stdlib.bundle.txt not present — run build:worker first");
+}
+
+// DEFAULT stdlib preload source — the combined byte size of the modules eval'd into every
+// no-config session (STDLIB_META.defaults × sizes). Parsed from src/stdlib-meta.ts (the bake
+// manifest). This is the always-on per-snapshot tax of the sensible-defaults feature.
+try {
+  const metaTxt = readFileSync(path.join(ROOT, "src/stdlib-meta.ts"), "utf8");
+  const m = metaTxt.match(/STDLIB_META:\s*StdlibMeta\s*=\s*(\{[\s\S]*?\});/);
+  if (m) {
+    const meta = JSON.parse(m[1]);
+    const defaults = Array.isArray(meta.defaults) ? meta.defaults : [];
+    const sizes = meta.sizes || {};
+    const defaultBytes = defaults.reduce((a, n) => a + (Number(sizes[n]) || 0), 0);
+    rows.push(mkrow("default stdlib (" + defaults.length + " mods)", defaultBytes, CEILINGS.DEFAULT_STDLIB_BYTES));
+  } else {
+    console.warn("  SKIP │ could not parse STDLIB_META.defaults from src/stdlib-meta.ts");
+  }
+} catch (e) {
+  console.warn("  SKIP │ default-stdlib measure failed: " + e.message);
 }
 
 // ─── report ──────────────────────────────────────────────────────────────────

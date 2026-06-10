@@ -23,6 +23,9 @@ declare global {
   // The stdlib module catalog (built TS, imported by entry; stamped onto globalThis).
   interface StdlibMeta {
     modules: string[];
+    // The sensible default preload set: eval'd into the heap when config.modules is UNSET.
+    // Heavy libs (mathjs, isomorphic-git) stay OUT of this and remain opt-in via optIn.
+    defaults: string[];
     optIn: string[];
     sizes: Record<string, number>;
     totalBytes: number;
