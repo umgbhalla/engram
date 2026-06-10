@@ -489,12 +489,18 @@ globalThis.__drainLogs = function(){ const l = globalThis.__logs; globalThis.__l
 // host Proxy: every host.<name>(...args) becomes a host-effect call dispatched to
 // Rust (__hostCall), which parks the request and returns a Promise resolved by the
 // shim on resume. fetch is the only wired host effect.
+// Capture the host bridge into a BOOTSTRAP-local const, then remove the global so guest cells
+// cannot shadow/replace globalThis.__hostCall to intercept host effects. The const lives in the
+// heap installed by BOOTSTRAP (WIRED-guarded, once per fresh runtime) so it survives snapshot/
+// restore like every other BOOTSTRAP value. __settleHost stays a global (Rust reads it on resume).
+const __HOSTCALL = globalThis.__hostCall;
+try { delete globalThis.__hostCall; } catch(e) { try { globalThis.__hostCall = undefined; } catch(e2){} }
 globalThis.host = new Proxy({}, {
   get(_t, name){
     if (typeof name !== 'string') return undefined;
     return function(...args){
       // park the request in Rust, then hand back a promise the shim settles on resume.
-      globalThis.__hostCall(name, JSON.stringify(args));
+      __HOSTCALL(name, JSON.stringify(args));
       return new Promise((res,rej)=>{
         globalThis.__settleHost = (ok, val) => { ok ? res(val) : rej(new Error(val)); };
       });
