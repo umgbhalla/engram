@@ -56,7 +56,12 @@
     // V1.2 metering: GET /usage queries the AE SQL API. The account id is non-secret (var);
     // CF_API_TOKEN + ADMIN_TOKEN are deployed as Worker SECRETS (wrangler secret put), never
     // committed. CF_ACCOUNT_ID also accepted as a secret/env; this var is the default.
-    "CF_ACCOUNT_ID": "54a86ffba6a98141d2b1b4a1035334ed"
+    "CF_ACCOUNT_ID": "54a86ffba6a98141d2b1b4a1035334ed",
+    // W1 (#37) WorkOS: CLIENT_ID is non-secret (identifies the WorkOS environment for the
+    // AuthKit JWKS endpoint). WORKOS_API_KEY is a Worker SECRET (wrangler secret put), never
+    // committed. Fail-closed if WORKOS_API_KEY is unset (WorkOS creds won't resolve; legacy
+    // md_ keys keep working).
+    "WORKOS_CLIENT_ID": "client_01KR5KPN41TQAGY5G62QFHY3KG"
   },
 
   // Reuse pre-existing infra (namespaced v1/ keys). SQLite-first snapshot is in the

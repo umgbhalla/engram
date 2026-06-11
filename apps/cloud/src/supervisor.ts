@@ -41,6 +41,15 @@ interface Env {
   CF_API_TOKEN?: string;
   CLOUDFLARE_API_TOKEN?: string;
   ADMIN_TOKEN?: string;
+  // ---- WorkOS (W1 — issue #37): WorkOS Organization == Engram account ----
+  // WORKOS_API_KEY: the environment SECRET (sk_…) used to call the WorkOS Management API
+  //   (POST /api_keys/validations). Deployed via `wrangler secret put WORKOS_API_KEY`.
+  // WORKOS_CLIENT_ID: non-secret (client_…); identifies the WorkOS environment for the
+  //   AuthKit JWKS endpoint. Deployed as a wrangler.jsonc var.
+  // WORKOS_API_HOST: optional override (defaults to https://api.workos.com).
+  WORKOS_API_KEY?: string;
+  WORKOS_CLIENT_ID?: string;
+  WORKOS_API_HOST?: string;
 }
 
 // ---- Worker-Loader + facets surface (not in @cloudflare/workers-types) ----------------------
@@ -101,6 +110,18 @@ interface ResolvedTenant {
   tenantId: string;
   plan: string;
   hash: string;
+}
+// ---- WorkOS-backed credential resolution (W1 — issue #37) ----------------------------------
+// A resolved credential carries the canonical Engram ACCOUNT (= the WorkOS Organization id,
+// or the legacy md_-key tenant id), the granted permissions, and how it was resolved.
+// `account` becomes the server-set x-md-tenant value → facet names, R2 prefixes and AE blobs
+// are all org-scoped. credType distinguishes the three credential classes for metering/audit.
+type CredType = "workos-key" | "workos-user" | "legacy";
+interface ResolvedCredential {
+  account: string;
+  permissions: string[];
+  credType: CredType;
+  plan: string;
 }
 // Generic kernel /frame reply (the Rust DO returns arbitrary JSON; checkpoint is the one field
 // the supervisor reads for keep-warm sizing/metering).
@@ -166,10 +187,191 @@ function facetName(tenant: unknown, sessionId: unknown): string {
   return "kr:" + String(tenant) + ":" + String(sessionId);
 }
 
+// ============================================================================================
+// W1 (issue #37): WorkOS-backed credential resolution.
+//
+// resolveCredential(env, rawKey) classifies a presented credential into one of three classes,
+// verifies it against WorkOS (or the legacy tenants table) and returns the canonical Engram
+// ACCOUNT (= WorkOS Organization id) + granted permissions + credType, or null. FAIL-CLOSED:
+// any unknown / invalid / revoked / mis-configured credential resolves to null → the gate 401s.
+//
+//   prefix "md_"  → legacy md_ key → SupervisorDO._resolveLocal (tenants table) → credType:legacy
+//   JWT (3 dots, "eyJ" header) → AuthKit user token → verify via WorkOS JWKS → org_id from claims
+//   anything else with a non-empty value → treat as a WorkOS native API key (sk_…) →
+//       POST /api_keys/validations → owner.organization_id (=account) + permissions
+//
+// The WorkOS validateApiKey result is CACHED in-isolate keyed by sha256(key) with a short TTL
+// (validate-once-per-connection) so the per-eval hot path never blocks on WorkOS. Sensitive ops
+// can force a live re-validate by passing {fresh:true}.
+// ============================================================================================
+
+const WORKOS_DEFAULT_HOST = "https://api.workos.com";
+const WORKOS_CACHE_TTL_MS = 60_000;
+const WORKOS_CACHE_MAX = 2048;
+
+// in-isolate validate-once cache: sha256(key) -> {cred|null, exp}
+const _workosCache = new Map<string, { cred: ResolvedCredential | null; exp: number }>();
+function _cacheGet(k: string): { cred: ResolvedCredential | null } | undefined {
+  const e = _workosCache.get(k);
+  if (!e) return undefined;
+  if (e.exp < Date.now()) { _workosCache.delete(k); return undefined; }
+  return e;
+}
+function _cacheSet(k: string, cred: ResolvedCredential | null): void {
+  if (_workosCache.size >= WORKOS_CACHE_MAX) {
+    // cheap eviction: drop the oldest insertion (Map preserves insertion order)
+    const first = _workosCache.keys().next().value;
+    if (first !== undefined) _workosCache.delete(first);
+  }
+  _workosCache.set(k, { cred, exp: Date.now() + WORKOS_CACHE_TTL_MS });
+}
+
+function workosHost(env: Env): string { return env.WORKOS_API_HOST || WORKOS_DEFAULT_HOST; }
+
+// Shape of POST /api_keys/validations: { api_key: {...} | null }
+interface WorkOSApiKeyObject {
+  id?: string;
+  owner?: { type?: string; id?: string };
+  permissions?: string[];
+}
+// Validate a WorkOS native API key. Returns the owning organization id + permissions, or null.
+async function workosValidateApiKey(env: Env, value: string): Promise<ResolvedCredential | null> {
+  if (!env.WORKOS_API_KEY) return null; // fail-closed: no management key configured
+  let res: Response;
+  try {
+    res = await fetch(`${workosHost(env)}/api_keys/validations`, {
+      method: "POST",
+      headers: {
+        "authorization": `Bearer ${env.WORKOS_API_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ value }),
+    });
+  } catch (_) { return null; }
+  if (!res.ok) return null; // 401/422/5xx → fail-closed
+  const data = (await res.json().catch(() => null)) as { api_key?: WorkOSApiKeyObject | null } | null;
+  const apiKey = data && data.api_key;
+  if (!apiKey || !apiKey.owner || apiKey.owner.type !== "organization" || !apiKey.owner.id) return null;
+  return {
+    account: String(apiKey.owner.id),
+    permissions: Array.isArray(apiKey.permissions) ? apiKey.permissions.map(String) : [],
+    credType: "workos-key",
+    plan: "workos",
+  };
+}
+
+// ---- AuthKit JWT (user token) verification via WorkOS JWKS (RS256, WebCrypto) ----------------
+// JWKS is fetched once per environment and cached; imported CryptoKeys are memoized by `kid`.
+const _jwksKeyCache = new Map<string, CryptoKey>();
+let _jwksFetchedFor = "";
+let _jwksFetchedAt = 0;
+const JWKS_TTL_MS = 10 * 60_000;
+function b64urlToU8(s: string): Uint8Array {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  const bin = atob(s);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8;
+}
+interface JwkRsa { kid?: string; kty?: string; n?: string; e?: string; alg?: string; use?: string }
+async function loadJwks(env: Env): Promise<void> {
+  if (!env.WORKOS_CLIENT_ID) return;
+  const url = `${workosHost(env)}/sso/jwks/${env.WORKOS_CLIENT_ID}`;
+  if (_jwksFetchedFor === url && Date.now() - _jwksFetchedAt < JWKS_TTL_MS && _jwksKeyCache.size) return;
+  let res: Response;
+  try { res = await fetch(url); } catch (_) { return; }
+  if (!res.ok) return;
+  const jwks = (await res.json().catch(() => null)) as { keys?: JwkRsa[] } | null;
+  if (!jwks || !Array.isArray(jwks.keys)) return;
+  _jwksKeyCache.clear();
+  for (const jwk of jwks.keys) {
+    if (!jwk.kid || jwk.kty !== "RSA" || !jwk.n || !jwk.e) continue;
+    try {
+      const key = await crypto.subtle.importKey(
+        "jwk",
+        { kty: "RSA", n: jwk.n, e: jwk.e, alg: "RS256", ext: true } as JsonWebKey,
+        { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+        false, ["verify"],
+      );
+      _jwksKeyCache.set(jwk.kid, key);
+    } catch (_) { /* skip bad key */ }
+  }
+  _jwksFetchedFor = url;
+  _jwksFetchedAt = Date.now();
+}
+interface AuthKitClaims { org_id?: string; organization_id?: string; permissions?: string[]; iss?: string; exp?: number; aud?: string | string[] }
+// Verify an AuthKit user JWT and return account (org_id) + permissions, or null. Fail-closed.
+async function workosVerifyUserToken(env: Env, token: string): Promise<ResolvedCredential | null> {
+  if (!env.WORKOS_CLIENT_ID) return null;
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const [h, p, s] = parts;
+  let header: { kid?: string; alg?: string };
+  let claims: AuthKitClaims;
+  try {
+    header = JSON.parse(new TextDecoder().decode(b64urlToU8(h)));
+    claims = JSON.parse(new TextDecoder().decode(b64urlToU8(p)));
+  } catch (_) { return null; }
+  if (header.alg !== "RS256" || !header.kid) return null;
+  await loadJwks(env);
+  let key = _jwksKeyCache.get(header.kid);
+  if (!key) { _jwksFetchedFor = ""; await loadJwks(env); key = _jwksKeyCache.get(header.kid); }
+  if (!key) return null;
+  const sig = b64urlToU8(s);
+  const signed = new TextEncoder().encode(`${h}.${p}`);
+  let ok = false;
+  try {
+    ok = await crypto.subtle.verify({ name: "RSASSA-PKCS1-v1_5" }, key, sig as BufferSource, signed as BufferSource);
+  } catch (_) { return null; }
+  if (!ok) return null;
+  if (typeof claims.exp === "number" && claims.exp * 1000 < Date.now()) return null; // expired
+  const org = claims.org_id || claims.organization_id;
+  if (!org) return null; // no organization membership → authorization error (fail-closed)
+  return {
+    account: String(org),
+    permissions: Array.isArray(claims.permissions) ? claims.permissions.map(String) : [],
+    credType: "workos-user",
+    plan: "workos",
+  };
+}
+
+// Top-level resolver. `authStub`-bound legacy resolution is injected (the tenants table lives on
+// the AUTH_SHARD DO, unreachable from this module-level fn), so callers pass a resolveLegacy fn.
+async function resolveCredential(
+  env: Env,
+  rawKey: string,
+  resolveLegacy: (k: string) => Promise<ResolvedTenant | null>,
+  opts?: { fresh?: boolean },
+): Promise<ResolvedCredential | null> {
+  if (!rawKey) return null;
+  // legacy md_ keys: never cached here (the AUTH-shard DO is the source of truth + fast)
+  if (rawKey.startsWith("md_")) {
+    const t = await resolveLegacy(rawKey);
+    if (!t || !t.tenantId) return null;
+    return { account: t.tenantId, permissions: [], credType: "legacy", plan: t.plan || "free" };
+  }
+  const cacheKey = await sha256Hex(rawKey);
+  if (!opts?.fresh) {
+    const hit = _cacheGet(cacheKey);
+    if (hit) return hit.cred; // cached null also short-circuits (negative cache) within TTL
+  }
+  // JWT (AuthKit user token): three base64url segments, JOSE header starts with "eyJ".
+  const looksJwt = rawKey.split(".").length === 3 && /^eyJ/.test(rawKey);
+  const cred = looksJwt
+    ? await workosVerifyUserToken(env, rawKey)
+    : await workosValidateApiKey(env, rawKey);
+  _cacheSet(cacheKey, cred);
+  return cred;
+}
+
 export class SupervisorDO extends DurableObject<Env> {
   private readonly sctx: SupervisorState;
   // The loader closure reads this to scope the gateway props (single-threaded DO, no race).
   private _egressTenant?: string;
+  // W1 (#37): the credential class for the in-flight request (workos-key|workos-user|legacy),
+  // server-set via x-md-credtype by the entry gate; surfaced into the AE metering blob schema.
+  private _reqCredType = "";
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -248,8 +450,9 @@ export class SupervisorDO extends DurableObject<Env> {
     try {
       if (!this.env || !this.env.AE || typeof this.env.AE.writeDataPoint !== "function") return;
       this.env.AE.writeDataPoint({
+        // blob1=account (org_id, GROUP BY dim) · blob2=metric · blob3=session · blob4=credType
         indexes: [String(tenant)],
-        blobs: [String(tenant), String(metric), String(sessionId || "")],
+        blobs: [String(tenant), String(metric), String(sessionId || ""), String(this._reqCredType || "")],
         doubles: [Number(value) || 0, 1],
       });
     } catch (_) {}
@@ -445,6 +648,8 @@ export class SupervisorDO extends DurableObject<Env> {
     // "anon" catch-all fallback. A tenant-scoped op with no server tenant fails closed (403)
     // via requireTenant() below — so a client can never spoof or share a tenant bucket.
     const tenant = req.headers.get("x-md-tenant") || "";
+    // W1 (#37): server-set credential class for metering/audit (entry gate sets x-md-credtype).
+    this._reqCredType = req.headers.get("x-md-credtype") || "";
     const sessionId = url.searchParams.get("session") || "default";
     // Fail-closed guard for tenant-scoped routes. Returns the resolved tenant or throws a 403.
     const requireTenant = (): string => {
@@ -672,9 +877,12 @@ export default {
       let tenant = url.searchParams.get("tenant") || "";
       if (!isAdmin) {
         const key = getApiKey(req, url);
-        const resolved = await authStub(env).fetch(`https://do/_auth/resolve?key=${encodeURIComponent(key)}`).then((r) => r.json() as Promise<ResolvedTenant | null>).catch(() => null);
-        if (!resolved || !resolved.tenantId) return j({ error: "unauthorized" }, 401);
-        tenant = resolved.tenantId; // ignore any client-supplied tenant
+        const legacyResolve = (k: string) =>
+          authStub(env).fetch(`https://do/_auth/resolve?key=${encodeURIComponent(k)}`)
+            .then((r) => r.json() as Promise<ResolvedTenant | null>).catch(() => null);
+        const cred = await resolveCredential(env, key, legacyResolve);
+        if (!cred || !cred.account) return j({ error: "unauthorized" }, 401);
+        tenant = cred.account; // ignore any client-supplied tenant (server-derived account)
       }
       const windowMinutes = Number(url.searchParams.get("window") || url.searchParams.get("windowMinutes") || 1440) || 1440;
       try { return j(await queryUsage(env, tenant || null, windowMinutes)); }
@@ -702,15 +910,23 @@ export default {
     if (p.startsWith("/_")) return j({ error: "not found" }, 404);
     const key = getApiKey(req, url);
     if (!key) return j({ error: "missing API key (x-api-key header or ?apiKey=)" }, 401);
-    const resolved = await authStub(env)
-      .fetch(`https://do/_auth/resolve?key=${encodeURIComponent(key)}`).then((r) => r.json() as Promise<ResolvedTenant | null>).catch(() => null);
-    if (!resolved || !resolved.tenantId) return j({ error: "invalid or revoked API key" }, 401);
+    // W1 (#37): resolve the credential via WorkOS (org-scoped key / AuthKit user token) or the
+    // legacy md_ tenants table. account == the WorkOS Organization id (canonical x-md-tenant).
+    // FAIL-CLOSED: null → 401, never accept-then-check.
+    const legacyResolve = (k: string) =>
+      authStub(env).fetch(`https://do/_auth/resolve?key=${encodeURIComponent(k)}`)
+        .then((r) => r.json() as Promise<ResolvedTenant | null>).catch(() => null);
+    const cred = await resolveCredential(env, key, legacyResolve);
+    if (!cred || !cred.account) return j({ error: "invalid or revoked API key" }, 401);
 
     const sessionId = url.searchParams.get("session") || "default";
     const stub = env.SUPERVISOR.get(env.SUPERVISOR.idFromName(shardFor(sessionId, SHARD_COUNT)));
     const headers = new Headers(req.headers);
-    headers.set("x-md-tenant", resolved.tenantId);
-    headers.set("x-md-plan", resolved.plan || "free");
+    // SECURITY (#38): the tenant is server-derived (cred.account) — any client-supplied
+    // x-md-tenant / ?tenant is ignored; the DO trusts ONLY this header.
+    headers.set("x-md-tenant", cred.account);
+    headers.set("x-md-plan", cred.plan || "free");
+    headers.set("x-md-credtype", cred.credType);
     return stub.fetch(new Request(req.url, { method: req.method, headers, body: req.body, redirect: "manual" }));
   },
 };

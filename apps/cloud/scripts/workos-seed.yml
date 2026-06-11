@@ -1,0 +1,61 @@
+# WorkOS seed file for Engram Cloud (W1 — issue #37).
+# Provisions environment-level roles + permissions for the Engram RBAC model.
+# A WorkOS Organization == an Engram account; these roles/permissions scope
+# kernel access for org-scoped API keys and AuthKit user tokens.
+#
+# Idempotent: existing resources are skipped. Apply with:
+#   npx --yes workos@latest seed --file=apps/cloud/scripts/workos-seed.yml
+# Tear down with `--clean`.
+
+permissions:
+  - name: Kernel Eval
+    slug: kernel:eval
+    description: Create sessions and evaluate cells in the kernel
+  - name: Kernel Read
+    slug: kernel:read
+    description: Read kernel/session output and state
+  - name: Kernel Reset
+    slug: kernel:reset
+    description: Reset or delete kernel session state
+  - name: Session List
+    slug: session:list
+    description: List sessions for the account
+  - name: Session Share
+    slug: session:share
+    description: Share a session with other users in the account
+  - name: Usage Read
+    slug: usage:read
+    description: Read account usage and metering
+  - name: Account Admin
+    slug: account:admin
+    description: Administer the account (keys, members, settings)
+
+roles:
+  - name: Engram Admin
+    slug: engram-admin
+    description: Full account access including admin operations
+    permissions:
+      - kernel:eval
+      - kernel:read
+      - kernel:reset
+      - session:list
+      - session:share
+      - usage:read
+      - account:admin
+  - name: Engram Developer
+    slug: engram-developer
+    description: Evaluate, read, reset, list and share sessions
+    permissions:
+      - kernel:eval
+      - kernel:read
+      - kernel:reset
+      - session:list
+      - session:share
+      - usage:read
+  - name: Engram Viewer
+    slug: engram-viewer
+    description: Read-only access to kernel output, sessions and usage
+    permissions:
+      - kernel:read
+      - session:list
+      - usage:read
