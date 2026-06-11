@@ -89,16 +89,24 @@ export interface KernelReply {
 
 export type KernelState = "connecting" | "disconnected";
 
-/** Auto-detect: cloud uses /connect?session=&apiKey= ; kernel uses /ws?id= */
+/**
+ * Auto-detect the WS URL.
+ *  - engram-cloud (multi-tenant): /connect?session=&apiKey=  (selected by a `-v1x` / `connect` endpoint).
+ *  - bare engram-kernel: /ws?id=&apiKey=  — the shared bearer key (auth enforced) is passed as a
+ *    query param AND re-sent as a {t:auth,token} first frame (see Kernel.open). Same key field.
+ */
 export function kernelUrl(endpoint: string, sessionId: string, apiKey: string): string {
   const ep = endpoint.replace(/\/+$/, "");
   const id = sessionId;
   const key = apiKey.trim();
-  if (key || /-v1\d?\b/.test(ep) || /connect/.test(ep)) {
+  // Cloud endpoint: /connect (apiKey is the per-tenant cloud key).
+  if (/-v1\d?\b/.test(ep) || /connect/.test(ep)) {
     const u = `${ep}/connect?session=${encodeURIComponent(id)}`;
     return key ? `${u}&apiKey=${encodeURIComponent(key)}` : u;
   }
-  return `${ep}/ws?id=${encodeURIComponent(id)}`;
+  // Bare kernel: /ws (apiKey is the shared bearer key; also re-sent as {t:auth}).
+  const base = `${ep}/ws?id=${encodeURIComponent(id)}`;
+  return key ? `${base}&apiKey=${encodeURIComponent(key)}` : base;
 }
 
 export interface KernelEndpoint {
@@ -121,6 +129,10 @@ export class Kernel {
   /** Resolves the live connection coordinates. */
   resolve: () => KernelEndpoint;
   onState: (s: KernelState) => void = () => {};
+  /** Fired when the socket closes with an auth-rejection code (1008 policy / 4001 / 401). */
+  onAuthError: (code: number, reason: string) => void = () => {};
+  /** Last close code seen — lets callers distinguish an auth reject from a normal drop. */
+  lastCloseCode = 0;
 
   constructor(resolve: () => KernelEndpoint) {
     this.resolve = resolve;
@@ -176,10 +188,15 @@ export class Kernel {
     if (p) { this.pending = null; clearTimeout(p.timer); p.resolve(msg as KernelReply); }
   };
 
-  private onClose = (): void => {
+  private onClose = (ev?: CloseEvent): void => {
+    const code = ev?.code ?? 0;
+    const reason = ev?.reason ?? "";
+    this.lastCloseCode = code;
     this.onState("disconnected");
+    // 1008 = policy violation (the kernel rejects a missing/bad bearer key); 4001/4401 custom; 401 mirror.
+    if (code === 1008 || code === 4001 || code === 4401 || code === 401) this.onAuthError(code, reason);
     const p = this.pending;
-    if (p) { this.pending = null; clearTimeout(p.timer); p.reject(new Error("ws closed before reply")); }
+    if (p) { this.pending = null; clearTimeout(p.timer); p.reject(new Error(reason || (code === 1008 ? "auth rejected" : "ws closed before reply"))); }
   };
 
   private sendRaw(obj: unknown): void {
@@ -196,8 +213,13 @@ export class Kernel {
       ws.addEventListener("error", () => rej(new Error("ws error")), { once: true });
       // ONE persistent message/close handler for the lifetime of this socket.
       ws.addEventListener("message", this.onMessage);
-      ws.addEventListener("close", this.onClose);
+      ws.addEventListener("close", this.onClose as (ev: Event) => void);
     });
+    // AUTH FIRST: the bare engram-kernel enforces bearer auth — send {t:auth,token} before
+    // {t:create}/eval so a credential-less upgrade re-auths (mirrors @engram/sdk). Idempotent.
+    const { apiKey } = this.resolve();
+    const key = (apiKey || "").trim();
+    if (key) await this.raw({ t: "auth", token: key }).catch(() => {});
     if (this.config) await this.raw({ t: "create", config: this.config });
   }
 

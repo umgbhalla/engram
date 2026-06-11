@@ -76,6 +76,20 @@ async function refreshState(): Promise<void> {
   }
   setSessionPill();
 }
+// Surface an auth rejection (1008 / 401) with a clear "enter your auth key" prompt and
+// open the Connection panel so the fix is one paste away.
+kernel.onAuthError = (code: number, reason: string): void => {
+  const hint = el("authHint");
+  hint.hidden = false;
+  hint.className = "hint auth-err";
+  const why = $in("cfgApiKey").value.trim() ? "rejected" : "missing";
+  hint.textContent = `Auth key ${why} (kernel closed ${code}${reason ? " · " + reason : ""}) — paste a valid key and press Reconnect.`;
+  const head = el<HTMLButtonElement>("connHead");
+  if (head.getAttribute("aria-expanded") !== "true") head.click();
+  el("stateDot").className = "dot off";
+  el("stateTxt").textContent = "auth required";
+};
+
 kernel.onState = (s: KernelState): void => {
   if (s === "disconnected") {
     el("stateDot").className = "dot off";
@@ -435,6 +449,13 @@ const persistConn = (): void => {
 wirePanel("connHead", "connBody");
 wirePanel("cfgHead", "cfgBody");
 wirePanel("e2eHead", "e2eBody");
+
+// Persist the auth key to localStorage as it is typed (survives reload) and clear any
+// stale "auth required" prompt once the user edits the key.
+$in("cfgApiKey").addEventListener("input", () => {
+  LS.key = $in("cfgApiKey").value.trim();
+  el("authHint").hidden = true;
+});
 
 el<HTMLButtonElement>("addCell").onclick = () => {
   const c = addCell();

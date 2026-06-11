@@ -521,6 +521,12 @@ select { cursor: pointer; }
   line-height: 1.5;
   text-wrap: pretty;
 }
+.hint.auth-err {
+  color: #e5484d;
+  font-weight: 600;
+  border-left: 2px solid #e5484d;
+  padding-left: 8px;
+}
 
 /* ===== E2E output ===== */
 .e2e-out {

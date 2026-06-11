@@ -74,8 +74,9 @@
         <div class="panel-body" id="connBody">
           <label for="cfgEndpoint">Kernel endpoint</label>
           <input id="cfgEndpoint" spellcheck="false" value="wss://engram-kernel.umg-bhalla88.workers.dev" />
-          <label for="cfgApiKey">API key <span class="muted">(engram-cloud only)</span></label>
-          <input id="cfgApiKey" spellcheck="false" placeholder="md_…  (blank for engram-kernel)" />
+          <label for="cfgApiKey">Auth key <span class="muted">(required — the kernel enforces bearer auth)</span></label>
+          <input id="cfgApiKey" type="password" spellcheck="false" autocomplete="off" placeholder="paste your engram-kernel / API key" />
+          <p class="hint" id="authHint" hidden></p>
           <label for="cfgSession">Session id</label>
           <div class="field-row">
             <input id="cfgSession" spellcheck="false" />
