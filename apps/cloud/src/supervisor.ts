@@ -464,6 +464,12 @@ export class SupervisorDO extends DurableObject<Env> {
         const src = url.searchParams.get("src") || "1+1";
         return J({ tenant, sessionId, ...(await this._evalMetered(tenant, sessionId, src, Date.now() & 0xffff)) });
       }
+      if (p === "/frame") {
+        this._touch(tenant, sessionId);
+        let frame: Record<string, unknown> = {};
+        try { frame = JSON.parse((await req.text()) || "{}"); } catch (_) {}
+        return J({ tenant, sessionId, ...(await this._frame(tenant, sessionId, frame)) });
+      }
       if (p === "/gen") return J(await this._frame(tenant, sessionId, { t: "gen" }));
       if (p === "/ping") return J(await this._frame(tenant, sessionId, { t: "ping" }));
       if (p === "/reset") return J(await this._frame(tenant, sessionId, { t: "reset" }));

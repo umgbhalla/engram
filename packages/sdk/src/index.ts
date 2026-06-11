@@ -108,6 +108,33 @@ export type EvalInterceptor = (
   next: (code: string) => Promise<EvalResult>,
 ) => Promise<EvalResult>;
 
+/** Descriptor for a large MIME/value payload stored server-side and read in chunks. */
+export interface ArtifactValue {
+  kind: "artifact";
+  handle: string;
+  mime?: string;
+  chars?: number;
+  bytes?: number;
+  encoding?: string;
+  chunkMaxChars?: number;
+}
+
+/** Jupyter-compatible MIME bundle: MIME type -> JSON/string/artifact payload. */
+export type MimeBundle = Record<string, unknown | ArtifactValue>;
+
+/** Jupyter-style output event emitted by a cell. */
+export interface MimeOutput {
+  output_type: "execute_result" | "display_data" | "update_display_data" | "clear_output" | "stream" | "error" | string;
+  data?: MimeBundle;
+  metadata?: Record<string, unknown>;
+  transient?: Record<string, unknown>;
+  execution_count?: number | null;
+  name?: string;
+  text?: string;
+  wait?: boolean;
+  [k: string]: unknown;
+}
+
 /** The typed result of {@link EngramSession.eval}. */
 export interface EvalResult<T = unknown, F = unknown> {
   /** `true` if the cell completed without throwing. */
@@ -120,8 +147,12 @@ export interface EvalResult<T = unknown, F = unknown> {
   value: T;
   /** A util.inspect-style preview string (always present for non-primitives). */
   valuePreview?: string;
-  /** Coarse tag: `"number" | "string" | "object" | "array" | "error" | ...`. */
+  /** Coarse tag for the completion value. */
   valueType?: string;
+  /** MIME bundle for the completion value, suitable for Jupyter-style renderers. */
+  mimeBundle?: MimeBundle;
+  /** Jupyter-style display/update/clear/execute_result outputs emitted by the cell. */
+  outputs: MimeOutput[];
   /** `console.*` lines captured during the cell. */
   console: ConsoleLine[];
   /** Present (and `ok === false`) when the cell threw. */
@@ -737,8 +768,18 @@ class HttpTransport implements Transport {
         return this.call("/evict", { method: "GET" });
       case "evict":
         return this.call("/evict", { method: "GET" });
+      case "artifact":
+        return this.call("/frame", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(frame),
+        });
       default:
-        return this.call("/status", { method: "GET" });
+        return this.call("/frame", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(frame),
+        });
     }
   }
 
@@ -1063,6 +1104,8 @@ export class EngramSession {
       value,
       valuePreview: typeof reply?.valuePreview === "string" ? reply.valuePreview : undefined,
       valueType: vt,
+      mimeBundle: reply?.mimeBundle && typeof reply.mimeBundle === "object" ? reply.mimeBundle : undefined,
+      outputs: Array.isArray(reply?.outputs) ? reply.outputs : [],
       console,
       error: reply?.error || undefined,
       checkpoint: reply?.checkpoint || undefined,
@@ -1070,6 +1113,32 @@ export class EngramSession {
       // Populated by eval() after the rpc returns (the captured final is per-eval).
       finalSet: false,
     };
+  }
+
+  /** Read a server-side artifact descriptor or handle into a string. */
+  async readArtifact(artifact: ArtifactValue | string, opts: { timeoutMs?: number; chunkChars?: number } = {}): Promise<string> {
+    let out = "";
+    for await (const chunk of this.streamArtifact(artifact, opts)) out += chunk;
+    return out;
+  }
+
+  /** Stream a server-side text artifact in protocol chunks. */
+  async *streamArtifact(artifact: ArtifactValue | string, opts: { timeoutMs?: number; chunkChars?: number } = {}): AsyncIterable<string> {
+    const handle = typeof artifact === "string" ? artifact : artifact.handle;
+    if (!handle) throw new EngramError("artifact handle is required");
+    let offset = 0;
+    const fallbackLen = typeof artifact === "string" ? 128 * 1024 : artifact.chunkMaxChars || 128 * 1024;
+    const len = Math.max(1, Math.min(opts.chunkChars || fallbackLen, 128 * 1024));
+    for (;;) {
+      const reply = await this.transport.request({ t: "artifact", handle, offset, len }, opts.timeoutMs ?? this.timeoutMs);
+      if (reply?.ok === false) {
+        throw toTypedError(reply.error || { name: "ArtifactError", message: "artifact read failed" });
+      }
+      if (typeof reply?.data !== "string") throw new EngramError("artifact chunk missing string data");
+      yield reply.data;
+      offset += reply.data.length;
+      if (reply.done || reply.data.length === 0) break;
+    }
   }
 
   // ---- durable key/value sugar (over the persisted namespace) ----

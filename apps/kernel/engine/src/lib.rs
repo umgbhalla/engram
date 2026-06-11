@@ -2655,6 +2655,91 @@ globalThis.__preview = function(v, depth){
   try { return go(v, depth); } catch(e){ return '[preview-error]'; }
 };
 
+// JUPYTER-STYLE MIME OUTPUTS. Additive: cells can call display({...mime bundle...}) and eval
+// replies carry mimeBundle + outputs[] without changing value/valuePreview/valueType.
+try {
+  globalThis.__displayEvents = globalThis.__displayEvents || [];
+  globalThis.__textArtifacts = globalThis.__textArtifacts || Object.create(null);
+  globalThis.__artifactSeq = globalThis.__artifactSeq || 0;
+  globalThis.__isMimeKey = function(k){ return typeof k === 'string' && (k.indexOf('/') > 0 || k.indexOf('+') > 0); };
+  globalThis.__looksMimeBundle = function(x){
+    if (!x || typeof x !== 'object' || Array.isArray(x)) return false;
+    var ks = Object.keys(x);
+    for (var i=0;i<ks.length;i++) if (globalThis.__isMimeKey(ks[i])) return true;
+    return false;
+  };
+  globalThis.__jsonSafe = function(v){
+    try { return JSON.parse(JSON.stringify(v)); } catch(e) { return null; }
+  };
+  globalThis.__makeTextArtifact = function(mime, text, idHint){
+    var s = String(text);
+    var id = idHint || String(++globalThis.__artifactSeq);
+    globalThis.__textArtifacts[id] = { mime: mime || 'text/plain;charset=utf-8', data: s };
+    return {
+      kind: 'artifact',
+      handle: 'pending:' + id,
+      mime: mime || 'text/plain;charset=utf-8',
+      chars: s.length,
+      encoding: 'utf-16-js-string',
+      chunkMaxChars: globalThis.__TEXT_ARTIFACT_CHUNK_MAX_CHARS || 131072
+    };
+  };
+  globalThis.__mimeValue = function(mime, v){
+    var threshold = globalThis.__TEXT_ARTIFACT_THRESHOLD_CHARS || 921600;
+    if (typeof v === 'string' && v.length > threshold) return globalThis.__makeTextArtifact(mime, v);
+    if (mime === 'application/json' && typeof v !== 'string') return globalThis.__jsonSafe(v);
+    return v;
+  };
+  globalThis.__normalizeMimeBundle = function(data, fallbackMime){
+    var out = {};
+    if (data && typeof data === 'object' && data.data && globalThis.__looksMimeBundle(data.data)) data = data.data;
+    if (globalThis.__looksMimeBundle(data)) {
+      var ks = Object.keys(data);
+      for (var i=0;i<ks.length;i++) out[ks[i]] = globalThis.__mimeValue(ks[i], data[ks[i]]);
+      if (out['text/plain'] === undefined) out['text/plain'] = globalThis.__preview(data, 2);
+      return out;
+    }
+    var mime = fallbackMime || 'text/plain';
+    out[mime] = globalThis.__mimeValue(mime, data);
+    if (mime !== 'text/plain') out['text/plain'] = globalThis.__preview(data, 2);
+    return out;
+  };
+  globalThis.__mimeBundleForValue = function(v, preview, jsonValue){
+    var out = {};
+    if (typeof v === 'string') out['text/plain'] = globalThis.__mimeValue('text/plain;charset=utf-8', v);
+    else {
+      out['text/plain'] = preview;
+      if (v !== undefined && typeof v !== 'function' && typeof v !== 'symbol') out['application/json'] = jsonValue;
+    }
+    return out;
+  };
+  globalThis.__pushDisplay = function(outputType, data, metadata, transient){
+    var ev = { output_type: outputType || 'display_data', data: globalThis.__normalizeMimeBundle(data), metadata: metadata || {} };
+    if (transient && typeof transient === 'object') ev.transient = transient;
+    globalThis.__displayEvents.push(ev);
+    return undefined;
+  };
+  globalThis.display = function(data, metadata, transient){
+    if (data && typeof data === 'object' && data.output_type && data.data) {
+      return globalThis.__pushDisplay(data.output_type, data.data, data.metadata || metadata, data.transient || transient);
+    }
+    return globalThis.__pushDisplay('display_data', data, metadata, transient);
+  };
+  globalThis.update_display = function(data, metadata, display_id){
+    var tr = (display_id && typeof display_id === 'object') ? display_id : (display_id ? { display_id: String(display_id) } : undefined);
+    return globalThis.__pushDisplay('update_display_data', data, metadata, tr);
+  };
+  globalThis.clear_output = function(wait){
+    globalThis.__displayEvents.push({ output_type: 'clear_output', wait: !!wait });
+    return undefined;
+  };
+  globalThis.displayHTML = function(s, metadata){ return globalThis.display({ 'text/html': String(s) }, metadata); };
+  globalThis.displayMarkdown = function(s, metadata){ return globalThis.display({ 'text/markdown': String(s) }, metadata); };
+  globalThis.displayJSON = function(v, metadata){ return globalThis.display({ 'application/json': v, 'text/plain': globalThis.__preview(v, 2) }, metadata); };
+  globalThis.displayImage = function(data, mime, metadata){ var m = mime || 'image/png'; var b = {}; b[m] = String(data); return globalThis.display(b, metadata); };
+  globalThis.__drainDisplayEvents = function(){ var a = globalThis.__displayEvents || []; globalThis.__displayEvents = []; return a; };
+} catch(e){}
+
 // __hasTopLevelReturn(src): true iff `src` contains a `return` KEYWORD at brace-depth 0 (a
 // top-level return statement). A depth-0, string/template/regex/line+block-comment-aware token
 // scan — so `return` inside a nested function, a string, or a regex is IGNORED. Used by the cell
@@ -3072,36 +3157,36 @@ fn finalize_cell(ctx: &Ctx) {
       (function(){
         var ok = globalThis.__cellOk;
         var logs = globalThis.__drainLogs();
+        var displays = globalThis.__drainDisplayEvents ? globalThis.__drainDisplayEvents() : [];
         if (ok) {
           var v = globalThis.__cellResult;
           var preview = globalThis.__preview(v, 2);
           var vtype = globalThis.__valueType(v);
           if (typeof v === 'string' && v.length > __TEXT_ARTIFACT_THRESHOLD_CHARS) {
-            globalThis.__lastTextArtifact = v;
+            var desc = globalThis.__makeTextArtifact('text/plain;charset=utf-8', v, 'text');
+            var mb = {'text/plain': desc, 'application/vnd.engram.artifact+json': desc};
             return JSON.stringify({
               ok:true,
-              value:{
-                kind:'artifact',
-                handle:'pending:text',
-                mime:'text/plain;charset=utf-8',
-                chars:v.length,
-                encoding:'utf-16-js-string',
-                chunkMaxChars:__TEXT_ARTIFACT_CHUNK_MAX_CHARS
-              },
+              value:desc,
               valuePreview:preview,
               valueType:'artifact',
+              mimeBundle:mb,
+              outputs:displays.concat([{output_type:'execute_result', execution_count:null, data:mb, metadata:{}}]),
               logs:JSON.parse(logs)
             });
           }
           var value;
           try { value = (v===undefined) ? null : JSON.parse(JSON.stringify(v)); }
           catch(e){ value = null; }
-          return JSON.stringify({ok:true, value:value, valuePreview:preview, valueType:vtype, logs:JSON.parse(logs)});
+          var mimeBundle = globalThis.__mimeBundleForValue(v, preview, value);
+          var outputs = displays.slice();
+          if (v !== undefined) outputs.push({output_type:'execute_result', execution_count:null, data:mimeBundle, metadata:{}});
+          return JSON.stringify({ok:true, value:value, valuePreview:preview, valueType:vtype, mimeBundle:mimeBundle, outputs:outputs, logs:JSON.parse(logs)});
         } else {
           var e = globalThis.__cellError;
           var name='Error', message=String(e), stack='';
           if (e && typeof e === 'object'){ name = e.name||'Error'; message = e.message!==undefined?String(e.message):String(e); stack = e.stack||''; }
-          return JSON.stringify({ok:false, valueType:'error', logs:JSON.parse(logs), error:{name:name, message:message, stack:stack}});
+          return JSON.stringify({ok:false, valueType:'error', outputs:displays, logs:JSON.parse(logs), error:{name:name, message:message, stack:stack}});
         }
       })()
     "#;
@@ -3137,8 +3222,15 @@ fn finalize_cell(ctx: &Ctx) {
 }
 
 #[no_mangle]
-pub extern "C" fn result_artifact_chunk(offset: usize, len: usize) -> i32 {
+pub extern "C" fn result_artifact_chunk(
+    id_ptr: *const u8,
+    id_len: usize,
+    offset: usize,
+    len: usize,
+) -> i32 {
     ensure_ctx();
+    let id = unsafe { std::slice::from_raw_parts(id_ptr, id_len) };
+    let id = std::str::from_utf8(id).unwrap_or("text").to_string();
     CTX.with(|c| {
         if let Some((_, ctx)) = c.borrow().as_ref() {
             ctx.with(|ctx| {
@@ -3146,9 +3238,9 @@ pub extern "C" fn result_artifact_chunk(offset: usize, len: usize) -> i32 {
                 let frame_js = format!(
                     r#"
                       (function(){{
-                        var v = (typeof globalThis.__lastTextArtifact === 'string')
-                          ? globalThis.__lastTextArtifact
-                          : globalThis.__cellResult;
+                        var id = {};
+                        var rec = globalThis.__textArtifacts && globalThis.__textArtifacts[id];
+                        var v = rec && typeof rec.data === 'string' ? rec.data : undefined;
                         if (typeof v !== 'string') {{
                           return JSON.stringify({{ok:false,t:'artifact',error:{{name:'ArtifactError',message:'last result is not a text artifact'}}}});
                         }}
@@ -3162,11 +3254,13 @@ pub extern "C" fn result_artifact_chunk(offset: usize, len: usize) -> i32 {
                           offset:off,
                           chars:chunk.length,
                           totalChars:total,
+                          mime:(rec && rec.mime) || 'text/plain;charset=utf-8',
                           done:off + chunk.length >= total,
                           data:chunk
                         }});
                       }})()
                     "#,
+                    json_str(&id),
                     offset,
                     chunk_len,
                     TEXT_ARTIFACT_CHUNK_MAX_CHARS

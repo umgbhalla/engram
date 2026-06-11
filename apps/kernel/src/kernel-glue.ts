@@ -241,7 +241,7 @@ interface EngineExports {
   kv_export_ptr(): number;
   kv_export_len(): number;
   kv_import(ptr: number, len: number): void;
-  result_artifact_chunk(offset: number, len: number): number;
+  result_artifact_chunk(idPtr: number, idLen: number, offset: number, len: number): number;
   eval_begin(ptr: number, len: number, budget: bigint, growCapPages: number): number;
   eval_resume(ptr: number, len: number): number;
   run_gc(): void;
@@ -287,6 +287,26 @@ interface KernelConfig {
   // fs provider: undefined / {provider:"vfs"} = in-heap VFS (sync, durable in snapshot);
   // {provider:"r2",binding?,prefix?} = host-backed R2 (async-only; serviced DO-side in lib.rs).
   fs?: { provider?: string; binding?: string; prefix?: string };
+
+  // EXTENSIBILITY API — REDUCED Phase 1 (#32): builder-registered host tools routed to the CLIENT.
+  // Validated + persisted in lib.rs create_critical (CLIENT backend only; http/worker rejected).
+  // Each ext installs a host.<name>.<fn> namespace (glue-seeded snippet) delegating to the existing
+  // flat-name host Proxy -> {t:hostcall} client bridge. SECRET-FREE; no credentials in this phase.
+  extensions?: ExtManifest[];
+}
+
+interface ExtTool {
+  fn: string;
+  params?: unknown;
+  description?: string;
+  example?: unknown;
+}
+interface ExtManifest {
+  name: string;
+  version?: string;
+  backend?: { kind?: string };
+  tools?: ExtTool[];
+  limits?: { callsPerCell?: number; maxResultBytes?: number };
 }
 
 interface RestoreTimings {
@@ -555,6 +575,11 @@ interface StreamState {
 // Per-cell budget for ws.* effects (a chatty pump cell makes many recv/poll calls). Counted
 // separately from maxHostCallsPerCell (the 64 guard) like maxStreamOpsPerCell.
 const WS_MAX_OPS_PER_CELL = 4096;
+// EXTENSIBILITY API — REDUCED Phase 1 (#32): hard caps for client-backend ext tools (mirror the
+// spec's limits ceiling). callsPerCell <= 64; maxResultBytes <= 65536 (also keeps the oplog row
+// well under SQLITE_MAX_VALUE_BYTES). config.limits may only LOWER these.
+const EXT_MAX_CALLS_PER_CELL = 64;
+const EXT_MAX_RESULT_BYTES = 65536;
 // Idle deadline for a parked recv(): if no frame arrives within this window the recv resolves
 // {type:"idle"} so the cell ends and the eval mutex turns over (never hold it forever).
 const WS_RECV_IDLE_MS = 25000;
@@ -762,6 +787,14 @@ class GlueKernel {
   // listener enqueues the next frame or the idle deadline fires).
   _ws?: Map<string, WsState>;
 
+  // EXTENSIBILITY API — REDUCED Phase 1 (#32): client-backend tool registry resolved from
+  // config.extensions in _applyConfig. Map "<extName>.<fn>" -> { ext, callsPerCell, maxResultBytes }.
+  // A registered tool routes through the existing _clientHostCall bridge with a per-cell call cap +
+  // result clamp. SECRET-FREE; no credentials in this phase (http/worker backends are rejected at
+  // create in lib.rs). _extOps = per-(ext)-cell call counter (mirrors streamOps/wsOps), reset per cell.
+  _extTools?: Map<string, { ext: string; callsPerCell: number; maxResultBytes: number }>;
+  _extOps?: Map<string, number>;
+  _aeExt?: (op: string) => void;
 
   constructor() {
     this.inst = null;
@@ -798,6 +831,59 @@ class GlueKernel {
   setFenceContext(doId: string, cell: number): void {
     this._fenceDoId = doId;
     this._fenceCell = cell;
+  }
+
+  // setExtAeSink: the DO installs (per eval) a sink that writes ONE AE datapoint per ext call
+  // (op="ext:<name>"). The glue has no AE binding; lib.rs owns the AE path, so it passes a closure.
+  // `null` clears it (facet/HTTP path or no AE binding).
+  setExtAeSink(sink: ((op: string) => void) | null): void {
+    this._aeExt = typeof sink === "function" ? sink : undefined;
+  }
+
+  // _seedExtMeta: EXTENSIBILITY API — REDUCED Phase 1 (#32) discoverability WITHOUT an engine edit.
+  // Evals a glue-side snippet into the live VM (same eval-snippet mechanism as _seedStdlibMeta /
+  // _applyFsProvider) that (a) installs globalThis.__extMeta = the SECRET-FREE manifest so an agent
+  // can read the registered tools/params/examples; (b) for each ext, installs a namespace object
+  // host.<name> = { <fn>: (...a)=>host["<name>.<fn>"](...a) } by REPLACING globalThis.host with a
+  // wrapper Proxy that returns the namespace for an ext name and delegates EVERYTHING ELSE to the
+  // original host Proxy (so the flat-name "<name>.<fn>" still reaches the BOOTSTRAP-captured
+  // __HOSTCALL). Idempotent; re-applied on every create AND restore (a cold-woken VM re-runs
+  // BOOTSTRAP but NOT this glue seed). Pure deterministic data write (zero entropy).
+  _seedExtMeta(): void {
+    try {
+      const exts = Array.isArray(this.config.extensions) ? this.config.extensions : [];
+      // SECRET-FREE manifest: names/versions/tools (fn/description/params/example). No backend/creds.
+      const meta = exts.map((e) => ({
+        name: e.name,
+        version: e.version || "0.0.0",
+        tools: (Array.isArray(e.tools) ? e.tools : []).map((t) => ({
+          fn: t.fn,
+          description: t.description || "",
+          params: t.params ?? null,
+          example: t.example ?? null,
+        })),
+      }));
+      const names = exts.map((e) => e.name).filter((n) => typeof n === "string" && n);
+      const ex = this._ex();
+      const src =
+        "(function(){var M=" + JSON.stringify(meta) + ";var NS=" + JSON.stringify(names) + ";" +
+        "globalThis.__extMeta=M;" +
+        "var nameSet={};for(var i=0;i<NS.length;i++)nameSet[NS[i]]=true;" +
+        // capture the original host Proxy ONCE (re-seed must not re-wrap an already-wrapped host).
+        "if(!globalThis.__hostBase)globalThis.__hostBase=globalThis.host;" +
+        "var base=globalThis.__hostBase;" +
+        "function mkNs(name){var o={};var tools=null;for(var k=0;k<M.length;k++)if(M[k].name===name)tools=M[k].tools;" +
+        "if(tools)for(var j=0;j<tools.length;j++){(function(fn){o[fn]=function(){var a=Array.prototype.slice.call(arguments);return base[name+'.'+fn].apply(base,a);};})(tools[j].fn);}return o;}" +
+        "var nsCache={};" +
+        "globalThis.host=new Proxy(base,{get:function(t,prop){" +
+        "if(typeof prop==='string'&&nameSet[prop]){if(!nsCache[prop])nsCache[prop]=mkNs(prop);return nsCache[prop];}" +
+        "return base[prop];}});" +
+        "globalThis.extensions=function(){return globalThis.__extMeta;};" +
+        "})();0";
+      const b = TEXT_ENC.encode(src);
+      this._writeScratch(b);
+      ex.eval_begin(ex.scratch_ptr(), b.length, BigInt(300000), 0);
+    } catch { /* non-fatal: flat host["<name>.<fn>"] still works without the namespace sugar */ }
   }
 
   // _sanityProbe: post-restore integrity check before a hot-blitted session goes live. Runs a full
@@ -896,7 +982,32 @@ class GlueKernel {
     // true ⇒ allow all; false ⇒ block all; [hosts] ⇒ hostname allowlist. A blocked host rejects
     // with FetchBlockedError (see _doFetch; socket stays alive). config can still RESTRICT egress.
     this._fetchAllow = cfg.fetch === undefined ? true : cfg.fetch;
+    // EXTENSIBILITY API (#32): resolve the CLIENT-backend tool registry from config.extensions.
+    // lib.rs create_critical already validated (client-only, name/shadow/size rules) + persisted in
+    // meta.config, so this is re-resolved on EVERY create/restore (configJson round-trips through the
+    // snapshot). Defensive: only register backend.kind==="client" tools; cap callsPerCell/maxResultBytes.
+    this._resolveExtensions(cfg);
     return cfg;
+  }
+
+  _resolveExtensions(cfg: KernelConfig): void {
+    const tools = new Map<string, { ext: string; callsPerCell: number; maxResultBytes: number }>();
+    const exts = Array.isArray(cfg.extensions) ? cfg.extensions : [];
+    for (const e of exts) {
+      if (!e || typeof e !== "object") continue;
+      const name = typeof e.name === "string" ? e.name : "";
+      if (!name) continue;
+      const kind = (e.backend && e.backend.kind) || "client";
+      if (kind !== "client") continue; // defense-in-depth: lib.rs already rejects non-client at create
+      const callsPerCell = Math.max(1, Math.min(EXT_MAX_CALLS_PER_CELL, ((e.limits && e.limits.callsPerCell) | 0) || EXT_MAX_CALLS_PER_CELL));
+      const maxResultBytes = Math.max(1, Math.min(EXT_MAX_RESULT_BYTES, ((e.limits && e.limits.maxResultBytes) | 0) || EXT_MAX_RESULT_BYTES));
+      const list = Array.isArray(e.tools) ? e.tools : [];
+      for (const t of list) {
+        if (!t || typeof t.fn !== "string" || !t.fn) continue;
+        tools.set(name + "." + t.fn, { ext: name, callsPerCell, maxResultBytes });
+      }
+    }
+    this._extTools = tools;
   }
 
   async createFresh(configJson: string): Promise<string> {
@@ -908,6 +1019,7 @@ class GlueKernel {
     this._injectStdlib(cfg.modules);
     this._applyFsProvider();
     this._seedStdlibMeta();
+    this._seedExtMeta();
     this.lastTimings = { instantiateMs: 0, growCount: 0 };
     return "fresh";
   }
@@ -1006,6 +1118,7 @@ class GlueKernel {
     this._lastImage = raw.slice();
     this._applyFsProvider();
     this._seedStdlibMeta();
+    this._seedExtMeta();
     this.lastTimings = { gunzipMs, instantiateMs: 0, growCount, neededPages: needPages };
     return label || "sqlite-restore";
   }
@@ -1101,6 +1214,7 @@ class GlueKernel {
     this._lastImage = image.slice();
     this._applyFsProvider();
     this._seedStdlibMeta();
+    this._seedExtMeta();
     if (!this._sanityProbe()) {
       throw new Error("RestoreSanityError: post-blit canary/GC probe failed (possible image corruption)");
     }
@@ -1117,10 +1231,12 @@ class GlueKernel {
     try { return JSON.stringify(this._cellHostResults || []); } catch { return "[]"; }
   }
 
-  resultArtifactChunk(offset: number, len: number): string {
+  resultArtifactChunk(id: string, offset: number, len: number): string {
     try {
       const ex = this._ex();
-      ex.result_artifact_chunk(Math.max(0, offset | 0), Math.max(0, len | 0));
+      const idBytes = TEXT_ENC.encode(id || "text");
+      this._writeScratch(idBytes);
+      ex.result_artifact_chunk(ex.scratch_ptr(), idBytes.length, Math.max(0, offset | 0), Math.max(0, len | 0));
       return this._readResult();
     } catch (e) {
       const err = e as { name?: string; message?: string };
@@ -1223,6 +1339,8 @@ class GlueKernel {
       let wsOps = 0;
       // E6 oplog: capture host requests+results for the crash-tail journal (host-side).
       this._cellHostResults = [];
+      // EXTENSIBILITY API (#32): reset the per-cell ext-call counter (mirrors streamOps/wsOps).
+      this._extOps = new Map<string, number>();
       while (status === STATUS_HOST_CALL && guard <= maxHostCalls && streamOps <= maxStreamOps && wsOps <= maxWsOps) {
         const req = this._readHostCall();
         const isStreamOp = req.name === "streamRead" || req.name === "streamWrite";
@@ -1297,6 +1415,32 @@ class GlueKernel {
     // host-backed fs (config.fs.provider != vfs): serviced DO-side via the installed _fsHandler.
 
     if (name === "__fs") return this._serviceFs(args[0] as Record<string, unknown>);
+    // EXTENSIBILITY API — REDUCED Phase 1 (#32): a registered "<extName>.<fn>" client-backend tool
+    // routes through the SAME client bridge (_clientHostCall) as any non-fetch host effect, but with a
+    // per-cell call cap (limits.callsPerCell) + a result-byte clamp (limits.maxResultBytes) + one AE
+    // datapoint (op="ext:<name>"). Deny-by-default: an UNREGISTERED "<x>.<y>" falls through to the raw
+    // _clientHostCall path (which rejects when no client handler answers) — same as before.
+    const ext = this._extTools && this._extTools.get(name);
+    if (ext) {
+      const ops = this._extOps || (this._extOps = new Map<string, number>());
+      const used = (ops.get(ext.ext) || 0) + 1;
+      ops.set(ext.ext, used);
+      if (used > ext.callsPerCell) {
+        return { ok: false, error: "ExtCallLimitError: ext '" + ext.ext + "' exceeded callsPerCell " + ext.callsPerCell };
+      }
+      try { if (this._aeExt) this._aeExt("ext:" + ext.ext); } catch { /* AE best-effort */ }
+      const res = await this._clientHostCall(name, args);
+      // RESULT CLAMP: keep the value within maxResultBytes so the oplog row never blows past
+      // SQLITE_MAX_VALUE_BYTES. Over-budget -> replace with a typed marker (recorded deterministically).
+      if (res && res.ok) {
+        let vbytes = 0;
+        try { vbytes = TEXT_ENC.encode(JSON.stringify(res.value ?? null)).length; } catch { vbytes = ext.maxResultBytes + 1; }
+        if (vbytes > ext.maxResultBytes) {
+          return { ok: true, value: { __extResultClamped: true, ext: ext.ext, tool: name, bytes: vbytes, maxResultBytes: ext.maxResultBytes } };
+        }
+      }
+      return res;
+    }
     return this._clientHostCall(name, args);
   }
 

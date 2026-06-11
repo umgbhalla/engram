@@ -256,6 +256,41 @@ Post-corrected verification:
   `fetch("https://speed.cloudflare.com/__down?bytes=4194304").arrayBuffer()` returned exactly
   4,194,304 bytes and checkpointed to SQLite.
 
+## 2026-06-11 Jupyter-Style MIME Bundles
+
+Feature target handled: eval replies now carry Jupyter-style MIME output data without removing the
+existing value, valuePreview, valueType, logs, or error fields. Cells can emit display outputs with
+display(bundle, metadata?, transient?), displayHTML, displayMarkdown, displayJSON, displayImage,
+update_display, and clear_output. The eval reply includes:
+
+- mimeBundle: MIME bundle for the completion value.
+- outputs: ordered output events shaped like Jupyter display_data, update_display_data,
+  clear_output, and execute_result.
+- Large string MIME entries become artifact descriptors and can be read with the artifact frame.
+
+Deploy evidence:
+
+- Kernel deploy: engram-kernel version 8cf7ee85-f4d1-4379-8891-eadc7d289038. Staged upload about
+  2.505 MiB raw / 0.881 MiB gzip; Worker startup time 12 ms. Engine hash
+  rust-044d6922da6359b9bff28ebd18446db6.
+- Cloud deploy baked codeId rustkernel-46cd85e60d199485 and engine hash
+  rust-044d6922da6359b9bff28ebd18446db6; cloud /health confirmed live. Cloud now exposes a
+  generic authenticated POST /frame route so SDK artifact reads work over HTTP as well as WS.
+- UI deploy: engram-ui version 796ea696-49a8-44e1-b302-b988d5dfd0bc with MIME output rendering for
+  HTML, Markdown, JSON, PNG/JPEG, SVG, plain text, clear-output, and text artifacts.
+
+Post-deploy verification:
+
+- node scripts/smoke-live.mjs passed for kernel, cloud, UI, and docs.
+- Direct WS MIME probe passed: displayHTML, displayMarkdown, SVG, displayJSON, a large 1,048,576
+  char text/html artifact, and object execute_result all appeared in ordered outputs. The HTML
+  artifact handle cell:0:artifact:1 chunked correctly, and remained readable after evict.
+- SDK live probe passed against the kernel WS endpoint: EvalResult.outputs, EvalResult.mimeBundle,
+  and session.readArtifact() reconstructed a 1,048,576 char text/html artifact before and after
+  evict.
+- Cloud HTTP route typechecked and deployed; no tenant API key was available in .env for an
+  authenticated live SDK-cloud artifact read.
+
 ## Rich Return Types
 
 Jupyter's useful model is a MIME bundle: outputs like execute_result, display_data, and

@@ -73,13 +73,15 @@ extern "C" {
     #[wasm_bindgen(method, js_name = evalCode)]
     fn eval_code(this: &GlueKernel, src: &str) -> js_sys::Promise;
     #[wasm_bindgen(method, js_name = resultArtifactChunk)]
-    fn result_artifact_chunk(this: &GlueKernel, offset: f64, len: f64) -> String;
+    fn result_artifact_chunk(this: &GlueKernel, id: &str, offset: f64, len: f64) -> String;
     #[wasm_bindgen(method, js_name = setHostSender)]
     fn set_host_sender(this: &GlueKernel, send: &JsValue, timeout_ms: f64);
     #[wasm_bindgen(method, js_name = setFsHandler)]
     fn set_fs_handler(this: &GlueKernel, handler: &JsValue);
     #[wasm_bindgen(method, js_name = setFenceContext)]
     fn set_fence_context(this: &GlueKernel, do_id: &str, cell: f64);
+    #[wasm_bindgen(method, js_name = setExtAeSink)]
+    fn set_ext_ae_sink(this: &GlueKernel, sink: &JsValue);
     #[wasm_bindgen(method, js_name = dump)]
     fn dump(this: &GlueKernel) -> js_sys::Promise;
     #[wasm_bindgen(method, js_name = dumpW4)]
@@ -918,24 +920,19 @@ impl KernelDO {
         let store = self.store();
         let cell = read_int(&store, "committedCell", -1) + 1;
         let epoch = read_int(&store, "epoch", 0);
-        if parsed.get("valueType").and_then(|v| v.as_str()) == Some("artifact") {
-            if let Some(obj) = parsed.get_mut("value").and_then(|v| v.as_object_mut()) {
-                obj.insert("handle".to_string(), json!(format!("cell:{cell}:text")));
-            }
-        }
+        let has_artifacts = stamp_artifact_handles(&mut parsed, cell);
         let ckpt = match self.checkpoint(cell, epoch, src).await {
             Ok(v) => v,
             Err(e) => json!({ "ok": false, "error": format!("{e}") }),
         };
         let ok = parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
-        let is_artifact = parsed.get("valueType").and_then(|v| v.as_str()) == Some("artifact");
         if ckpt.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-            let artifact_cell = if is_artifact {
+            let artifact_cell = if has_artifacts {
                 cell.to_string()
             } else {
                 "-1".to_string()
             };
-            write_meta(&store, "lastTextArtifactCell", &artifact_cell);
+            write_meta(&store, "lastArtifactCell", &artifact_cell);
         }
 
         // V0.5: per-eval AE datapoint (op/restoreSource/store/sizeGz/usedHeap/cell/ok + valueType).
@@ -971,6 +968,8 @@ impl KernelDO {
             "value": parsed.get("value").cloned().unwrap_or(serde_json::Value::Null),
             "valuePreview": parsed.get("valuePreview").cloned().unwrap_or(serde_json::Value::Null),
             "valueType": parsed.get("valueType").cloned().unwrap_or(serde_json::Value::Null),
+            "mimeBundle": parsed.get("mimeBundle").cloned().unwrap_or(serde_json::Value::Null),
+            "outputs": parsed.get("outputs").cloned().unwrap_or_else(|| json!([])),
             "logs": parsed.get("logs").cloned().unwrap_or_else(|| json!([])),
             "error": parsed.get("error").cloned().unwrap_or(serde_json::Value::Null),
             "cell": cell,
@@ -984,7 +983,7 @@ impl KernelDO {
 
     async fn artifact_critical(&self, msg: &serde_json::Value) -> Result<serde_json::Value> {
         let handle = msg.get("handle").and_then(|v| v.as_str()).unwrap_or("");
-        let Some(cell) = parse_text_artifact_handle(handle) else {
+        let Some((cell, artifact_id)) = parse_artifact_handle(handle) else {
             return Ok(json!({
                 "ok": false,
                 "t": "artifact",
@@ -993,7 +992,7 @@ impl KernelDO {
         };
 
         let committed = read_int(&self.store(), "committedCell", -1);
-        let artifact_cell = read_int(&self.store(), "lastTextArtifactCell", -1);
+        let artifact_cell = read_int(&self.store(), "lastArtifactCell", -1);
         if cell != committed || cell != artifact_cell {
             return Ok(json!({
                 "ok": false,
@@ -1020,7 +1019,7 @@ impl KernelDO {
         let _ = self.ensure_glue().await?;
         let chunk_json = {
             let glue = clone_glue(self.glue.borrow().as_ref().unwrap());
-            glue.result_artifact_chunk(offset as f64, len as f64)
+            glue.result_artifact_chunk(&artifact_id, offset as f64, len as f64)
         };
         let mut parsed: serde_json::Value = match serde_json::from_str(&chunk_json) {
             Ok(v) => v,
@@ -1065,6 +1064,7 @@ impl KernelDO {
         let epoch = read_int(&store, "epoch", 0) + 1;
         write_meta(&store, "epoch", &epoch.to_string());
         write_meta(&store, "committedCell", "-1");
+        write_meta(&store, "lastArtifactCell", "-1");
         Ok(json!({"ok": true, "t": "reset", "epoch": epoch, "generation": self.generation}))
     }
 
@@ -1703,10 +1703,60 @@ fn read_str<S: KernelStore>(store: &S, k: &str) -> Option<String> {
     rows.into_iter().next().map(|r| r.v)
 }
 
-fn parse_text_artifact_handle(handle: &str) -> Option<i64> {
+fn parse_artifact_handle(handle: &str) -> Option<(i64, String)> {
     let rest = handle.strip_prefix("cell:")?;
-    let cell = rest.strip_suffix(":text")?;
-    cell.parse().ok()
+    if let Some(cell) = rest.strip_suffix(":text") {
+        return Some((cell.parse().ok()?, "text".to_string()));
+    }
+    let (cell, id) = rest.split_once(":artifact:")?;
+    if id.is_empty() || id.len() > 64 {
+        return None;
+    }
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    Some((cell.parse().ok()?, id.to_string()))
+}
+
+fn stamp_artifact_handles(v: &mut serde_json::Value, cell: i64) -> bool {
+    match v {
+        serde_json::Value::Array(items) => {
+            let mut any = false;
+            for item in items {
+                any |= stamp_artifact_handles(item, cell);
+            }
+            any
+        }
+        serde_json::Value::Object(obj) => {
+            let mut any = false;
+            let is_artifact = obj
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .map(|s| s == "artifact")
+                .unwrap_or(false);
+            if is_artifact {
+                if let Some(handle) = obj.get("handle").and_then(|v| v.as_str()) {
+                    if let Some(id) = handle.strip_prefix("pending:") {
+                        let stamped = if id == "text" {
+                            format!("cell:{cell}:text")
+                        } else {
+                            format!("cell:{cell}:artifact:{id}")
+                        };
+                        obj.insert("handle".to_string(), json!(stamped));
+                        any = true;
+                    }
+                }
+            }
+            for value in obj.values_mut() {
+                any |= stamp_artifact_handles(value, cell);
+            }
+            any
+        }
+        _ => false,
+    }
 }
 
 fn write_meta<S: KernelStore>(store: &S, k: &str, v: &str) {
