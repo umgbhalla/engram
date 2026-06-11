@@ -35,6 +35,10 @@ const indexJs: string = readFileSync(join(kernelRust, "build", "index.js"), "utf
 const indexBgWasm: Buffer = readFileSync(join(kernelRust, "build", "index_bg.wasm"));
 // The rquickjs engine wasm + its build-time hash.
 const engineWasm: Buffer = readFileSync(join(kernelRust, "src", "engine.wasm"));
+// The snapshot zstd codec wasm (issue #9). The kernel-glue reads it via globalThis.__ZSTD_MODULE
+// (a PRECOMPILED WebAssembly.Module); without it a facet checkpoint throws ZstdCodecError. Ship it
+// as a {wasm} loader module at ./zstd-codec.wasm, mirroring the standalone kernel's entry.ts.
+const zstdCodecWasm: Buffer = readFileSync(join(kernelRust, "src", "zstd-codec.wasm"));
 const engineHashJs: string = readFileSync(join(kernelRust, "src", "engine-hash.js"), "utf8");
 // engine-hash.js exports `ENGINE_HASH`; we want the raw value baked as a global string.
 const engineHashMatch = engineHashJs.match(/ENGINE_HASH\s*=\s*["']([^"']+)["']/);
@@ -54,12 +58,14 @@ try {
 
 const indexBgB64: string = indexBgWasm.toString("base64");
 const engineB64: string = engineWasm.toString("base64");
+const zstdCodecB64: string = zstdCodecWasm.toString("base64");
 
 // content hash -> codeId (any kernel change => fresh isolate, no stale-codeId foot-gun).
 const h = createHash("sha256");
 h.update(indexJs);
 h.update(indexBgWasm);
 h.update(engineWasm);
+h.update(zstdCodecWasm);
 h.update(stdlibBundleTxt);
 h.update(engineHash);
 const hash = h.digest("hex").slice(0, 16);
@@ -69,9 +75,11 @@ const codeId = "rustkernel-" + hash;
 const facetMain = `// GENERATED — Rust-kernel facet main (mainModule). Sets the 4 globals the Rust DO
 // wasm-bindgen glue (index.js) reads, then re-exports the KernelDO durable-object class.
 import ENGINE_MODULE from "./engine.wasm";           // {wasm} => precompiled WebAssembly.Module
+import ZSTD_MODULE from "./zstd-codec.wasm";          // {wasm} => snapshot codec (issue #9)
 import STDLIB_BUNDLE_TXT from "./stdlib.bundle.txt";  // {text} => string
 import "./stdlib-meta.js";                            // {js}   => sets globalThis.__STDLIB_META
 globalThis.__ENGINE_MODULE = ENGINE_MODULE;
+globalThis.__ZSTD_MODULE = ZSTD_MODULE;
 globalThis.__ENGINE_HASH = ${JSON.stringify(engineHash)};
 globalThis.__STDLIB_BUNDLE = STDLIB_BUNDLE_TXT;
 // index.js itself does \`import Dt from "./index_bg.wasm"\` and instantiates it via
@@ -85,6 +93,7 @@ export const FACET_MAIN_SRC = ${JSON.stringify(facetMain)};
 export const KERNEL_INDEX_JS = ${JSON.stringify(indexJs)};
 export const INDEX_BG_WASM_B64 = ${JSON.stringify(indexBgB64)};
 export const ENGINE_WASM_B64 = ${JSON.stringify(engineB64)};
+export const ZSTD_CODEC_WASM_B64 = ${JSON.stringify(zstdCodecB64)};
 export const STDLIB_BUNDLE_TXT = ${JSON.stringify(stdlibBundleTxt)};
 export const STDLIB_META_SRC = ${JSON.stringify(stdlibMeta)};
 export const KERNEL_CODE_ID = ${JSON.stringify(codeId)};
@@ -93,6 +102,6 @@ export const ENGINE_HASH = ${JSON.stringify(engineHash)};
 writeFileSync(join(src, "modules.rust.gen.js"), out);
 console.log(
   `baked RUST kernel facet: index.js=${indexJs.length}b index_bg.wasm=${indexBgWasm.length}B ` +
-    `engine.wasm=${engineWasm.length}B stdlib=${stdlibBundleTxt.length}b ` +
+    `engine.wasm=${engineWasm.length}B zstd-codec.wasm=${zstdCodecWasm.length}B stdlib=${stdlibBundleTxt.length}b ` +
     `codeId=${codeId} engineHash=${engineHash}`,
 );

@@ -5,6 +5,7 @@ export const FACET_MAIN_SRC: string;
 export const KERNEL_INDEX_JS: string;
 export const INDEX_BG_WASM_B64: string;
 export const ENGINE_WASM_B64: string;
+export const ZSTD_CODEC_WASM_B64: string;
 export const STDLIB_BUNDLE_TXT: string;
 export const STDLIB_META_SRC: string;
 export const KERNEL_CODE_ID: string;

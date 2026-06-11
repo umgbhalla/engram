@@ -23,6 +23,7 @@ import {
   KERNEL_INDEX_JS,
   INDEX_BG_WASM_B64,
   ENGINE_WASM_B64,
+  ZSTD_CODEC_WASM_B64,
   STDLIB_BUNDLE_TXT,
   STDLIB_META_SRC,
   KERNEL_CODE_ID,
@@ -467,6 +468,9 @@ export class SupervisorDO extends DurableObject<Env> {
         "index.js": KERNEL_INDEX_JS,
         "index_bg.wasm": { wasm: b64ToArrayBuffer(INDEX_BG_WASM_B64) },
         "engine.wasm": { wasm: b64ToArrayBuffer(ENGINE_WASM_B64) },
+        // Snapshot zstd codec (issue #9). facet-rust.js imports it as {wasm} and sets
+        // globalThis.__ZSTD_MODULE; without it facet checkpoints throw ZstdCodecError.
+        "zstd-codec.wasm": { wasm: b64ToArrayBuffer(ZSTD_CODEC_WASM_B64) },
         "stdlib.bundle.txt": { text: STDLIB_BUNDLE_TXT },
         "stdlib-meta.js": STDLIB_META_SRC,
       };
