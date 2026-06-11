@@ -3341,8 +3341,16 @@ pub extern "C" fn eval_resume(res_ptr: *const u8, res_len: usize) -> i32 {
     let s = unsafe { std::slice::from_raw_parts(res_ptr, res_len) };
     let payload = std::str::from_utf8(s).unwrap_or("{}").to_string();
     HOSTCALL_RES.with(|h| *h.borrow_mut() = Some(payload));
-    // re-arm budget for the continuation but keep counting buffer growth from start.
-    BUDGET.with(|b| b.set(b.get().max(100_000)));
+    // FIX #14: do NOT refill the budget on resume. The continuation runs under the
+    // SAME cellBudgetTicks envelope as the cell that parked: the remaining budget
+    // carries across the host-call boundary and keeps decrementing. This bounds the
+    // TOTAL bytecode work of a cell (across all its `await host.fetch()` parks) by the
+    // configured cellBudgetTicks, so a post-fetch tight loop trips a typed
+    // TimeoutError instead of getting an ~83x window (the old `max(remaining,100_000)`
+    // re-arm) that could outrun the workerd interrupt-throttle floor and WS-1006 the DO.
+    // The remaining BUDGET is left exactly as-is (not refilled); host-call round-trips
+    // run no JS bytecode so they cost ~0 budget, and the buffer-growth tripwire still
+    // counts pages from eval-begin.
     run(true)
 }
 
