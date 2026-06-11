@@ -199,7 +199,6 @@ const SQLITE_HOT_MAX: usize = 8 * 1024 * 1024;
 const SQLITE_MAX_VALUE_BYTES: usize = 1_500_000;
 const TEXT_ARTIFACT_CHUNK_MAX_CHARS: i64 = 128 * 1024;
 
-#[durable_object]
 /// A single staged host.fs mutation for the in-flight cell. Staged ops are buffered in DO memory
 /// (never durable) until the cell's checkpoint flushes them to R2 + the committed `fs_files` meta
 /// table IN THE SAME COMMIT as the heap dump — honoring the SANDBOX-API staged-commit coherence
@@ -221,6 +220,19 @@ struct FsStage {
 /// closure (which is `forget()`-leaked) and the `checkpoint`/`handle_eval` methods share ONE buffer.
 type StagedFs = Rc<RefCell<Vec<FsStage>>>;
 
+/// Committed fs metadata for one path: the content body's R2 key + size. The R2 key is the SAME as
+/// the path-derived key (`<prefix><normpath>`) — the `fs_files` row exists iff the body is durable.
+#[derive(Clone)]
+struct FsMeta {
+    r2_key: String,
+    size: i64,
+}
+
+/// A snapshot of the committed per-session path namespace (normalized-path -> meta), captured at
+/// eval start so in-cell reads/list/stat overlay staged ops on a stable committed view.
+type FsCommitted = Rc<BTreeMap<String, FsMeta>>;
+
+#[durable_object]
 pub struct KernelDO {
     state: State,
     env: Env,
@@ -639,6 +651,93 @@ impl KernelDO {
         DoSqlStore::new(self.state.storage().sql())
     }
 
+    /// Read the committed host.fs path namespace for THIS session from `fs_files`. Returned as a
+    /// shareable snapshot so the per-eval fs handler closure can overlay staged ops on a stable
+    /// committed view (read-after-write within a cell, list/stat consistency). Cheap: paths+sizes,
+    /// no bodies. Best-effort: a query error yields an empty namespace (treated as no files).
+    fn read_fs_committed(&self) -> FsCommitted {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            path: String,
+            r2_key: String,
+            size: i64,
+        }
+        let rows: Vec<Row> = self
+            .store()
+            .query_typed("SELECT path, r2_key, size FROM fs_files;", None)
+            .unwrap_or_default();
+        let mut map = BTreeMap::new();
+        for r in rows {
+            map.insert(
+                r.path,
+                FsMeta {
+                    r2_key: r.r2_key,
+                    size: r.size,
+                },
+            );
+        }
+        Rc::new(map)
+    }
+
+    /// Flush this cell's STAGED host.fs mutations to durable storage as part of `store_ckpt` — i.e.
+    /// IN THE SAME COMMIT ORDERING as the heap manifest, per the SANDBOX-API staged-commit coherence
+    /// invariant. Body bytes are written to R2 FIRST (write-ordering rule: a body is durable before
+    /// its `fs_files` meta row references it), then the `fs_files` rows are upserted/deleted via the
+    /// provided store (the same store handle that commits the manifest txn). The staged buffer is
+    /// drained on the way out, whether or not it was non-empty, so a subsequent cell starts clean.
+    /// A crash before this runs drops the in-memory staged set with the rolled-back heap (O3).
+    async fn flush_staged_fs<S: KernelStore>(&self, store: &S, cell: i64) {
+        let ops: Vec<FsStage> = std::mem::take(&mut *self.staged_fs.borrow_mut());
+        if ops.is_empty() {
+            return;
+        }
+        // Resolve binding from config (default SNAPSHOTS); prefix is hard-bound to the DO id.
+        let cfg: serde_json::Value = serde_json::from_str(
+            &read_str(store, "config").unwrap_or_else(|| "{}".into()),
+        )
+        .unwrap_or_else(|_| json!({}));
+        let binding = cfg
+            .get("fs")
+            .and_then(|f| f.get("binding"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("SNAPSHOTS")
+            .to_string();
+        let prefix = format!("fs/{}/", self.do_id);
+        let bucket = match self.env.bucket(&binding) {
+            Ok(b) => b,
+            Err(_) => return, // bucket missing: nothing to flush (writes already returned ok in-cell)
+        };
+        // Collapse to last-op-per-path (a path written then deleted in one cell ends deleted, etc.),
+        // preserving the engine's per-cell semantics, then apply in a deterministic path order.
+        let mut last: BTreeMap<String, FsStageOp> = BTreeMap::new();
+        for o in ops {
+            last.insert(o.path, o.op);
+        }
+        let now = now_ms();
+        for (path, op) in last {
+            let key = format!("{}{}", prefix, path.trim_start_matches('/'));
+            match op {
+                FsStageOp::Write(bytes) => {
+                    let size = bytes.len() as i64;
+                    // Body to R2 first (durable before the meta row references it).
+                    if self.r2_put_resilient(&binding, &key, bytes).await.is_err() {
+                        // R2 unavailable: skip the meta row so the namespace stays coherent (the
+                        // file is simply absent on restore — never a dangling reference).
+                        continue;
+                    }
+                    let _ = store.exec(
+                        "INSERT INTO fs_files(path,r2_key,size,cell,created_ms) VALUES(?,?,?,?,?)                          ON CONFLICT(path) DO UPDATE SET r2_key=excluded.r2_key, size=excluded.size, cell=excluded.cell, created_ms=excluded.created_ms;",
+                        Some(vec![path.clone().into(), key.clone().into(), size.into(), cell.into(), now.into()]),
+                    );
+                }
+                FsStageOp::Delete => {
+                    let _ = store.exec("DELETE FROM fs_files WHERE path=?;", Some(vec![path.clone().into()]));
+                    let _ = bucket.delete(&key).await; // best-effort body GC; orphan is harmless
+                }
+            }
+        }
+    }
+
     fn r2_key_for(&self, cell: i64, epoch: i64) -> String {
         format!("benchrustf/{}/e{}-c{}.qjs.gz", self.do_id, epoch, cell)
     }
@@ -744,6 +843,47 @@ impl KernelDO {
             "[r2-get] EXHAUSTED {R2_GET_ATTEMPTS} attempts for key {key}"
         ));
         R2Read::Exhausted
+    }
+
+    /// Resilient R2 PUT for host.fs body bytes — mirrors `r2_get_resilient`'s retry-with-backoff +
+    /// per-attempt timeout + circuit-breaker (#10). Returns Ok on a durable put, Err after exhausting
+    /// retries (caller then SKIPS the meta row so the namespace stays coherent — the file is absent on
+    /// restore, never a dangling reference). Determinism preserved (fixed backoffs; R2 adds no entropy).
+    async fn r2_put_resilient(&self, binding: &str, key: &str, bytes: Vec<u8>) -> std::result::Result<(), ()> {
+        if self.r2_breaker_open() {
+            console_log("[r2-fs-put] breaker OPEN — skipping put");
+            return Err(());
+        }
+        for attempt in 0..R2_GET_ATTEMPTS {
+            if attempt > 0 {
+                let backoff = R2_GET_BACKOFF_MS
+                    .get(attempt - 1)
+                    .copied()
+                    .unwrap_or(*R2_GET_BACKOFF_MS.last().unwrap());
+                Delay::from(Duration::from_millis(backoff)).await;
+            }
+            let bucket = match self.env.bucket(binding) {
+                Ok(b) => b,
+                Err(e) => {
+                    console_log(&format!("[r2-fs-put] bucket bind failed (attempt {attempt}): {e:?}"));
+                    continue;
+                }
+            };
+            let body = bytes.clone();
+            let k = key.to_string();
+            let fut = async move { bucket.put(&k, body).execute().await.map(|_| ()) };
+            match race_timeout(fut, R2_GET_TIMEOUT_MS).await {
+                Some(Ok(())) => {
+                    self.r2_breaker_record_success();
+                    return Ok(());
+                }
+                Some(Err(e)) => console_log(&format!("[r2-fs-put] transient error attempt {attempt}: {e:?}")),
+                None => console_log(&format!("[r2-fs-put] timeout attempt {attempt}")),
+            }
+        }
+        self.r2_breaker_record_failure();
+        console_log(&format!("[r2-fs-put] EXHAUSTED {R2_GET_ATTEMPTS} attempts for key {key}"));
+        Err(())
     }
 
     /// No-ws entry (HTTP /frame / facet proxy path). Host callbacks are unavailable
@@ -1457,6 +1597,9 @@ impl KernelDO {
                     Some(vec![cell.to_string().into()]))?;
                 Ok(())
             };
+            // COHERENCE: stage host.fs body bytes -> R2 (awaits; durable before meta), then the
+            // `fs_files` meta rows land in the SAME coalesced SQLite flush as the manifest txn below.
+            self.flush_staged_fs(&store, cell).await;
             txn()?;
             // W4 commit-ordering: the delta row is now the committed chain tail — promote the staged
             // candidate to the live delta base so the NEXT diff is against exactly this image.
@@ -1541,6 +1684,9 @@ impl KernelDO {
                 Some(vec![cell.to_string().into()]))?;
             Ok(n_chunks)
         };
+        // COHERENCE: same as the delta path — stage host.fs bodies to R2 (durable first), then the
+        // `fs_files` meta rows land in the SAME coalesced SQLite flush as the manifest txn.
+        self.flush_staged_fs(&kstore, cell).await;
         let n_chunks = txn()?;
         // W4 commit-ordering: the full base is committed — promote the staged image to the live base.
         glue.commit_dump();
@@ -2213,86 +2359,236 @@ fn to_err(e: JsValue) -> worker::Error {
     worker::Error::RustError(format!("{:?}", e))
 }
 
+/// Normalize a guest fs path to a session-rooted POSIX path, defense-in-depth against traversal.
+/// Collapses `.`/`..` against a virtual `/` root (a leading `..` cannot escape — it is dropped),
+/// rejects a NUL byte. The returned path is always absolute and `..`-free; combined with the
+/// DO-id-bound key prefix in r2_fs_op, a guest can never address another session's namespace.
+fn norm_fs_path(p: &str) -> std::result::Result<String, JsValue> {
+    if p.contains('\u{0}') {
+        return Err(JsValue::from_str("EINVAL: path contains NUL byte"));
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => continue,
+            ".." => {
+                out.pop();
+            }
+            s => out.push(s),
+        }
+    }
+    Ok(format!("/{}", out.join("/")))
+}
+
 /// DO-side R2 servicer for the in-VM `fs` host-backed provider (config.fs.provider == "r2").
 /// `payload` is the JS object the glue forwards: { op, path, bytes?:Uint8Array }. Returns a JS
 /// object the glue marshals back to the engine: { ok, bytes?:Uint8Array, names?, size?, isFile?,
 /// isDirectory?, error? }. Binary crosses as Uint8Array (glue does the base64 at the engine edge).
+///
+/// COHERENCE: write/delete are STAGED in `staged` (DO memory) and flushed at checkpoint (see
+/// flush_staged_fs) — they do NOT touch R2 here. Reads/list/stat overlay `staged` (this cell's
+/// pending mutations) on `committed` (the path namespace as of eval start) and fall through to R2
+/// for the actual body bytes of already-committed files. This makes the fs namespace commit in the
+/// SAME version as the heap (a cold restore never sees a file from an uncommitted cell, nor a heap
+/// referencing a not-yet-durable file).
+///
+/// ISOLATION: `prefix` is always `fs/<doId>/` (DO-id-bound, never user config) and `path` is
+/// normalized `..`-free, so the R2 key can never address another session's namespace.
 async fn r2_fs_op(
     env: &Env,
     binding: &str,
     prefix: &str,
+    staged: &StagedFs,
+    committed: &FsCommitted,
     payload: JsValue,
 ) -> std::result::Result<JsValue, JsValue> {
     let getp = |k: &str| Reflect::get(&payload, &JsValue::from_str(k)).ok();
     let op = getp("op").and_then(|v| v.as_string()).unwrap_or_default();
-    let path = getp("path").and_then(|v| v.as_string()).unwrap_or_default();
+    let raw_path = getp("path").and_then(|v| v.as_string()).unwrap_or_default();
+    let path = match norm_fs_path(&raw_path) {
+        Ok(p) => p,
+        Err(e) => {
+            let out = js_sys::Object::new();
+            let _ = Reflect::set(&out, &JsValue::from_str("error"), &e);
+            return Ok(out.into());
+        }
+    };
     let key = format!("{}{}", prefix, path.trim_start_matches('/'));
-    let bucket = env
-        .bucket(binding)
-        .map_err(|e| JsValue::from_str(&format!("FsError: bucket '{}' — {e}", binding)))?;
     let out = js_sys::Object::new();
     let set = |k: &str, v: &JsValue| {
         let _ = Reflect::set(&out, &JsValue::from_str(k), v);
     };
     let enoent = |p: &str| format!("ENOENT: no such file or directory, '{}'", p);
-    match op.as_str() {
-        "read" => match bucket.get(&key).execute().await {
-            Ok(Some(obj)) => {
-                let body = obj
-                    .body()
-                    .ok_or_else(|| JsValue::from_str("FsError: empty body"))?;
-                let bytes = body
-                    .bytes()
-                    .await
-                    .map_err(|e| JsValue::from_str(&format!("{e}")))?;
-                let arr = Uint8Array::new_with_length(bytes.len() as u32);
-                arr.copy_from(&bytes);
-                set("ok", &JsValue::TRUE);
-                set("bytes", &arr.into());
+
+    // Resolve the effective view of `path`: this cell's staged op wins over the committed namespace.
+    // Returns: Some(Some((bytes_opt, size))) = exists (bytes_opt None => committed-only, read from R2);
+    //          Some(None) = staged-deleted (treat as absent); None = not staged (check committed).
+    let staged_view = |p: &str| -> Option<Option<(Option<Vec<u8>>, i64)>> {
+        let st = staged.borrow();
+        // last staged op for this path wins
+        for s in st.iter().rev() {
+            if s.path == p {
+                return Some(match &s.op {
+                    FsStageOp::Write(b) => Some((Some(b.clone()), b.len() as i64)),
+                    FsStageOp::Delete => None,
+                });
             }
-            _ => set("error", &JsValue::from_str(&enoent(&path))),
-        },
+        }
+        None
+    };
+
+    // Ranged read window (engine chunks a large body across calls): off/len in bytes. Absent => whole.
+    let off = getp("off").and_then(|v| v.as_f64()).unwrap_or(0.0) as usize;
+    let len = getp("len").and_then(|v| v.as_f64());
+
+    match op.as_str() {
+        "read" => {
+            // Resolve the body source: staged-this-cell wins over committed. Returns the TOTAL size
+            // (so the engine knows how many chunks to pull) + the requested [off, off+len) slice.
+            let slice_out = |full: &[u8]| -> (i64, Uint8Array) {
+                let total = full.len();
+                let start = off.min(total);
+                let end = match len {
+                    Some(l) => (start + (l as usize)).min(total),
+                    None => total,
+                };
+                let part = &full[start..end];
+                let arr = Uint8Array::new_with_length(part.len() as u32);
+                arr.copy_from(part);
+                (total as i64, arr)
+            };
+            match staged_view(&path) {
+                Some(None) => set("error", &JsValue::from_str(&enoent(&raw_path))), // staged-deleted
+                Some(Some((Some(bytes), _))) => {
+                    let (total, arr) = slice_out(&bytes);
+                    set("ok", &JsValue::TRUE);
+                    set("size", &JsValue::from_f64(total as f64));
+                    set("bytes", &arr.into());
+                }
+                _ => {
+                    // not staged: read committed body from R2 (ranged when off/len given).
+                    match committed.get(&path) {
+                        None => set("error", &JsValue::from_str(&enoent(&raw_path))),
+                        Some(meta) => {
+                            let bucket = env.bucket(binding).map_err(|e| {
+                                JsValue::from_str(&format!("FsError: bucket '{}' — {e}", binding))
+                            })?;
+                            let mut gb = bucket.get(&key);
+                            if off > 0 || len.is_some() {
+                                let length = len
+                                    .map(|l| l as u64)
+                                    .unwrap_or((meta.size as u64).saturating_sub(off as u64));
+                                gb = gb.range(worker::Range::OffsetWithLength {
+                                    offset: off as u64,
+                                    length,
+                                });
+                            }
+                            match gb.execute().await {
+                                Ok(Some(obj)) => {
+                                    let body = obj
+                                        .body()
+                                        .ok_or_else(|| JsValue::from_str("FsError: empty body"))?;
+                                    let bytes = body
+                                        .bytes()
+                                        .await
+                                        .map_err(|e| JsValue::from_str(&format!("{e}")))?;
+                                    let arr = Uint8Array::new_with_length(bytes.len() as u32);
+                                    arr.copy_from(&bytes);
+                                    set("ok", &JsValue::TRUE);
+                                    // size = the TOTAL committed file size (from meta), not the slice.
+                                    set("size", &JsValue::from_f64(meta.size as f64));
+                                    set("bytes", &arr.into());
+                                }
+                                // Committed meta but missing body = a torn write (per SANDBOX-API):
+                                // report it distinctly so callers can detect, never return garbage.
+                                _ => set("error", &JsValue::from_str(&format!(
+                                    "ENOENT: torn file (committed meta, body absent), '{}'",
+                                    raw_path
+                                ))),
+                            }
+                        }
+                    }
+                }
+            }
+        }
         "write" => {
             let bytes_val = getp("bytes").unwrap_or(JsValue::NULL);
             let arr: Uint8Array = bytes_val
                 .dyn_into()
                 .map_err(|_| JsValue::from_str("FsError: write bytes missing"))?;
-            bucket
-                .put(&key, arr.to_vec())
-                .execute()
-                .await
-                .map_err(|e| JsValue::from_str(&format!("FsError: {e}")))?;
+            let chunk = getp("chunk").and_then(|v| v.as_f64()).unwrap_or(0.0) as i64;
+            let new_bytes = arr.to_vec();
+            // STAGE (no R2 write until checkpoint). A chunked write (body > 64KB) arrives as several
+            // host calls: chunk 0 REPLACES (start a fresh staged Write for this path), chunk>0 APPENDS
+            // to the last staged Write for the same path so the host assembles the whole body in DO
+            // memory before the checkpoint flush.
+            let mut st = staged.borrow_mut();
+            if chunk > 0 {
+                // find the last staged Write for this path and extend it
+                if let Some(s) = st.iter_mut().rev().find(|s| s.path == path) {
+                    if let FsStageOp::Write(ref mut buf) = s.op {
+                        buf.extend_from_slice(&new_bytes);
+                    } else {
+                        // last op was a delete: start a fresh write with just this chunk
+                        st.push(FsStage { path: path.clone(), op: FsStageOp::Write(new_bytes) });
+                    }
+                } else {
+                    st.push(FsStage { path: path.clone(), op: FsStageOp::Write(new_bytes) });
+                }
+            } else {
+                st.push(FsStage { path: path.clone(), op: FsStageOp::Write(new_bytes) });
+            }
             set("ok", &JsValue::TRUE);
         }
         "delete" => {
-            let _ = bucket.delete(&key).await;
+            // STAGE a tombstone (flushed at checkpoint: DELETE fs_files row + best-effort R2 delete).
+            staged.borrow_mut().push(FsStage {
+                path: path.clone(),
+                op: FsStageOp::Delete,
+            });
             set("ok", &JsValue::TRUE);
         }
-        "stat" => match bucket.get(&key).execute().await {
-            Ok(Some(obj)) => {
-                set("ok", &JsValue::TRUE);
-                set("isFile", &JsValue::TRUE);
-                set("isDirectory", &JsValue::FALSE);
-                set("size", &JsValue::from_f64(obj.size() as f64));
+        "stat" => {
+            let size = match staged_view(&path) {
+                Some(None) => None,                       // staged-deleted => absent
+                Some(Some((_, sz))) => Some(sz),          // staged write => its size
+                None => committed.get(&path).map(|m| m.size), // committed size
+            };
+            match size {
+                Some(sz) => {
+                    set("ok", &JsValue::TRUE);
+                    set("isFile", &JsValue::TRUE);
+                    set("isDirectory", &JsValue::FALSE);
+                    set("size", &JsValue::from_f64(sz as f64));
+                }
+                None => set("error", &JsValue::from_str(&enoent(&raw_path))),
             }
-            _ => set("error", &JsValue::from_str(&enoent(&path))),
-        },
+        }
         "list" => {
-            let lpfx = format!("{}{}", prefix, path.trim_start_matches('/'));
-            let listing = bucket
-                .list()
-                .prefix(lpfx.clone())
-                .execute()
-                .await
-                .map_err(|e| JsValue::from_str(&format!("FsError: {e}")))?;
+            // The committed namespace overlaid with this cell's staged writes/deletes, scoped to the
+            // requested dir prefix. Returns the immediate child names (files + synthetic subdir names).
+            let dir = if path == "/" { "/".to_string() } else { format!("{}/", path) };
+            let pre = if path == "/" { "/" } else { dir.as_str() };
+            // effective path set = committed - staged-deletes + staged-writes
+            let mut eff: std::collections::BTreeSet<String> = committed.keys().cloned().collect();
+            for s in staged.borrow().iter() {
+                match s.op {
+                    FsStageOp::Write(_) => {
+                        eff.insert(s.path.clone());
+                    }
+                    FsStageOp::Delete => {
+                        eff.remove(&s.path);
+                    }
+                }
+            }
             let names = js_sys::Array::new();
             let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-            for o in listing.objects() {
-                let k = o.key();
-                let rest = k.strip_prefix(&lpfx).unwrap_or(&k);
-                let name = rest.trim_start_matches('/').split('/').next().unwrap_or("");
-                if !name.is_empty() && seen.insert(name.to_string()) {
-                    names.push(&JsValue::from_str(name));
+            for full in eff.iter() {
+                if let Some(rest) = full.strip_prefix(pre) {
+                    let name = rest.split('/').next().unwrap_or("");
+                    if !name.is_empty() && seen.insert(name.to_string()) {
+                        names.push(&JsValue::from_str(name));
+                    }
                 }
             }
             set("ok", &JsValue::TRUE);

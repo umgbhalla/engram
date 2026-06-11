@@ -283,6 +283,9 @@ interface KernelConfig {
   // WEBSOCKET-CLIENT-IN-VM (#12): per-cell budget for ws.* effects (recv/poll/send), counted
   // separately from maxHostCallsPerCell so a chatty WS pump is not capped by the 64 host-call guard.
   maxWsOpsPerCell?: number;
+  // HOST-BACKED FS (#18): per-cell budget for host.__fs chunk calls (a body >64KB is chunked),
+  // counted separately so a multi-MB host.fs read/write is not capped by the 64 host-call guard.
+  maxFsOpsPerCell?: number;
 
   // fs provider: undefined / {provider:"vfs"} = in-heap VFS (sync, durable in snapshot);
   // {provider:"r2",binding?,prefix?} = host-backed R2 (async-only; serviced DO-side in lib.rs).
@@ -1528,15 +1531,22 @@ class GlueKernel {
       // guard. Each parked recv still has the idle deadline so the cell can never hang forever.
       const maxWsOps = (this.config.maxWsOpsPerCell ?? 0) || WS_MAX_OPS_PER_CELL;
       let wsOps = 0;
+      // HOST-BACKED FS (#18): a single host.fs read/write of a body > 64KB is CHUNKED into many
+      // host.__fs calls (each chunk crosses the fixed 64KB HOSTCALL request buffer). Like stream/ws
+      // ops, these get their OWN large budget so a multi-MB file is not capped by the 64 host-call
+      // guard (a 5MB file at 32KB/chunk is ~160 calls). Bounded so the pump can never spin forever.
+      const maxFsOps = (this.config.maxFsOpsPerCell ?? 0) || 8192;
+      let fsOps = 0;
       // E6 oplog: capture host requests+results for the crash-tail journal (host-side).
       this._cellHostResults = [];
       // EXTENSIBILITY API (#32): reset the per-cell ext-call counter (mirrors streamOps/wsOps).
       this._extOps = new Map<string, number>();
-      while (status === STATUS_HOST_CALL && guard <= maxHostCalls && streamOps <= maxStreamOps && wsOps <= maxWsOps) {
+      while (status === STATUS_HOST_CALL && guard <= maxHostCalls && streamOps <= maxStreamOps && wsOps <= maxWsOps && fsOps <= maxFsOps) {
         const req = this._readHostCall();
         const isStreamOp = req.name === "streamRead" || req.name === "streamWrite";
         const isWsOp = req.name === "ws.recv" || req.name === "ws.poll" || req.name === "ws.send";
-        if (isStreamOp) streamOps++; else if (isWsOp) wsOps++; else guard++;
+        const isFsOp = req.name === "__fs";
+        if (isStreamOp) streamOps++; else if (isWsOp) wsOps++; else if (isFsOp) fsOps++; else guard++;
 
         let res: HostResult;
         if (this._replayHostResults && this._replayHostResults.length) {
@@ -1645,7 +1655,13 @@ class GlueKernel {
       return { ok: true, value: { error: "FsError: no fs provider active (set config.fs.provider)" } };
     }
     const op = String(req && req.op);
+    // Forward the per-op fields the DO handler understands: write chunk index/count (a body >64KB is
+    // sent in slices), and read range window (off/len) for chunked reassembly.
     const payload: Record<string, unknown> = { op, path: req && req.path };
+    if (typeof req.chunk === "number") payload.chunk = req.chunk;
+    if (typeof req.chunks === "number") payload.chunks = req.chunks;
+    if (typeof req.off === "number") payload.off = req.off;
+    if (typeof req.len === "number") payload.len = req.len;
     if (op === "write" && typeof req.data === "string") {
       try {
         payload.bytes = Uint8Array.from(atob(req.data as string), (c) => c.charCodeAt(0));
@@ -1669,10 +1685,11 @@ class GlueKernel {
       value.data = btoa(s);
     }
     if (res && Array.isArray(res.names)) value.names = res.names;
-    if (res && typeof res.size === "number") {
-      value.size = res.size;
-      value.isFile = !!res.isFile;
-      value.isDirectory = !!res.isDirectory;
+    // size: read returns the TOTAL file size (for chunked reassembly); stat returns size + type.
+    if (res && typeof res.size === "number") value.size = res.size;
+    if (op === "stat") {
+      value.isFile = !!(res && res.isFile);
+      value.isDirectory = !!(res && res.isDirectory);
     }
     return { ok: true, value };
   }

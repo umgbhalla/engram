@@ -2335,8 +2335,37 @@ globalThis.__vfs = globalThis.__vfs || { files: {}, dirs: { '/': true } };
   // host round-trip: host.__fs({op, path, ...}) -> { ok, data?(base64), names?, size?, isFile?, isDirectory?, error? }
   function hostFs(op, args){ return globalThis.host.__fs(Object.assign({ op: op }, args || {})); }
   function hostThrow(res, p){ if (res && res.error){ var e = new Error(res.error); e.code = (res.error.indexOf('ENOENT') === 0) ? 'ENOENT' : (res.code || undefined); throw e; } return res; }
-  async function hReadFile(p, enc){ var r = hostThrow(await hostFs('read', { path: norm(p) }), p); var bytes = r.data ? Uint8Array.from(atob(r.data), function(c){return c.charCodeAt(0);}) : new Uint8Array(0); return decode(bytes, enc && enc.encoding ? enc.encoding : enc); }
-  async function hWriteFile(p, data, enc){ var bytes = toBytes(data, enc && enc.encoding ? enc.encoding : enc); var b64 = btoa(String.fromCharCode.apply(null, bytes)); hostThrow(await hostFs('write', { path: norm(p), data: b64 }), p); }
+  // Base64 marshal across the host boundary, CHUNKED so a multi-MB file body does not overflow the
+  // engine's ~65535 function-argument cap (String.fromCharCode.apply / Uint8Array.from on the whole
+  // buffer at once throws "too many arguments"). 32KB chunks keep large host-fs files (>heap cap)
+  // working. b64enc: bytes -> base64; b64dec: base64 -> bytes.
+  function b64enc(bytes){ var CH = 0x8000, parts = []; for (var i=0;i<bytes.length;i+=CH){ parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i+CH))); } return btoa(parts.join('')); }
+  function b64dec(b64){ var bin = atob(b64), n = bin.length, out = new Uint8Array(n); for (var i=0;i<n;i++) out[i] = bin.charCodeAt(i); return out; }
+  // host.__fs args cross the 64KB HOSTCALL buffer as JSON, so a file BODY bigger than that must be
+  // CHUNKED across multiple host calls (this is how host-backed fs supports files larger than 64KB,
+  // up to the R2/heap limits). FS_CHUNK = raw bytes per chunk (-> ~4/3 in base64, well under 64KB).
+  var FS_CHUNK = 32 * 1024;
+  // hWriteFile: stage the body to the host in <=FS_CHUNK slices. chunk 0 replaces (or creates), each
+  // later chunk appends to the SAME staged write — so the host assembles the whole body before the
+  // checkpoint flush. A zero-length file is a single chunk-0 write.
+  async function hWriteFile(p, data, enc){
+    var bytes = toBytes(data, enc && enc.encoding ? enc.encoding : enc);
+    var total = bytes.length, nchunks = Math.max(1, Math.ceil(total / FS_CHUNK));
+    for (var ci = 0; ci < nchunks; ci++){
+      var slice = bytes.subarray(ci * FS_CHUNK, Math.min(total, (ci + 1) * FS_CHUNK));
+      hostThrow(await hostFs('write', { path: norm(p), data: b64enc(slice), chunk: ci, chunks: nchunks }), p);
+    }
+  }
+  // hReadFile: the READ RESULT crosses on the host SCRATCH result buffer (1MB floor / 32MB ceil),
+  // NOT the fixed 64KB HOSTCALL request buffer — so the whole body comes back in ONE call (the
+  // base64 ~1.34x of files up to the scratch ceiling). Writes still chunk (the request buffer is
+  // the 64KB-capped direction); reads do not need to. A body larger than the scratch ceiling would
+  // be truncated by the host; that is well past the snapshot/heap envelope.
+  async function hReadFile(p, enc){
+    var r = hostThrow(await hostFs('read', { path: norm(p) }), p);
+    var bytes = r.data ? b64dec(r.data) : new Uint8Array(0);
+    return decode(bytes, enc && enc.encoding ? enc.encoding : enc);
+  }
   async function hAppendFile(p, data, enc){ var cur; try { cur = await hReadFile(p); } catch(e){ cur = new Uint8Array(0); } var add = toBytes(data, enc); var out = new Uint8Array(cur.length + add.length); out.set(cur); out.set(add, cur.length); await hWriteFile(p, out); }
   async function hUnlink(p){ hostThrow(await hostFs('delete', { path: norm(p) }), p); }
   async function hReaddir(p){ var r = hostThrow(await hostFs('list', { path: norm(p) }), p); return r.names || []; }
