@@ -87,8 +87,10 @@ export const worker = await Worker("engram-kernel", {
     // NOTE: set ALCHEMY_PASSWORD in the deploy env for strong at-rest encryption of this secret in
     // the R2 state store — the default "dev-only-password" works but is WEAK (do not rely on it).
     ENGRAM_KERNEL_KEY: alchemy.secret(process.env.ENGRAM_KERNEL_KEY!),
-    // ENFORCE flag: "0"/absent = log-only (serve + emit AE errorName=unauthorized); "1" = enforce.
-    ENGRAM_AUTH_ENFORCE: process.env.ENGRAM_AUTH_ENFORCE ?? "0",
+    // FAIL-CLOSED enforce flag: persisted "1" so a deploy that forgets to export the var still
+    // boots CLOSED whenever a key is configured. Only an explicit ENGRAM_AUTH_ENFORCE="0"
+    // downgrades to log-only (serve + emit AE errorName=unauthorized).
+    ENGRAM_AUTH_ENFORCE: process.env.ENGRAM_AUTH_ENFORCE ?? "1",
   },
 });
 

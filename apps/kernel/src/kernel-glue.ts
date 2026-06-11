@@ -612,8 +612,145 @@ interface WsState {
 // UNCONDITIONALLY (even under allow-all egress and with a valid auth key)? Covers metadata
 // (169.254.0.0/16), loopback (127.0.0.0/8, ::1), RFC1918 (10/8, 172.16/12, 192.168/16),
 // 0.0.0.0, link-local v6 (fe80::/10), unique-local v6 (fc00::/7), and *.internal/localhost names.
-// Hostname allowlists do NOT survive DNS-rebind, so this is enforced at fetch time by literal-IP
-// and known-internal-suffix inspection.
+//
+// IMPORTANT — this block + any hostname allowlist do NOT defend against DNS-REBIND: a public
+// hostname that resolves to a private IP at connect time slips through, because the worker never
+// resolves the name itself (workerd has no in-VM DNS resolver). The product-chosen egress default
+// is allow-all; the real rebind fix is per-token egress policy + resolve-pinning (pin the A/AAAA
+// at allow-time and reconnect to the pinned literal) — tracked as the Phase-2 hardening (#30).
+// Until then this is best-effort: literal-IP (all encodings) + known-internal-suffix inspection.
+
+// Parse a private/loopback/link-local IPv4 given as 4 octet numbers.
+function isPrivateV4(a: number, b: number, _c: number, _d: number): boolean {
+  if (a === 127) return true;                       // 127.0.0.0/8 loopback
+  if (a === 10) return true;                         // 10.0.0.0/8
+  if (a === 0) return true;                          // 0.0.0.0/8
+  if (a === 169 && b === 254) return true;          // 169.254.0.0/16 link-local + metadata
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+  if (a === 192 && b === 168) return true;          // 192.168.0.0/16
+  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
+  return false;
+}
+
+// Normalize an all-numeric IPv4 in any legal encoding (dotted-quad, dotted shorthands 127.1 /
+// 10.0.1, single decimal 2130706433, hex 0x7f000001, octal 0177.0.0.1) into 4 octets.
+// Returns null if `h` is not an all-numeric IPv4 form (i.e. it's a real hostname).
+function normalizeV4(h: string): [number, number, number, number] | null {
+  // Each part: decimal, 0x-hex, or 0-leading octal. Up to 4 parts (a / a.b / a.b.c / a.b.c.d).
+  const partsRaw = h.split(".");
+  if (partsRaw.length < 1 || partsRaw.length > 4) return null;
+  const nums: number[] = [];
+  for (const p of partsRaw) {
+    if (p.length === 0) return null;
+    let n: number;
+    if (/^0x[0-9a-f]+$/i.test(p)) n = parseInt(p.slice(2), 16);
+    else if (/^0[0-7]+$/.test(p)) n = parseInt(p, 8);
+    else if (/^0$/.test(p)) n = 0;
+    else if (/^[1-9][0-9]*$/.test(p)) n = parseInt(p, 10);
+    else return null; // contains a non-numeric char -> a real hostname, not an IPv4 literal
+    if (!Number.isFinite(n) || n < 0) return null;
+    nums.push(n);
+  }
+  // Pack per the inet_aton shorthand rules: the LAST part fills the remaining low octets.
+  const k = nums.length;
+  let value: number;
+  if (k === 1) {
+    value = nums[0];
+  } else {
+    // first k-1 parts are single octets; the last part fills the remaining (4-(k-1)) bytes.
+    for (let i = 0; i < k - 1; i++) if (nums[i] > 0xff) return null;
+    const fillBytes = 4 - (k - 1);
+    const maxLast = fillBytes >= 4 ? 0xffffffff : Math.pow(256, fillBytes) - 1;
+    if (nums[k - 1] > maxLast) return null;
+    value = 0;
+    for (let i = 0; i < k - 1; i++) value = value * 256 + nums[i];
+    value = value * Math.pow(256, fillBytes) + nums[k - 1];
+  }
+  if (value > 0xffffffff) return null;
+  return [
+    (value >>> 24) & 0xff,
+    (value >>> 16) & 0xff,
+    (value >>> 8) & 0xff,
+    value & 0xff,
+  ];
+}
+
+// Parse an IPv6 literal (zone-id stripped, :: expanded, embedded v4 handled) into 16 bytes.
+// Returns null if `h` is not a valid IPv6 form.
+function parseV6(h: string): Uint8Array | null {
+  let s = h;
+  const zone = s.indexOf("%");
+  if (zone >= 0) s = s.slice(0, zone); // strip zone-id (fe80::1%eth0)
+  if (s.indexOf(":") < 0) return null;
+  // split off an embedded IPv4 tail (::ffff:127.0.0.1) -> two 16-bit groups
+  let head = s;
+  let tailGroups: number[] = [];
+  const lastColon = s.lastIndexOf(":");
+  const tail = s.slice(lastColon + 1);
+  if (tail.indexOf(".") >= 0) {
+    const v4 = normalizeV4(tail);
+    if (!v4) return null;
+    tailGroups = [(v4[0] << 8) | v4[1], (v4[2] << 8) | v4[3]];
+    head = s.slice(0, lastColon); // includes trailing ":" of "...:1.2.3.4"
+    // head now ends with ":" ; normalize by trimming the dangling colon so split is clean
+    if (head.endsWith(":") && !head.endsWith("::")) head = head.slice(0, -1);
+  }
+  const dbl = head.indexOf("::");
+  let groups: number[];
+  if (dbl >= 0) {
+    const left = head.slice(0, dbl).split(":").filter((x) => x.length > 0);
+    const right = head.slice(dbl + 2).split(":").filter((x) => x.length > 0);
+    const known = left.length + right.length + tailGroups.length;
+    if (known > 8) return null;
+    const fill = 8 - known;
+    const mid = new Array(fill).fill(0);
+    const parse16 = (g: string[]) => {
+      const out: number[] = [];
+      for (const x of g) {
+        if (!/^[0-9a-f]{1,4}$/i.test(x)) return null;
+        out.push(parseInt(x, 16));
+      }
+      return out;
+    };
+    const l = parse16(left), r = parse16(right);
+    if (!l || !r) return null;
+    groups = [...l, ...mid, ...r, ...tailGroups];
+  } else {
+    const g = head.split(":").filter((x) => x.length > 0);
+    const out: number[] = [];
+    for (const x of g) {
+      if (!/^[0-9a-f]{1,4}$/i.test(x)) return null;
+      out.push(parseInt(x, 16));
+    }
+    groups = [...out, ...tailGroups];
+  }
+  if (groups.length !== 8) return null;
+  const bytes = new Uint8Array(16);
+  for (let i = 0; i < 8; i++) {
+    bytes[i * 2] = (groups[i] >>> 8) & 0xff;
+    bytes[i * 2 + 1] = groups[i] & 0xff;
+  }
+  return bytes;
+}
+
+function isBlockedV6(bytes: Uint8Array): boolean {
+  // ::  (unspecified) and ::1 (loopback)
+  let allZeroButLast = true;
+  for (let i = 0; i < 15; i++) if (bytes[i] !== 0) { allZeroButLast = false; break; }
+  if (allZeroButLast && (bytes[15] === 0 || bytes[15] === 1)) return true;
+  // fe80::/10 link-local
+  if (bytes[0] === 0xfe && (bytes[1] & 0xc0) === 0x80) return true;
+  // fc00::/7 unique-local
+  if ((bytes[0] & 0xfe) === 0xfc) return true;
+  // ::ffff:0:0/96 (IPv4-mapped) -> re-check the embedded v4 against the v4 private ranges
+  let mapped = true;
+  for (let i = 0; i < 10; i++) if (bytes[i] !== 0) { mapped = false; break; }
+  if (mapped && bytes[10] === 0xff && bytes[11] === 0xff) {
+    if (isPrivateV4(bytes[12], bytes[13], bytes[14], bytes[15])) return true;
+  }
+  return false;
+}
+
 function isBlockedSsrfHost(hostname: string): boolean {
   if (!hostname) return true;
   let h = hostname.toLowerCase();
@@ -623,26 +760,61 @@ function isBlockedSsrfHost(hostname: string): boolean {
   if (h === "localhost" || h.endsWith(".localhost")) return true;
   if (h.endsWith(".internal") || h.endsWith(".local")) return true;
   if (h === "metadata.google.internal") return true;
-  // IPv6 loopback / link-local / unique-local
-  if (h === "::1" || h === "::") return true;
-  if (h.startsWith("fe80:") || h.startsWith("fe8") || h.startsWith("fe9") || h.startsWith("fea") || h.startsWith("feb")) return true; // fe80::/10
-  if (h.startsWith("fc") || h.startsWith("fd")) return true; // fc00::/7 unique-local
-  // IPv4-mapped IPv6 (::ffff:a.b.c.d) — extract the v4 tail and re-check
-  const mapped = h.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
-  if (mapped) return isBlockedSsrfHost(mapped[1]);
-  // IPv4 literal checks
-  const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (m) {
-    const a = Number(m[1]), b = Number(m[2]);
-    if (a === 127) return true;                 // 127.0.0.0/8 loopback
-    if (a === 10) return true;                  // 10.0.0.0/8
-    if (a === 0) return true;                    // 0.0.0.0/8
-    if (a === 169 && b === 254) return true;    // 169.254.0.0/16 link-local + metadata
-    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
-    if (a === 192 && b === 168) return true;    // 192.168.0.0/16
-    if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
+
+  // IPv6: real parse (zone-id strip, :: expansion, embedded v4) then numeric-range test.
+  if (h.indexOf(":") >= 0) {
+    const v6 = parseV6(h);
+    if (v6) return isBlockedV6(v6);
+    return true; // looks like IPv6 but failed to parse -> reject (fail-closed)
   }
+
+  // IPv4: normalize ANY all-numeric encoding (decimal/hex/octal/shorthand) to dotted-quad first.
+  const v4 = normalizeV4(h);
+  if (v4) return isPrivateV4(v4[0], v4[1], v4[2], v4[3]);
+
+  // An all-numeric host that did NOT normalize is a malformed literal, not a real hostname -> reject.
+  if (/^[0-9.]+$/.test(h)) return true;
+
   return false;
+}
+
+// SSRF-SAFE redirect following. A default `redirect:"follow"` fetch only SSRF-checks the INITIAL
+// host — a public URL that 302s to http://169.254.169.254/ would bypass the block. So we force
+// `redirect:"manual"` and walk each hop ourselves: on a 3xx with a Location, re-parse it, re-run
+// isBlockedSsrfHost on the new host, and re-fetch — capped at MAX_REDIRECT_HOPS. A blocked hop
+// rejects. The returned Response is the first non-redirect (or the last hop at the cap).
+const MAX_REDIRECT_HOPS = 5;
+async function ssrfSafeFetch(url: string, init?: RequestInit): Promise<Response> {
+  let curUrl = url;
+  // strip any caller-supplied redirect mode; we always drive redirects manually.
+  const baseInit: RequestInit = { ...(init || {}), redirect: "manual" };
+  for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
+    const r = await fetch(curUrl, baseInit);
+    const isRedirect = r.status >= 300 && r.status < 400 && r.headers.has("location");
+    if (!isRedirect) return r;
+    if (hop === MAX_REDIRECT_HOPS) {
+      throw new Error("FetchBlockedError: too many redirects (>" + MAX_REDIRECT_HOPS + ")");
+    }
+    const loc = r.headers.get("location") || "";
+    let next: URL;
+    try {
+      next = new URL(loc, curUrl); // resolve relative Location against the current URL
+    } catch {
+      throw new Error("FetchBlockedError: invalid redirect Location");
+    }
+    if (isBlockedSsrfHost(next.hostname)) {
+      throw new Error("FetchBlockedError: redirect to " + next.hostname + " is a blocked private/internal address");
+    }
+    // a 303 (or 302/301 on POST per browser behavior) becomes GET; keep it simple & safe: after the
+    // first hop, drop the body and force GET so we never replay a body to a new (re-checked) origin.
+    if (hop === 0 && baseInit.method && baseInit.method.toUpperCase() !== "GET" && baseInit.method.toUpperCase() !== "HEAD") {
+      baseInit.method = "GET";
+      delete (baseInit as { body?: unknown }).body;
+    }
+    curUrl = next.toString();
+  }
+  // unreachable (loop returns or throws), but satisfy the type checker.
+  return fetch(curUrl, baseInit);
 }
 
 function bytesToB64(u8: Uint8Array): string {
@@ -1591,7 +1763,8 @@ class GlueKernel {
       const prep = await this._fetchPrep(url, init);
       if (prep.error) return { ok: false, error: prep.error };
       const fetchInit = prep.fetchInit;
-      const r = await fetch(url, fetchInit || undefined);
+      // SSRF-safe: manual redirect following with per-hop host re-check.
+      const r = await ssrfSafeFetch(url, fetchInit || undefined);
       // BINARY-SAFE: read RAW BYTES (arrayBuffer), never lossy `.text()`. Cross the boundary as
       // base64 (`bodyB64`) — exact bytes both ways. Cap at FETCH_MAX_BODY_BYTES (was 1MB).
       const ab = await r.arrayBuffer();
@@ -1650,16 +1823,20 @@ class GlueKernel {
       // ---- request-body streaming (upload): VM will push chunks via streamWrite ----
       if ((init as { requestStream?: boolean } | undefined)?.requestStream) {
         const ts = new TransformStream<Uint8Array, Uint8Array>();
-        const upInit: RequestInit & { duplex?: string } = { ...fetchInit, duplex: "half" };
+        const upInit: RequestInit & { duplex?: string } = { ...fetchInit, duplex: "half", redirect: "manual" };
         delete (upInit as { requestStream?: boolean }).requestStream;
         upInit.body = ts.readable as unknown as BodyInit;
         // kick off the fetch WITHOUT awaiting; the VM drains its source via streamWrite.
+        // redirect:"manual" — a streamed (duplex) upload body cannot be safely replayed to a
+        // re-checked redirect target, so a 3xx surfaces as a non-2xx response instead of following
+        // (no SSRF bypass via Location). The initial host was already SSRF-checked in _fetchPrep.
         const fetchPromise = fetch(url, upInit as RequestInit);
         this._streams.set(streamId, { writer: ts.writable.getWriter(), fetchPromise, done: false });
         return { ok: true, value: { streamId, uploadOpen: true, stream: true } };
       }
 
-      const r = await fetch(url, fetchInit as RequestInit);
+      // SSRF-safe: manual redirect following with per-hop host re-check.
+      const r = await ssrfSafeFetch(url, fetchInit as RequestInit);
       const headers: Record<string, string> = {};
       r.headers.forEach((v, k) => (headers[k] = v));
       const meta = {
@@ -1837,7 +2014,22 @@ class GlueKernel {
     try {
       const reqHeaders: Record<string, string> = { Upgrade: "websocket" };
       if (protocols && protocols.length) reqHeaders["Sec-WebSocket-Protocol"] = protocols.join(", ");
-      const resp = await fetch(httpUrl, { headers: reqHeaders });
+      // redirect:"manual" — only the INITIAL host was SSRF-checked; if the upgrade endpoint 3xx's
+      // we must re-check the Location host before following (else a public ws host could redirect
+      // the upgrade to an internal address). A blocked hop rejects; we follow up to MAX_REDIRECT_HOPS.
+      let curUrl = httpUrl;
+      let resp = await fetch(curUrl, { headers: reqHeaders, redirect: "manual" });
+      for (let hop = 0; hop < MAX_REDIRECT_HOPS; hop++) {
+        if (!(resp.status >= 300 && resp.status < 400 && resp.headers.has("location"))) break;
+        let next: URL;
+        try { next = new URL(resp.headers.get("location") || "", curUrl); }
+        catch { return { ok: false, error: "WsBlockedError: invalid redirect Location" }; }
+        if (isBlockedSsrfHost(next.hostname)) {
+          return { ok: false, error: "WsBlockedError: redirect to " + next.hostname + " is a blocked private/internal address" };
+        }
+        curUrl = next.toString();
+        resp = await fetch(curUrl, { headers: reqHeaders, redirect: "manual" });
+      }
       const sock = (resp as { webSocket?: WebSocket | null }).webSocket;
       if (!sock) {
         return { ok: false, error: "WsError: upstream did not upgrade (status " + resp.status + ")" };

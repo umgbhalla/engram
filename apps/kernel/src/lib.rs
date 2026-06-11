@@ -300,12 +300,19 @@ impl DurableObject for KernelDO {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        let auth_enforce = env
-            .var("ENGRAM_AUTH_ENFORCE")
-            .ok()
-            .map(|v| v.to_string())
-            .map(|s| s.trim() == "1")
-            .unwrap_or(false);
+        // FAIL-CLOSED: once a key is configured, ENFORCE by default. The env var can only
+        // explicitly DISABLE it via "0" — an absent/unset var (e.g. a deploy that forgot to
+        // export it) must NOT silently open the kernel. With NO key configured, enforcement is
+        // meaningless (nothing to check against), so it stays off regardless of the var.
+        let auth_enforce = if auth_keys.is_empty() {
+            false
+        } else {
+            env.var("ENGRAM_AUTH_ENFORCE")
+                .ok()
+                .map(|v| v.to_string())
+                .map(|s| s.trim() != "0")
+                .unwrap_or(true)
+        };
 
         Self {
             state,
@@ -790,7 +797,14 @@ impl KernelDO {
             }));
         }
         let cfg_str = serde_json::to_string(&cfg).unwrap_or_else(|_| "{}".into());
-        write_meta(&self.store(), "config", &cfg_str);
+        if let Some(err) = persist_config(&self.store(), &cfg_str) {
+            return Ok(json!({
+                "ok": false, "t": "create",
+                "valueType": "error",
+                "error": err,
+                "generation": self.generation,
+            }));
+        }
         let info = self.ensure_glue().await?;
         let mut dp = Datapoint::new("create");
         dp.restore_source = info.source.clone();
@@ -814,12 +828,31 @@ impl KernelDO {
         let src = msg.get("src").and_then(|v| v.as_str()).unwrap_or("");
         let before = self.glue.borrow().is_some();
 
-        // first-eval config (only if none yet)
+        // first-eval config (only if none yet). Apply the SAME validation as create_critical so an
+        // eval-first `{t:eval,config:{...}}` frame cannot bypass the extension name-shadow / __-prefix
+        // / manifest-size guards, and reject an oversize config BEFORE write_meta (which would
+        // otherwise panic on SQLITE_TOOBIG -> DoS). A validation/size failure returns a typed
+        // {ok:false} eval reply (socket stays alive), never persists a bad config.
         if !before {
             if let Some(cfg) = msg.get("config") {
                 if read_str(&self.store(), "config").is_none() {
+                    if let Some(err) = validate_extensions(cfg) {
+                        return Ok(json!({
+                            "ok": false, "t": "eval",
+                            "valueType": "error",
+                            "error": err,
+                            "generation": self.generation,
+                        }));
+                    }
                     let cfg_str = serde_json::to_string(cfg).unwrap_or_else(|_| "{}".into());
-                    write_meta(&self.store(), "config", &cfg_str);
+                    if let Some(err) = persist_config(&self.store(), &cfg_str) {
+                        return Ok(json!({
+                            "ok": false, "t": "eval",
+                            "valueType": "error",
+                            "error": err,
+                            "generation": self.generation,
+                        }));
+                    }
                 }
             }
         }
@@ -1668,22 +1701,24 @@ async fn fetch(req: Request, env: Env, _ctx: worker::Context) -> Result<Response
     // DO (garbage never mints a session). A credential-LESS request must still reach the DO so the
     // browser first-message {t:auth} path works. Only enforces when ENGRAM_AUTH_ENFORCE=1.
     {
-        let enforce = env
-            .var("ENGRAM_AUTH_ENFORCE")
+        let keys: Vec<String> = env
+            .secret("ENGRAM_KERNEL_KEY")
             .ok()
-            .map(|v| v.to_string())
-            .map(|s| s.trim() == "1")
-            .unwrap_or(false);
-        if enforce {
-            let keys: Vec<String> = env
-                .secret("ENGRAM_KERNEL_KEY")
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        // FAIL-CLOSED: enforce whenever a key is configured unless ENGRAM_AUTH_ENFORCE=="0".
+        let enforce = !keys.is_empty()
+            && env
+                .var("ENGRAM_AUTH_ENFORCE")
                 .ok()
-                .map(|s| s.to_string())
-                .unwrap_or_default()
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+                .map(|v| v.to_string())
+                .map(|s| s.trim() != "0")
+                .unwrap_or(true);
+        if enforce {
             let (token, _) = extract_token(&req);
             if !token.is_empty() && !token_valid(&token, &keys) {
                 return Response::error("unauthorized", 401);
@@ -1980,6 +2015,35 @@ fn stamp_artifact_handles(v: &mut serde_json::Value, cell: i64) -> bool {
         }
         _ => false,
     }
+}
+
+/// Persist the session config to meta WITHOUT panicking on an oversize value. SQLite's row/blob
+/// ceiling (SQLITE_TOOBIG, ~1GB but workerd caps far lower) would make the raw `write_meta` `.expect`
+/// panic -> WS-1006 DoS. We pre-reject any config above a generous ceiling with a typed error so the
+/// socket stays alive. Returns Some(error-json) on rejection, None on success.
+fn persist_config<S: KernelStore>(store: &S, cfg_str: &str) -> Option<serde_json::Value> {
+    // 512KB ceiling — far above any legitimate config (the extensions manifest alone caps at 64KB),
+    // far below SQLite's hard limit, so this only catches abusive/oversize payloads.
+    const MAX_CONFIG_BYTES: usize = 512 * 1024;
+    if cfg_str.len() > MAX_CONFIG_BYTES {
+        return Some(json!({
+            "name": "ConfigTooBigError",
+            "message": format!("config {}B exceeds cap {}B", cfg_str.len(), MAX_CONFIG_BYTES)
+        }));
+    }
+    if store
+        .exec(
+            "INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v;",
+            Some(vec!["config".into(), cfg_str.into()]),
+        )
+        .is_err()
+    {
+        return Some(json!({
+            "name": "ConfigPersistError",
+            "message": "failed to persist config (storage rejected the write)"
+        }));
+    }
+    None
 }
 
 fn write_meta<S: KernelStore>(store: &S, k: &str, v: &str) {
