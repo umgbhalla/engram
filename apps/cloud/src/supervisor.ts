@@ -131,6 +131,45 @@ interface FrameReply {
   [k: string]: unknown;
 }
 
+// ============================================================================================
+// W2 (issue #37): per-operation WorkOS permission ENFORCEMENT.
+//
+// The seven Engram permission slugs (mirror apps/cloud/scripts/workos-seed.yml). Enforcement is
+// ALWAYS by `permissions.includes(slug)` — never by role-slug branches (roles are a WorkOS-side
+// authoring convenience; the wire only ever carries the resolved permissions array).
+// ============================================================================================
+const PERM = {
+  KERNEL_EVAL: "kernel:eval",
+  KERNEL_READ: "kernel:read",
+  KERNEL_RESET: "kernel:reset",
+  SESSION_LIST: "session:list",
+  SESSION_SHARE: "session:share",
+  USAGE_READ: "usage:read",
+  ACCOUNT_ADMIN: "account:admin",
+} as const;
+
+// DOCUMENTED developer profile — the full day-to-day kernel/session set (mirrors the
+// `engram-developer` WorkOS role). Applied as the effective permission set for:
+//   (a) legacy `md_` keys (credType:"legacy") — so existing cloud users are unaffected; and
+//   (b) WorkOS keys/tokens that carry NO permissions claim (older W1-era keys) — so they don't
+//       suddenly 403. A WorkOS credential that DOES carry a (non-empty) permissions array uses it
+//       directly (real enforcement). Absence of the claim → this profile; never "deny-all".
+// NOTE: this profile intentionally EXCLUDES account:admin — admin ops require an explicit grant.
+const DEVELOPER_PROFILE: string[] = [
+  PERM.KERNEL_EVAL, PERM.KERNEL_READ, PERM.KERNEL_RESET,
+  PERM.SESSION_LIST, PERM.SESSION_SHARE, PERM.USAGE_READ,
+];
+
+// Compute the EFFECTIVE permission set the wire carries for a resolved credential.
+//   legacy md_ key            → fixed developer profile (no regression for existing cloud users).
+//   WorkOS cred, perms present→ use them verbatim (real per-op enforcement).
+//   WorkOS cred, perms absent → developer profile (W1-era keys keep working; documented fallback).
+function effectivePermissions(cred: ResolvedCredential): string[] {
+  if (cred.credType === "legacy") return DEVELOPER_PROFILE.slice();
+  if (Array.isArray(cred.permissions) && cred.permissions.length > 0) return cred.permissions.slice();
+  return DEVELOPER_PROFILE.slice();
+}
+
 const SHARD_COUNT = 64;
 const MAX_FACETS_PER_SUPERVISOR = 128;
 
@@ -142,6 +181,19 @@ class HttpError extends Error {
     super(message);
     this.name = "HttpError";
     this.status = status;
+  }
+}
+
+// W2 (#37): typed 403 raised when the caller's resolved permissions do not include the slug the
+// operation requires. Carries the MISSING slug so the client (and audit) see exactly what's needed.
+// Always 403 (authorization) — distinct from 401 (authentication / no key) and never a 500.
+class PermissionDeniedError extends Error {
+  status = 403;
+  missing: string;
+  constructor(missing: string) {
+    super(`permission denied: missing required permission '${missing}'`);
+    this.name = "PermissionDeniedError";
+    this.missing = missing;
   }
 }
 
@@ -655,10 +707,22 @@ export class SupervisorDO extends DurableObject<Env> {
     // W1 (#37): server-set credential class for metering/audit (entry gate sets x-md-credtype).
     this._reqCredType = req.headers.get("x-md-credtype") || "";
     const sessionId = url.searchParams.get("session") || "default";
+    // W2 (#37): the caller's EFFECTIVE permissions, server-set as x-eg-perms (CSV) by the entry
+    // gate — same trust model as x-md-tenant (#38): the client value is stripped before forwarding
+    // and the gate sets it from the WorkOS-resolved permissions. A missing/empty header → NO
+    // permissions → fail-closed (every guarded op 403s). NEVER trust a client-supplied value.
+    const permsCsv = req.headers.get("x-eg-perms") || "";
+    const perms = permsCsv ? permsCsv.split(",").map((s) => s.trim()).filter(Boolean) : [];
     // Fail-closed guard for tenant-scoped routes. Returns the resolved tenant or throws a 403.
     const requireTenant = (): string => {
       if (!tenant) throw new HttpError(403, "tenant not resolved (server-set x-md-tenant required; route only reachable via the validated-key data-plane gate)");
       return tenant;
+    };
+    // W2 (#37): per-op permission guard. Enforced via permissions.includes(slug) ONLY (no role-slug
+    // branches). Absence of the claim → deny (fail-closed). Throws a typed PermissionDeniedError →
+    // 403 naming the missing slug (NOT 500, NOT 401). Call it BEFORE any facet /frame dispatch.
+    const requirePerm = (slug: string): void => {
+      if (!perms.includes(slug)) throw new PermissionDeniedError(slug);
     };
 
     // ---- control-plane RPC routes (entry -> AUTH shard), not client-facing ----
@@ -681,36 +745,48 @@ export class SupervisorDO extends DurableObject<Env> {
     }
 
     try {
-      // create a session kernel (config: clock/rngSeed/cellBudgetTicks/etc).
+      // create a session kernel (config: clock/rngSeed/cellBudgetTicks/etc). Creating + running a
+      // kernel is an eval-class op → requires kernel:eval.
       if (p === "/create") {
         const t = requireTenant();
+        requirePerm(PERM.KERNEL_EVAL);
         this._touch(t, sessionId);
         let config: unknown = {};
         try { config = JSON.parse((await req.text()) || "{}"); } catch (_) {}
         return J({ tenant: t, sessionId, ...(await this._frame(t, sessionId, { t: "create", config })) });
       }
-      // eval one cell (metered).
+      // eval one cell (metered). Requires kernel:eval.
       if (p === "/eval") {
         const t = requireTenant();
+        requirePerm(PERM.KERNEL_EVAL);
         this._touch(t, sessionId);
         const src = url.searchParams.get("src") || "1+1";
         return J({ tenant: t, sessionId, ...(await this._evalMetered(t, sessionId, src, Date.now() & 0xffff)) });
       }
+      // /frame carries an arbitrary kernel protocol frame; the permission required depends on the
+      // frame's `t`: eval/create → kernel:eval; reset → kernel:reset; everything else (gen/ping/
+      // read/get/snapshot status) → kernel:read. Enforced BEFORE the facet dispatch.
       if (p === "/frame") {
         const t = requireTenant();
-        this._touch(t, sessionId);
         let frame: Record<string, unknown> = {};
         try { frame = JSON.parse((await req.text()) || "{}"); } catch (_) {}
+        const ft = String((frame && frame.t) || "");
+        if (ft === "eval" || ft === "create") requirePerm(PERM.KERNEL_EVAL);
+        else if (ft === "reset") requirePerm(PERM.KERNEL_RESET);
+        else requirePerm(PERM.KERNEL_READ);
+        this._touch(t, sessionId);
         return J({ tenant: t, sessionId, ...(await this._frame(t, sessionId, frame)) });
       }
-      if (p === "/gen") { const t = requireTenant(); return J(await this._frame(t, sessionId, { t: "gen" })); }
-      if (p === "/ping") { const t = requireTenant(); return J(await this._frame(t, sessionId, { t: "ping" })); }
-      if (p === "/reset") { const t = requireTenant(); return J(await this._frame(t, sessionId, { t: "reset" })); }
+      if (p === "/gen") { const t = requireTenant(); requirePerm(PERM.KERNEL_READ); return J(await this._frame(t, sessionId, { t: "gen" })); }
+      if (p === "/ping") { const t = requireTenant(); requirePerm(PERM.KERNEL_READ); return J(await this._frame(t, sessionId, { t: "ping" })); }
+      if (p === "/reset") { const t = requireTenant(); requirePerm(PERM.KERNEL_RESET); return J(await this._frame(t, sessionId, { t: "reset" })); }
 
-      // (1) keep-warm view for a session: cadence stats + whether the sweep would warm it now.
+      // (1) keep-warm view for a session: cadence stats (a read op). Toggling latency-sensitivity
+      // is a session-visibility/share-class change → requires session:share when mutating.
       if (p === "/warm") {
         const t = requireTenant();
         const ls = url.searchParams.get("latencySensitive");
+        if (ls != null) requirePerm(PERM.SESSION_SHARE); else requirePerm(PERM.KERNEL_READ);
         if (ls != null) this._setLatencySensitive(t, sessionId, ls === "1" || ls === "true");
         const row = this.sctx.storage.sql
           .exec<SessionRow>("SELECT * FROM sessions WHERE facet=?;", facetName(t, sessionId)).toArray()[0] || null;
@@ -718,8 +794,10 @@ export class SupervisorDO extends DurableObject<Env> {
       }
 
       // hard-evict the facet (ctx.facets.abort). SQLite snapshot survives -> next eval cold-restores.
+      // evict is a reset-class destructive op → requires kernel:reset.
       if (p === "/evict") {
         const t = requireTenant();
+        requirePerm(PERM.KERNEL_RESET);
         this.sctx.facets.abort(facetName(t, sessionId), new Error("manual evict"));
         this.sctx.storage.sql.exec(
           "UPDATE sessions SET last_activity=0, warm_until=0 WHERE facet=?;", facetName(t, sessionId));
@@ -729,6 +807,7 @@ export class SupervisorDO extends DurableObject<Env> {
       // cross-tenant session enumeration). Fails closed without a server-set tenant.
       if (p === "/sessions") {
         const t = requireTenant();
+        requirePerm(PERM.SESSION_LIST);
         const rows = this.sctx.storage.sql.exec<SessionRow>("SELECT * FROM sessions WHERE tenant=?;", t).toArray();
         return J({ count: rows.length, max: MAX_FACETS_PER_SUPERVISOR, sessions: rows });
       }
@@ -741,6 +820,9 @@ export class SupervisorDO extends DurableObject<Env> {
         routes: ["POST /create", "/eval?src=", "/gen", "/ping", "/reset", "/warm[?latencySensitive=1]", "/evict", "/sessions", "/health", "GET /usage?tenant=&window=", "POST /admin/keys (mint)", "GET /admin/keys (list)", "DELETE /admin/keys (revoke)"],
       });
     } catch (e) {
+      // W2 (#37): typed 403 — name the error class + the missing slug so the client/audit see why.
+      if (e instanceof PermissionDeniedError)
+        return J({ ok: false, error: { name: "PermissionDeniedError", message: e.message, missing: e.missing } }, 403);
       if (e instanceof HttpError) return J({ ok: false, error: e.message }, e.status);
       return J({ ok: false, error: String((e && (e as Error).stack) || e) }, 500);
     }
@@ -848,8 +930,23 @@ export default {
 
     // ---- ADMIN routes (gated by ADMIN_TOKEN secret) ----
     if (p === "/admin/keys") {
+      // W2 (#37): admin key-mint/list/revoke requires account:admin. Two accepted carriers:
+      //   (a) the operator ADMIN_TOKEN secret (legacy break-glass — unchanged); OR
+      //   (b) a WorkOS credential whose EFFECTIVE permissions include account:admin (real RBAC).
+      // No valid carrier → 401 (no/invalid auth); a valid key WITHOUT account:admin → typed 403.
       const adminTok = req.headers.get("x-admin-token") || url.searchParams.get("adminToken") || "";
-      if (!env.ADMIN_TOKEN || !safeEqual(adminTok, env.ADMIN_TOKEN)) return j({ error: "admin auth required (x-admin-token)" }, 401);
+      const hasAdminToken = !!env.ADMIN_TOKEN && safeEqual(adminTok, env.ADMIN_TOKEN);
+      if (!hasAdminToken) {
+        const key = getApiKey(req, url);
+        if (!key) return j({ error: "admin auth required (x-admin-token or an account:admin API key)" }, 401);
+        const legacyResolve = (k: string) =>
+          authStub(env).fetch(`https://do/_auth/resolve?key=${encodeURIComponent(k)}`)
+            .then((r) => r.json() as Promise<ResolvedTenant | null>).catch(() => null);
+        const cred = await resolveCredential(env, key, legacyResolve);
+        if (!cred || !cred.account) return j({ error: "admin auth required (x-admin-token or an account:admin API key)" }, 401);
+        if (!effectivePermissions(cred).includes(PERM.ACCOUNT_ADMIN))
+          return j({ error: { name: "PermissionDeniedError", message: `permission denied: missing required permission '${PERM.ACCOUNT_ADMIN}'`, missing: PERM.ACCOUNT_ADMIN } }, 403);
+      }
       const stub = authStub(env);
       if (req.method === "POST") {
         const tenantId = url.searchParams.get("tenantId") || url.searchParams.get("tenant");
@@ -885,7 +982,11 @@ export default {
           authStub(env).fetch(`https://do/_auth/resolve?key=${encodeURIComponent(k)}`)
             .then((r) => r.json() as Promise<ResolvedTenant | null>).catch(() => null);
         const cred = await resolveCredential(env, key, legacyResolve);
-        if (!cred || !cred.account) return j({ error: "unauthorized" }, 401);
+        if (!cred || !cred.account) return j({ error: "unauthorized" }, 401); // 401: no/invalid key
+        // W2 (#37): /usage requires usage:read. Enforce on the EFFECTIVE permissions (legacy/W1-era
+        // keys carry the developer profile, which includes usage:read). Missing → typed 403.
+        if (!effectivePermissions(cred).includes(PERM.USAGE_READ))
+          return j({ error: { name: "PermissionDeniedError", message: `permission denied: missing required permission '${PERM.USAGE_READ}'`, missing: PERM.USAGE_READ } }, 403);
         tenant = cred.account; // ignore any client-supplied tenant (server-derived account)
       }
       const windowMinutes = Number(url.searchParams.get("window") || url.searchParams.get("windowMinutes") || 1440) || 1440;
@@ -902,6 +1003,7 @@ export default {
       const headers = new Headers(req.headers);
       headers.delete("x-md-tenant");
       headers.delete("x-md-plan");
+      headers.delete("x-eg-perms"); // W2 (#37): strip client-supplied perms on non-gated routes
       const safeReq = new Request(req.url, { method: req.method, headers, body: req.body, redirect: "manual" });
       return env.SUPERVISOR.get(env.SUPERVISOR.idFromName(shardFor(sessionId, SHARD_COUNT))).fetch(safeReq);
     }
@@ -931,6 +1033,10 @@ export default {
     headers.set("x-md-tenant", cred.account);
     headers.set("x-md-plan", cred.plan || "free");
     headers.set("x-md-credtype", cred.credType);
+    // W2 (#37): the DO trusts ONLY this server-set x-eg-perms (CSV) for per-op enforcement. We
+    // overwrite (never append) any client-supplied value with the EFFECTIVE permissions resolved
+    // from WorkOS (or the documented developer/legacy fallback) — same trust model as x-md-tenant.
+    headers.set("x-eg-perms", effectivePermissions(cred).join(","));
     return stub.fetch(new Request(req.url, { method: req.method, headers, body: req.body, redirect: "manual" }));
   },
 };
