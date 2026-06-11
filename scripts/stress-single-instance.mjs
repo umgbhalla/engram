@@ -164,21 +164,73 @@ async function payloadProbe() {
     for (const kb of payloadKb) {
       const bytes = kb * 1024;
       const sample = await timedRpc(c, { t: "eval", src: '"x".repeat(' + bytes + ")" }, Math.max(timeoutMs, 60000));
+      const error = sample.error || compactError(sample.reply?.error);
+      const guarded = sample.reply?.ok === false && error?.name === "ProtocolSizeError";
+      const artifact = sample.reply?.ok !== false && sample.reply?.valueType === "artifact" && sample.reply?.value?.kind === "artifact";
+      const artifactRead = artifact
+        ? await retrieveTextArtifact(c, sample.reply.value, Math.max(timeoutMs, 60000))
+        : null;
       samples.push({
         kb,
         bytes,
         ms: sample.ms,
-        ok: sample.reply?.ok !== false,
+        ok: sample.reply?.ok !== false || guarded,
+        guarded,
+        artifact,
+        artifactRead,
         valueType: sample.reply?.valueType,
         returnedLength: typeof sample.reply?.value === "string" ? sample.reply.value.length : null,
         checkpoint: compactCheckpoint(sample.reply?.checkpoint),
-        error: sample.error || compactError(sample.reply?.error),
+        error,
       });
     }
-    return { ok: samples.every((s) => s.ok && s.returnedLength === s.bytes), sid, samples, stats: dist(samples.map((s) => s.ms)) };
+    const inline = samples.filter((s) => !s.guarded && !s.artifact);
+    const guarded = samples.filter((s) => s.guarded);
+    const artifacts = samples.filter((s) => s.artifact);
+    return {
+      ok: inline.every((s) => s.ok && s.returnedLength === s.bytes) &&
+        guarded.every((s) => s.ok) &&
+        artifacts.every((s) => s.ok && s.artifactRead?.ok && s.artifactRead?.chars === s.bytes),
+      sid,
+      inlineMaxKiB: inline.filter((s) => s.returnedLength === s.bytes).reduce((m, s) => Math.max(m, s.kb), 0),
+      guardedKiB: guarded.map((s) => s.kb),
+      artifactKiB: artifacts.map((s) => s.kb),
+      samples,
+      stats: dist(samples.map((s) => s.ms)),
+    };
   } finally {
     c.close();
   }
+}
+
+async function retrieveTextArtifact(client, descriptor, timeout) {
+  const handle = descriptor.handle;
+  const total = descriptor.chars;
+  const len = Math.min(descriptor.chunkMaxChars || 128 * 1024, 128 * 1024);
+  const chunks = [];
+  let offset = 0;
+  let chars = 0;
+  while (offset < total) {
+    const sample = await timedRpc(client, { t: "artifact", handle, offset, len }, timeout);
+    if (sample.error || sample.reply?.ok === false) {
+      return { ok: false, handle, chars, chunks: chunks.length, error: sample.error || compactError(sample.reply?.error) };
+    }
+    const data = sample.reply?.data;
+    if (typeof data !== "string" || sample.reply?.offset !== offset) {
+      return { ok: false, handle, chars, chunks: chunks.length, error: { name: "ArtifactError", message: "invalid chunk frame" } };
+    }
+    chars += data.length;
+    chunks.push({ offset, chars: data.length, done: Boolean(sample.reply?.done), ms: sample.ms });
+    offset += data.length;
+    if (data.length === 0) break;
+  }
+  return {
+    ok: chars === total && (chunks.length === 0 || chunks[chunks.length - 1].done === true),
+    handle,
+    chars,
+    chunks: chunks.length,
+    chunkStats: dist(chunks.map((c) => c.ms)),
+  };
 }
 
 async function memoryProbe() {
@@ -375,7 +427,12 @@ function summarizeRun(data) {
   const headline = [];
   if (data.sequence) headline.push("sequence cells=" + data.sequence.finalValue + "/" + data.config.cells + " p95=" + data.sequence.stats.ms.p95 + "ms");
   if (data.burst) headline.push("burst observed=" + data.burst.observed + "/" + data.burst.expected + " distinct=" + data.burst.distinct + " p95=" + data.burst.stats.ms.p95 + "ms");
-  if (data.payload) headline.push("payload max=" + Math.max(...data.payload.samples.map((s) => s.kb)) + "KiB ok=" + data.payload.ok);
+  if (data.payload) {
+    const max = Math.max(...data.payload.samples.map((s) => s.kb));
+    const guarded = data.payload.guardedKiB?.length ? " guarded=" + data.payload.guardedKiB.join(",") + "KiB" : "";
+    const artifacts = data.payload.artifactKiB?.length ? " artifact=" + data.payload.artifactKiB.join(",") + "KiB" : "";
+    headline.push("payload max=" + max + "KiB inlineMax=" + data.payload.inlineMaxKiB + "KiB" + guarded + artifacts + " ok=" + data.payload.ok);
+  }
   if (data.memory) headline.push("memory restored=" + data.memory.restoredBytes + " source=" + (data.memory.restoreSource || "unknown") + " ok=" + data.memory.ok);
   return { ok: failures.length === 0, checkedParts: parts.length, failedParts: failures.map((p) => p.sid || "unknown"), headline };
 }

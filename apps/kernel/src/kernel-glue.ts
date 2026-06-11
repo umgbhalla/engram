@@ -18,29 +18,204 @@
 // The engine ABI (C exports) is documented in engine/src/lib.rs.
 
 import { transformCell, wrapAsyncCompletion } from "./repl-transform.js";
-import tsBlankSpace from "ts-blank-space";
 
-// stripTypes: erase TS type syntax to whitespace (length-preserving, no codegen) so the
+// stripTypes: erase common TS type syntax to whitespace (length-preserving, no codegen) so the
 // downstream depth-0 declaration tokenizer in repl-transform.ts still sees the same offsets.
-// Pure host-side source fn — adds NO entropy (determinism + engine-hash unchanged). The optional
-// onError callback fires once per UN-ERASABLE TS construct (enum / namespace / parameter
-// properties); we collect their SyntaxKind numbers and throw so evalCode can reject the cell with
-// a typed TypeScriptError (socket stays alive). On a valid-JS or plain-TS cell this is a near
-// no-op (type annotations -> spaces, which the tokenizer already skips as trivia).
+// This intentionally avoids bundling the full TypeScript compiler into kernel-glue.mjs: wasm-bindgen
+// embeds this module as a JS snippet during the Rust worker-shell build, and a huge glue file makes
+// rustc's const evaluation peg a core for minutes. The eraser is deliberately conservative; if it
+// sees syntax that needs runtime codegen, it rejects before eval with a typed TypeScriptError.
 function stripTypes(src: string): string {
-  const errKinds: number[] = [];
-  const out = tsBlankSpace(src, (node) => {
-    errKinds.push((node as { kind: number }).kind);
-  });
-  if (errKinds.length) {
-    const e = new Error(
-      "un-erasable TypeScript construct(s) (SyntaxKind " + errKinds.join(",") +
-        "); enum / namespace / parameter-properties are not supported"
-    );
+  if (!/[<:>]|\b(?:type|interface|declare|abstract|enum|namespace|module|as|satisfies)\b/.test(src)) return src;
+
+  const masked = maskNonCode(src);
+  const reject = (message: string): never => {
+    const e = new Error(message);
     (e as Error & { name: string }).name = "TypeScriptError";
     throw e;
+  };
+  if (/\b(?:const\s+)?enum\s+[A-Za-z_$]/.test(masked)) {
+    reject("un-erasable TypeScript construct: enum is not supported");
   }
-  return out;
+  if (/\b(?:namespace|module)\s+[A-Za-z_$][\w$]*\s*\{/.test(masked)) {
+    reject("un-erasable TypeScript construct: namespace/module is not supported");
+  }
+  if (/\bconstructor\s*\([^)]*\b(?:public|private|protected|readonly)\b/.test(masked)) {
+    reject("un-erasable TypeScript construct: parameter properties are not supported");
+  }
+
+  const out = src.split("");
+  const blank = (start: number, end: number) => {
+    for (let i = Math.max(0, start); i < Math.min(out.length, end); i++) {
+      if (out[i] !== "\n" && out[i] !== "\r") out[i] = " ";
+    }
+  };
+
+  for (const m of masked.matchAll(/\binterface\s+[A-Za-z_$][\w$]*/g)) {
+    const start = m.index || 0;
+    const brace = masked.indexOf("{", start + m[0].length);
+    if (brace < 0) reject("invalid TypeScript interface declaration");
+    const endBrace = findMatching(masked, brace, "{", "}");
+    if (endBrace < 0) reject("invalid TypeScript interface declaration");
+    let end = endBrace + 1;
+    while (/\s/.test(masked[end] || "")) end++;
+    if (masked[end] === ";") end++;
+    blank(start, end);
+  }
+
+  for (const m of masked.matchAll(/\btype\s+[A-Za-z_$][\w$]*\b/g)) {
+    const start = m.index || 0;
+    const eq = masked.indexOf("=", start + m[0].length);
+    if (eq < 0) continue;
+    blank(start, findStatementEnd(masked, eq + 1));
+  }
+
+  for (const m of masked.matchAll(/\bdeclare\b/g)) {
+    const start = m.index || 0;
+    let end = findStatementEnd(masked, start + m[0].length);
+    const brace = masked.indexOf("{", start + m[0].length);
+    if (brace >= 0 && brace < end) {
+      const endBrace = findMatching(masked, brace, "{", "}");
+      if (endBrace >= 0) end = endBrace + 1;
+    }
+    blank(start, end);
+  }
+
+  for (const m of masked.matchAll(/\babstract\b/g)) blank(m.index || 0, (m.index || 0) + m[0].length);
+
+  for (let i = 0; i < masked.length; i++) {
+    if (masked[i] !== "<") continue;
+    const end = findMatching(masked, i, "<", ">");
+    if (end < 0) continue;
+    const body = masked.slice(i + 1, end);
+    const next = nextNonSpace(masked, end + 1);
+    const prev = prevNonSpace(masked, i - 1);
+    if (
+      next >= 0 && masked[next] === "(" &&
+      /^[\sA-Za-z_$][\w$\s,=.\[\]|&?]*(?:extends\s+[\w$\s.\[\]|&?]+)?[,]?\s*$/.test(body) &&
+      (prev < 0 || /[=,(]|[A-Za-z_$0-9]/.test(masked[prev]))
+    ) {
+      blank(i, end + 1);
+      i = end;
+    }
+  }
+
+  eraseTypeAnnotations(masked, blank);
+  eraseAssertionLike(masked, /\bas\b/g, blank);
+  eraseAssertionLike(masked, /\bsatisfies\b/g, blank);
+
+  return out.join("");
+}
+
+function maskNonCode(src: string): string {
+  const out = src.split("");
+  for (let i = 0; i < out.length; i++) {
+    const ch = out[i], n = out[i + 1];
+    if (ch === "/" && n === "/") {
+      for (let j = i; j < out.length && out[j] !== "\n"; j++) out[j] = " ";
+    } else if (ch === "/" && n === "*") {
+      out[i] = out[i + 1] = " ";
+      for (let j = i + 2; j < out.length; j++) {
+        const end = out[j] === "*" && out[j + 1] === "/";
+        if (out[j] !== "\n" && out[j] !== "\r") out[j] = " ";
+        if (end) { if (out[j + 1] !== "\n" && out[j + 1] !== "\r") out[j + 1] = " "; i = j + 1; break; }
+      }
+    } else if (ch === '"' || ch === "'" || ch.charCodeAt(0) === 96) {
+      const quote = ch;
+      out[i] = " ";
+      for (let j = i + 1; j < out.length; j++) {
+        const c = out[j];
+        if (c === "\\") {
+          if (out[j] !== "\n" && out[j] !== "\r") out[j] = " ";
+          if (out[j + 1] !== "\n" && out[j + 1] !== "\r") out[j + 1] = " ";
+          j++;
+          continue;
+        }
+        if (c !== "\n" && c !== "\r") out[j] = " ";
+        if (c === quote) { i = j; break; }
+      }
+    }
+  }
+  return out.join("");
+}
+
+function findMatching(src: string, start: number, open: string, close: string): number {
+  let depth = 0;
+  for (let i = start; i < src.length; i++) {
+    if (src[i] === open) depth++;
+    else if (src[i] === close && --depth === 0) return i;
+  }
+  return -1;
+}
+
+function findStatementEnd(src: string, start: number): number {
+  let paren = 0, brace = 0, bracket = 0;
+  for (let i = start; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === "(") paren++;
+    else if (ch === ")") paren = Math.max(0, paren - 1);
+    else if (ch === "{") brace++;
+    else if (ch === "}") brace = Math.max(0, brace - 1);
+    else if (ch === "[") bracket++;
+    else if (ch === "]") bracket = Math.max(0, bracket - 1);
+    else if (ch === ";" && paren === 0 && brace === 0 && bracket === 0) return i + 1;
+  }
+  return src.length;
+}
+
+function nextNonSpace(src: string, i: number): number {
+  while (i < src.length && /\s/.test(src[i])) i++;
+  return i < src.length ? i : -1;
+}
+
+function prevNonSpace(src: string, i: number): number {
+  while (i >= 0 && /\s/.test(src[i])) i--;
+  return i;
+}
+
+function eraseTypeAnnotations(src: string, blank: (start: number, end: number) => void): void {
+  let paren = 0, brace = 0, bracket = 0;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === "(") paren++;
+    else if (ch === ")") paren = Math.max(0, paren - 1);
+    else if (ch === "{") brace++;
+    else if (ch === "}") brace = Math.max(0, brace - 1);
+    else if (ch === "[") bracket++;
+    else if (ch === "]") bracket = Math.max(0, bracket - 1);
+    if (ch !== ":" || brace > 0 || bracket > 0) continue;
+    const prev = prevNonSpace(src, i - 1);
+    const next = nextNonSpace(src, i + 1);
+    if (prev < 0 || next < 0 || !/[A-Za-z_$)\]}]/.test(src[prev]) || !/[A-Za-z_$\[{]/.test(src[next])) continue;
+    const end = findTypeEnd(src, i + 1);
+    if (end > i + 1) blank(i, end);
+  }
+}
+
+function findTypeEnd(src: string, start: number): number {
+  let angle = 0, paren = 0, bracket = 0, brace = 0;
+  for (let i = start; i < src.length; i++) {
+    const ch = src[i], n = src[i + 1];
+    if (ch === "<") angle++;
+    else if (ch === ">" && angle > 0) angle--;
+    else if (ch === "(") paren++;
+    else if (ch === ")" && paren > 0) paren--;
+    else if (ch === "[") bracket++;
+    else if (ch === "]" && bracket > 0) bracket--;
+    else if (ch === "{") brace++;
+    else if (ch === "}" && brace > 0) brace--;
+    if (angle || paren || bracket || brace) continue;
+    if (ch === "=" && n === ">") return i;
+    if (/[=,);{}]/.test(ch)) return i;
+  }
+  return src.length;
+}
+
+function eraseAssertionLike(src: string, re: RegExp, blank: (start: number, end: number) => void): void {
+  for (const m of src.matchAll(re)) {
+    const start = m.index || 0;
+    blank(start, findTypeEnd(src, start + m[0].length));
+  }
 }
 
 // ---- engine C-ABI export surface (the precompiled rquickjs engine.wasm) ----
@@ -66,6 +241,7 @@ interface EngineExports {
   kv_export_ptr(): number;
   kv_export_len(): number;
   kv_import(ptr: number, len: number): void;
+  result_artifact_chunk(offset: number, len: number): number;
   eval_begin(ptr: number, len: number, budget: bigint, growCapPages: number): number;
   eval_resume(ptr: number, len: number): number;
   run_gc(): void;
@@ -939,6 +1115,24 @@ class GlueKernel {
   // E6: the host requests+results serviced during the last eval (for the crash-tail oplog).
   lastCellHostResults(): string {
     try { return JSON.stringify(this._cellHostResults || []); } catch { return "[]"; }
+  }
+
+  resultArtifactChunk(offset: number, len: number): string {
+    try {
+      const ex = this._ex();
+      ex.result_artifact_chunk(Math.max(0, offset | 0), Math.max(0, len | 0));
+      return this._readResult();
+    } catch (e) {
+      const err = e as { name?: string; message?: string };
+      return JSON.stringify({
+        ok: false,
+        t: "artifact",
+        error: {
+          name: (err && err.name) || "ArtifactError",
+          message: String((err && err.message) || e),
+        },
+      });
+    }
   }
 
   // evalCode: ASYNC. Drives the engine eval_begin/eval_resume loop, servicing host effects

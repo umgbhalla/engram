@@ -31,45 +31,19 @@ const COMMON = {
   format: "esm",
   target: "es2022",
   platform: "neutral",
-  // ts-blank-space (bundled into kernel-glue) imports "typescript" for its scanner/parser; the
-  // "neutral" platform ignores package "main" by default, so name the fields explicitly to resolve
-  // the CJS entry. Bundling pulls the TS parser into the single .mjs (host-side only).
   mainFields: ["module", "main"],
   minify: false,
   sourcemap: false,
   legalComments: "none",
 };
 
-// 1. kernel-glue: self-contained single-file ESM (repl-transform + ts-blank-space inlined).
-// ts-blank-space pulls in the "typescript" parser, which `require(...)`s Node built-ins both
-// EAGERLY at module top-level AND via computed `require(name)` env probing (os.platform() at
-// init). The wasm-bindgen snippet that worker-build re-bundles MUST be fully self-contained — it
-// re-runs esbuild with NO externals and a browser platform, so we can neither leave `import"fs"`
-// nor reference `node:*`. Instead, alias every bare builtin to a tiny self-contained functional
-// shim module AND inject a banner `require()` (intercepting static + computed requires) that
-// resolves to that same shim. The shim is behavior-correct ONLY for the env-probe surface TS
-// touches at init (os.platform, path.*, process.*); the in-memory scanner/createSourceFile path
-// ts-blank-space uses performs no real fs/process I/O, so the shim is never functionally relied
-// on beyond init. Host-side only; the VM heap never sees any of this.
-const NODE_SHIM = resolve(here, "node-builtin-shim.mjs");
-const NODE_BUILTINS = ["fs", "path", "os", "inspector", "crypto", "perf_hooks", "module", "url",
-  "buffer", "util", "child_process", "readline", "tty", "v8", "vm", "events", "stream",
-  "string_decoder", "assert", "process", "net", "http", "https", "zlib", "worker_threads"];
-const NODE_ALIAS = Object.fromEntries(
-  NODE_BUILTINS.flatMap((m) => [[m, NODE_SHIM], ["node:" + m, NODE_SHIM]])
-);
-const REQUIRE_BANNER =
-  `import __NODE_SHIM from ${JSON.stringify(NODE_SHIM)};` +
-  "const require=(n)=>__NODE_SHIM;" +
-  // CJS globals the bundled typescript reads at init under ESM output (esbuild does not inject
-  // these for format:esm). Harmless constants; the scanner path never uses them meaningfully.
-  'const __filename="/kernel-glue.mjs";const __dirname="/";';
+// 1. kernel-glue: self-contained single-file ESM (repl-transform inlined). The TypeScript eraser is
+// local code in kernel-glue.ts, so this no longer bundles the full TypeScript compiler into the
+// wasm-bindgen JS snippet.
 await build({
   ...COMMON,
   entryPoints: [resolve(root, "src/kernel-glue.ts")],
   outfile: resolve(root, "src/kernel-glue.mjs"),
-  alias: NODE_ALIAS,
-  banner: { js: REQUIRE_BANNER },
 });
 console.log("[build-ts] src/kernel-glue.ts -> src/kernel-glue.mjs");
 

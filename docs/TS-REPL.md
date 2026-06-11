@@ -8,6 +8,12 @@
 > generation (`enum`, `const enum`, `namespace`/`module`, parameter properties) are cleanly
 > rejected with a typed `TypeScriptError` — the socket stays alive and the next eval works.
 
+> **2026-06-11 update:** the runtime no longer bundles `ts-blank-space` or the full `typescript`
+> compiler into `kernel-glue.mjs`. That dependency worked at runtime but made wasm-bindgen/rustc
+> const-evaluate a ~10 MB JS snippet during worker-shell builds. The live implementation is now a
+> small local host-side eraser in `apps/kernel/src/kernel-glue.ts`; the older `ts-blank-space`
+> details below are historical context for the original rollout.
+
 ## Why TS, why now
 
 The kernel is a stateful JS REPL. Users increasingly paste TypeScript. Until now a cell like

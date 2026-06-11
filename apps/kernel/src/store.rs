@@ -47,8 +47,11 @@ pub trait KernelStore {
 
     /// Run a query and return each row as a positional `Vec<StoreValue>` (no column names).
     /// Mirrors iterating `sql.exec(query, bindings)?.raw()`. Used by the chunk/delta blob readers.
-    fn query_raw(&self, query: &str, bindings: Option<Vec<StoreValue>>)
-        -> Result<Vec<Vec<StoreValue>>>;
+    fn query_raw(
+        &self,
+        query: &str,
+        bindings: Option<Vec<StoreValue>>,
+    ) -> Result<Vec<Vec<StoreValue>>>;
 }
 
 /// Cloudflare Durable Object SQLite backend — the one concrete `KernelStore` today. A thin,

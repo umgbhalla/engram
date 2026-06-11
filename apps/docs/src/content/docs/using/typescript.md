@@ -18,15 +18,15 @@ never sees TypeScript or a TS parser:
 
 ```
 cell source
-  → stripTypes(src)          [ts-blank-space, host-side, if config.typescript !== false]
+  → stripTypes(src)          [host-side eraser, if config.typescript !== false]
   → transformCell(stripped)  [existing depth-0 let/const/function/class → global rewrite]
   → engine eval (QuickJS in WASM)
 ```
 
-`stripTypes` calls `ts-blank-space`, which does **length- and position-preserving** erasure: type
+`stripTypes` is a small, host-side, length-preserving eraser for common TypeScript syntax. Type
 syntax is replaced byte-for-byte with spaces, so `out.length === src.length`. This is the
-load-bearing property — the existing declaration tokenizer sees **identical offsets**, so no
-change is needed downstream.
+load-bearing property: the existing declaration tokenizer sees identical offsets, so no change is
+needed downstream. It deliberately does no code generation.
 
 If any un-erasable construct is encountered, `stripTypes` throws a typed `TypeScriptError`
 **without evaluating** the partially-blanked output. The reject is shaped exactly like the
@@ -69,12 +69,13 @@ the strip entirely and feed raw QuickJS.
 
 ## Determinism
 
-`tsBlankSpace(src)` is a **pure function of its input string** — no `Date`, no RNG, no I/O — and runs
+`stripTypes(src)` is a pure function of its input string: no `Date`, no RNG, no I/O. It runs
 host-side, not in WASM linear memory. The snapshot is unaffected, the engine hash is unchanged, and
 seeded sessions stay byte-identical across restore.
 
-## The one real cost
+## Build cost
 
-`ts-blank-space` hard-depends on the `typescript` package for its scanner, growing the bundled glue
-from ~36 KB to ~10 MB raw / ~1.65 MB gzip. The Worker code budget is 10 MB **after** compression, so
-the gzip glue plus the ~1.45 MB `quickjs.wasm` sit comfortably under the cap.
+The stripper is intentionally local and small. Earlier builds bundled `ts-blank-space` plus the
+full `typescript` package into `kernel-glue.mjs`, which worked at runtime but made the worker-shell
+Rust build spend minutes in wasm-bindgen const evaluation. The local eraser keeps the glue small
+enough for fast worker builds.

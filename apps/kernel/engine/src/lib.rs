@@ -83,10 +83,21 @@ pub extern "C" fn boot_err_len() -> usize {
 
 fn set_result(s: &str) {
     let b = s.as_bytes();
-    let n = b.len().min(1 << 20);
+    let overflow;
+    let out = if b.len() > (1 << 20) {
+        overflow = format!(
+            r#"{{"ok":false,"valueType":"error","error":{{"name":"ProtocolSizeError","message":"eval result JSON {}B exceeds RESULT buffer {}B; return an artifact/display handle instead of an inline value"}}}}"#,
+            b.len(),
+            1 << 20,
+        );
+        overflow.as_bytes()
+    } else {
+        b
+    };
+    let n = out.len().min(1 << 20);
     unsafe {
         let p = core::ptr::addr_of_mut!(RESULT) as *mut u8;
-        core::ptr::copy_nonoverlapping(b.as_ptr(), p, n);
+        core::ptr::copy_nonoverlapping(out.as_ptr(), p, n);
         RESULT_LEN = n;
     }
 }
@@ -99,6 +110,9 @@ fn set_hostcall(s: &str) {
         HOSTCALL_LEN = n;
     }
 }
+
+const TEXT_ARTIFACT_THRESHOLD_CHARS: usize = 900 * 1024;
+const TEXT_ARTIFACT_CHUNK_MAX_CHARS: usize = 128 * 1024;
 
 #[no_mangle]
 pub extern "C" fn scratch_ptr() -> *const u8 {
@@ -2583,7 +2597,16 @@ globalThis.use = async function(name, opts){
 globalThis.__preview = function(v, depth){
   depth = (depth === undefined) ? 2 : depth;
   const seen = new WeakSet();
-  function q(s){ return '"' + String(s).replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n') + '"'; }
+  function q(s){
+    s = String(s);
+    var max = 4096;
+    var suffix = '';
+    if (s.length > max) {
+      suffix = '...(' + s.length + ' chars)';
+      s = s.slice(0, max);
+    }
+    return '"' + (s + suffix).replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n') + '"';
+  }
   function go(v, d){
     const t = typeof v;
     if (v === null) return 'null';
@@ -2846,7 +2869,13 @@ fn ensure_ctx() {
 #[no_mangle]
 pub extern "C" fn create(clock_seed: u64, rng_seed: u64) -> i32 {
     CLOCK.with(|c| c.set(clock_seed));
-    RNG.with(|r| r.set(if rng_seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { rng_seed }));
+    RNG.with(|r| {
+        r.set(if rng_seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            rng_seed
+        })
+    });
     ensure_ctx();
     1
 }
@@ -2966,7 +2995,11 @@ fn ensure_wired() {
                 ctx.with(|ctx| {
                     let r: rquickjs::Result<Value> = ctx.eval(BOOTSTRAP);
                     if r.is_err() {
-                        let msg = ctx.catch().as_exception().and_then(|e| e.message()).unwrap_or_else(|| "no-exc".into());
+                        let msg = ctx
+                            .catch()
+                            .as_exception()
+                            .and_then(|e| e.message())
+                            .unwrap_or_else(|| "no-exc".into());
                         let b = msg.as_bytes();
                         let n = b.len().min(4096);
                         unsafe {
@@ -3020,7 +3053,10 @@ fn finalize_cell(ctx: &Ctx) {
     if tripped || grow_tripped {
         let logs = drain_logs(ctx);
         let (name, msg) = if grow_tripped {
-            ("MemoryLimitError", "cell grew linear memory past the per-cell cap")
+            (
+                "MemoryLimitError",
+                "cell grew linear memory past the per-cell cap",
+            )
         } else {
             ("TimeoutError", "cell exceeded the instruction budget")
         };
@@ -3040,6 +3076,23 @@ fn finalize_cell(ctx: &Ctx) {
           var v = globalThis.__cellResult;
           var preview = globalThis.__preview(v, 2);
           var vtype = globalThis.__valueType(v);
+          if (typeof v === 'string' && v.length > __TEXT_ARTIFACT_THRESHOLD_CHARS) {
+            globalThis.__lastTextArtifact = v;
+            return JSON.stringify({
+              ok:true,
+              value:{
+                kind:'artifact',
+                handle:'pending:text',
+                mime:'text/plain;charset=utf-8',
+                chars:v.length,
+                encoding:'utf-16-js-string',
+                chunkMaxChars:__TEXT_ARTIFACT_CHUNK_MAX_CHARS
+              },
+              valuePreview:preview,
+              valueType:'artifact',
+              logs:JSON.parse(logs)
+            });
+          }
           var value;
           try { value = (v===undefined) ? null : JSON.parse(JSON.stringify(v)); }
           catch(e){ value = null; }
@@ -3052,13 +3105,24 @@ fn finalize_cell(ctx: &Ctx) {
         }
       })()
     "#;
+    let _ = ctx.globals().set(
+        "__TEXT_ARTIFACT_THRESHOLD_CHARS",
+        TEXT_ARTIFACT_THRESHOLD_CHARS as i32,
+    );
+    let _ = ctx.globals().set(
+        "__TEXT_ARTIFACT_CHUNK_MAX_CHARS",
+        TEXT_ARTIFACT_CHUNK_MAX_CHARS as i32,
+    );
     let res = ctx.eval::<Value, _>(frame_js);
     let frame = match res {
         Ok(v) => v
             .as_string()
             .and_then(|s| s.to_string().ok())
             .unwrap_or_else(|| {
-                format!("{{\"FRAME_NOT_STRING\":true,\"isPromise\":{}}}", v.is_promise())
+                format!(
+                    "{{\"FRAME_NOT_STRING\":true,\"isPromise\":{}}}",
+                    v.is_promise()
+                )
             }),
         Err(_) => {
             let m = ctx
@@ -3070,6 +3134,65 @@ fn finalize_cell(ctx: &Ctx) {
         }
     };
     set_result(&frame);
+}
+
+#[no_mangle]
+pub extern "C" fn result_artifact_chunk(offset: usize, len: usize) -> i32 {
+    ensure_ctx();
+    CTX.with(|c| {
+        if let Some((_, ctx)) = c.borrow().as_ref() {
+            ctx.with(|ctx| {
+                let chunk_len = len.min(TEXT_ARTIFACT_CHUNK_MAX_CHARS);
+                let frame_js = format!(
+                    r#"
+                      (function(){{
+                        var v = (typeof globalThis.__lastTextArtifact === 'string')
+                          ? globalThis.__lastTextArtifact
+                          : globalThis.__cellResult;
+                        if (typeof v !== 'string') {{
+                          return JSON.stringify({{ok:false,t:'artifact',error:{{name:'ArtifactError',message:'last result is not a text artifact'}}}});
+                        }}
+                        var total = v.length;
+                        var off = Math.max(0, Math.min({}, total));
+                        var n = Math.max(0, Math.min({}, {}));
+                        var chunk = v.slice(off, off + n);
+                        return JSON.stringify({{
+                          ok:true,
+                          t:'artifact',
+                          offset:off,
+                          chars:chunk.length,
+                          totalChars:total,
+                          done:off + chunk.length >= total,
+                          data:chunk
+                        }});
+                      }})()
+                    "#,
+                    offset,
+                    chunk_len,
+                    TEXT_ARTIFACT_CHUNK_MAX_CHARS
+                );
+                let res = ctx.eval::<Value, _>(frame_js.as_str());
+                let frame = match res {
+                    Ok(v) => v
+                        .as_string()
+                        .and_then(|s| s.to_string().ok())
+                        .unwrap_or_else(|| r#"{"ok":false,"t":"artifact","error":{"name":"ArtifactError","message":"chunk frame was not a string"}}"#.to_string()),
+                    Err(_) => {
+                        let m = ctx
+                            .catch()
+                            .as_exception()
+                            .and_then(|e| e.message())
+                            .unwrap_or_else(|| "no-exc".into());
+                        format!(r#"{{"ok":false,"t":"artifact","error":{{"name":"ArtifactError","message":{}}}}}"#, json_str(&m))
+                    }
+                };
+                set_result(&frame);
+            });
+        } else {
+            set_result(r#"{"ok":false,"t":"artifact","error":{"name":"ArtifactError","message":"kernel is not initialized"}}"#);
+        }
+    });
+    0
 }
 
 fn drain_logs(ctx: &Ctx) -> String {
@@ -3089,7 +3212,12 @@ fn arm_guards(budget: i64, grow_cap_pages: u32) {
 }
 
 #[no_mangle]
-pub extern "C" fn eval_begin(src_ptr: *const u8, src_len: usize, budget: i64, grow_cap_pages: u32) -> i32 {
+pub extern "C" fn eval_begin(
+    src_ptr: *const u8,
+    src_len: usize,
+    budget: i64,
+    grow_cap_pages: u32,
+) -> i32 {
     ensure_ctx();
     arm_guards(budget, grow_cap_pages);
     ensure_wired();
@@ -3100,7 +3228,9 @@ pub extern "C" fn eval_begin(src_ptr: *const u8, src_len: usize, budget: i64, gr
     let src = match std::str::from_utf8(src) {
         Ok(s) => s.to_string(),
         Err(_) => {
-            set_result(r#"{"ok":false,"valueType":"error","logs":[],"error":{"name":"Error","message":"invalid-utf8","stack":""}}"#);
+            set_result(
+                r#"{"ok":false,"valueType":"error","logs":[],"error":{"name":"Error","message":"invalid-utf8","stack":""}}"#,
+            );
             return STATUS_DONE;
         }
     };
@@ -3352,7 +3482,9 @@ mod serde_lite {
                             if c == ']' && depth == 0 {
                                 let item = rest[start..i].trim();
                                 if !item.is_empty() {
-                                    items.push(Item { raw: item.to_string() });
+                                    items.push(Item {
+                                        raw: item.to_string(),
+                                    });
                                 }
                                 return Some(Arr { items });
                             }
@@ -3361,7 +3493,9 @@ mod serde_lite {
                         ',' if depth == 0 => {
                             let item = rest[start..i].trim();
                             if !item.is_empty() {
-                                items.push(Item { raw: item.to_string() });
+                                items.push(Item {
+                                    raw: item.to_string(),
+                                });
                             }
                             start = i + 1;
                         }

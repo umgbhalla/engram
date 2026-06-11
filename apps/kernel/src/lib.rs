@@ -11,16 +11,21 @@
 //! Rust-in-wasm instead of 2000 lines of hand-written glue.js.
 //!
 //! Protocol over WS/HTTP (JSON), parity with engram-kernel:
-//!   {t:create,config} {t:eval,src} {t:ping} {t:gen} {t:reset} {t:evict} + /health
+//!   {t:create,config} {t:eval,src} {t:artifact,handle,offset,len}
+//!   {t:ping} {t:gen} {t:reset} {t:evict} + /health
 
 mod store;
 
 use js_sys::{Reflect, Uint8Array};
 use serde_json::json;
 use std::cell::RefCell;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
 use store::{DoSqlStore, KernelStore};
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::closure::Closure;
+use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use worker::{
@@ -28,10 +33,6 @@ use worker::{
     Request, Response, Result, State, WebSocket, WebSocketIncomingMessage, WebSocketPair,
     WebSocketRequestResponsePair,
 };
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use std::time::Duration;
 
 #[wasm_bindgen(module = "/src/kernel-glue.mjs")]
 extern "C" {
@@ -71,6 +72,8 @@ extern "C" {
     fn last_restore_timings(this: &GlueKernel) -> String;
     #[wasm_bindgen(method, js_name = evalCode)]
     fn eval_code(this: &GlueKernel, src: &str) -> js_sys::Promise;
+    #[wasm_bindgen(method, js_name = resultArtifactChunk)]
+    fn result_artifact_chunk(this: &GlueKernel, offset: f64, len: f64) -> String;
     #[wasm_bindgen(method, js_name = setHostSender)]
     fn set_host_sender(this: &GlueKernel, send: &JsValue, timeout_ms: f64);
     #[wasm_bindgen(method, js_name = setFsHandler)]
@@ -188,6 +191,7 @@ const SQLITE_HOT_MAX: usize = 8 * 1024 * 1024;
 /// stay below this or the INSERT throws SQLITE_TOOBIG mid-commit (aborting the staged transaction
 /// and risking a torn manifest). The E6 oplog `src` is the only unbounded text we bind; clamp it.
 const SQLITE_MAX_VALUE_BYTES: usize = 1_500_000;
+const TEXT_ARTIFACT_CHUNK_MAX_CHARS: i64 = 128 * 1024;
 
 #[durable_object]
 pub struct KernelDO {
@@ -211,7 +215,10 @@ impl DurableObject for KernelDO {
     fn new(state: State, env: Env) -> Self {
         let store = DoSqlStore::new(state.storage().sql());
         store
-            .exec("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);", None)
+            .exec(
+                "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);",
+                None,
+            )
             .expect("create meta");
         store
             .exec(
@@ -234,17 +241,29 @@ impl DurableObject for KernelDO {
             .expect("create snap_chunks");
         // W4 byte-delta: the committed snapshot is a full (W5-compacted) BASE plus a chain of
         // per-cell byte-deltas. Manifest gains base_seq/delta_seq/snap_mode + ctx columns.
-        store.exec_ignore("ALTER TABLE snap_manifest ADD COLUMN base_seq INTEGER;", None);
-        store.exec_ignore("ALTER TABLE snap_manifest ADD COLUMN delta_seq INTEGER;", None);
+        store.exec_ignore(
+            "ALTER TABLE snap_manifest ADD COLUMN base_seq INTEGER;",
+            None,
+        );
+        store.exec_ignore(
+            "ALTER TABLE snap_manifest ADD COLUMN delta_seq INTEGER;",
+            None,
+        );
         store.exec_ignore("ALTER TABLE snap_manifest ADD COLUMN snap_mode TEXT;", None);
         // Snapshot-format groundwork: a semantic layout epoch alongside engine_hash (fable design —
         // a manual salt may only FORCE replay, never force a hot restore). Recorded for future
         // layout-compatible hot-restore gating; the post-restore sanity probe is the live safety net.
-        store.exec_ignore("ALTER TABLE snap_manifest ADD COLUMN layout_version TEXT;", None);
+        store.exec_ignore(
+            "ALTER TABLE snap_manifest ADD COLUMN layout_version TEXT;",
+            None,
+        );
         // W4 reconstruction checksum: CRC32 of the FULL image the committed chain reconstructs to
         // (base+deltas incl. the manifest's tail row). restoreW4 recomputes + rejects a mismatch =>
         // oplog replay fallback. Nullable for pre-CRC snapshots (the glue skips the check then).
-        store.exec_ignore("ALTER TABLE snap_manifest ADD COLUMN final_crc INTEGER;", None);
+        store.exec_ignore(
+            "ALTER TABLE snap_manifest ADD COLUMN final_crc INTEGER;",
+            None,
+        );
         write_meta(&store, "snapFormat", SNAPSHOT_FORMAT_VERSION);
         store
             .exec(
@@ -362,7 +381,9 @@ impl DurableObject for KernelDO {
                 }
             }
         }
-        Response::ok("engram-rust kernel: connect a websocket; {t:create|eval|reset|gen|ping|evict}\n")
+        Response::ok(
+            "engram-rust kernel: connect a websocket; {t:create|eval|reset|gen|ping|evict}\n",
+        )
     }
 
     async fn websocket_message(
@@ -479,7 +500,12 @@ struct Datapoint {
 }
 impl Datapoint {
     fn new(op: &str) -> Self {
-        Datapoint { op: op.into(), ok: true, cell: -1, ..Default::default() }
+        Datapoint {
+            op: op.into(),
+            ok: true,
+            cell: -1,
+            ..Default::default()
+        }
     }
 }
 
@@ -504,7 +530,11 @@ impl KernelDO {
         let mut dp = Datapoint::new(op);
         dp.error_name = "unauthorized".into();
         dp.ok = false;
-        dp.label = if self.auth_enforce { "enforce".into() } else { "log-only".into() };
+        dp.label = if self.auth_enforce {
+            "enforce".into()
+        } else {
+            "log-only".into()
+        };
         self.emit(&dp);
     }
 
@@ -607,7 +637,9 @@ impl KernelDO {
             let bucket = match self.env.bucket("SNAPSHOTS") {
                 Ok(b) => b,
                 Err(e) => {
-                    console_log(&format!("[r2-get] bucket bind failed (attempt {attempt}): {e:?}"));
+                    console_log(&format!(
+                        "[r2-get] bucket bind failed (attempt {attempt}): {e:?}"
+                    ));
                     continue;
                 }
             };
@@ -639,15 +671,22 @@ impl KernelDO {
                     return R2Read::Missing;
                 }
                 Some(Err(e)) => {
-                    console_log(&format!("[r2-get] transient error attempt {attempt}: {e:?}"));
+                    console_log(&format!(
+                        "[r2-get] transient error attempt {attempt}: {e:?}"
+                    ));
                 }
                 None => {
-                    console_log(&format!("[r2-get] timeout (>{}ms) attempt {attempt}", R2_GET_TIMEOUT_MS));
+                    console_log(&format!(
+                        "[r2-get] timeout (>{}ms) attempt {attempt}",
+                        R2_GET_TIMEOUT_MS
+                    ));
                 }
             }
         }
         self.r2_breaker_record_failure();
-        console_log(&format!("[r2-get] EXHAUSTED {R2_GET_ATTEMPTS} attempts for key {key}"));
+        console_log(&format!(
+            "[r2-get] EXHAUSTED {R2_GET_ATTEMPTS} attempts for key {key}"
+        ));
         R2Read::Exhausted
     }
 
@@ -693,6 +732,12 @@ impl KernelDO {
                 let _ = js_sys::Function::from(release).call0(&JsValue::NULL);
                 res
             }
+            "artifact" => {
+                let release = JsFuture::from(self.mutex.acquire()).await.map_err(to_err)?;
+                let res = self.artifact_critical(&msg).await;
+                let _ = js_sys::Function::from(release).call0(&JsValue::NULL);
+                res
+            }
             "reset" => {
                 let release = JsFuture::from(self.mutex.acquire()).await.map_err(to_err)?;
                 let res = self.reset_critical().await;
@@ -714,8 +759,13 @@ impl KernelDO {
                 // OPLOG-REPLAY path (the byte-blit image is "from a different engine"). Proves the
                 // engine-migration journal replay works without a real redeploy.
                 let taken = self.glue.borrow_mut().take();
-                if let Some(g) = taken { g.drop_kernel(); }
-                self.store().exec_ignore("UPDATE snap_manifest SET engine_hash='STALE-ENGINE-HASH' WHERE id=1;", None);
+                if let Some(g) = taken {
+                    g.drop_kernel();
+                }
+                self.store().exec_ignore(
+                    "UPDATE snap_manifest SET engine_hash='STALE-ENGINE-HASH' WHERE id=1;",
+                    None,
+                );
                 Ok(json!({"ok": true, "t": "_forceEngineMismatch", "generation": self.generation}))
             }
             "health" => Ok(json!({"ok": true, "t": "health", "generation": self.generation})),
@@ -776,7 +826,8 @@ impl KernelDO {
                     let s = frame.as_string().unwrap_or_default();
                     let ok = ws_for_send.send_with_str(&s).is_ok();
                     JsValue::from_bool(ok)
-                }) as Box<dyn FnMut(JsValue) -> JsValue>);
+                })
+                    as Box<dyn FnMut(JsValue) -> JsValue>);
                 glue.set_host_sender(sender.as_ref().unchecked_ref(), 60000.0);
                 // Leak the closure for the lifetime of this eval; it is replaced/cleared on
                 // the next eval. (One small closure per eval; bounded by serialized evals.)
@@ -804,10 +855,15 @@ impl KernelDO {
             let glue = clone_glue(self.glue.borrow().as_ref().unwrap());
             if fsv == "r2" {
                 let binding = cfg
-                    .get("fs").and_then(|f| f.get("binding")).and_then(|v| v.as_str())
-                    .unwrap_or("SNAPSHOTS").to_string();
+                    .get("fs")
+                    .and_then(|f| f.get("binding"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("SNAPSHOTS")
+                    .to_string();
                 let prefix = cfg
-                    .get("fs").and_then(|f| f.get("prefix")).and_then(|v| v.as_str())
+                    .get("fs")
+                    .and_then(|f| f.get("prefix"))
+                    .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| format!("fs/{}/", self.do_id));
                 let env = self.env.clone();
@@ -818,7 +874,8 @@ impl KernelDO {
                     wasm_bindgen_futures::future_to_promise(async move {
                         r2_fs_op(&env, &binding, &prefix, payload).await
                     })
-                }) as Box<dyn FnMut(JsValue) -> js_sys::Promise>);
+                })
+                    as Box<dyn FnMut(JsValue) -> js_sys::Promise>);
                 glue.set_fs_handler(handler.as_ref().unchecked_ref());
                 handler.forget();
             } else {
@@ -845,18 +902,41 @@ impl KernelDO {
             .map_err(to_err)?
             .as_string()
             .unwrap_or_else(|| "{\"ok\":true,\"value\":null}".to_string());
-        let parsed: serde_json::Value =
-            serde_json::from_str(&eval_json).unwrap_or_else(|_| json!({"ok": true, "value": eval_json}));
+        let mut parsed: serde_json::Value = match serde_json::from_str(&eval_json) {
+            Ok(v) => v,
+            Err(e) => json!({
+                "ok": false,
+                "valueType": "error",
+                "error": {
+                    "name": "ProtocolSizeError",
+                    "message": format!("eval result JSON was invalid or truncated ({} bytes): {e}", eval_json.len()),
+                },
+            }),
+        };
 
         // allocate the next cell inside the critical section, then checkpoint.
         let store = self.store();
         let cell = read_int(&store, "committedCell", -1) + 1;
         let epoch = read_int(&store, "epoch", 0);
+        if parsed.get("valueType").and_then(|v| v.as_str()) == Some("artifact") {
+            if let Some(obj) = parsed.get_mut("value").and_then(|v| v.as_object_mut()) {
+                obj.insert("handle".to_string(), json!(format!("cell:{cell}:text")));
+            }
+        }
         let ckpt = match self.checkpoint(cell, epoch, src).await {
             Ok(v) => v,
             Err(e) => json!({ "ok": false, "error": format!("{e}") }),
         };
         let ok = parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+        let is_artifact = parsed.get("valueType").and_then(|v| v.as_str()) == Some("artifact");
+        if ckpt.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let artifact_cell = if is_artifact {
+                cell.to_string()
+            } else {
+                "-1".to_string()
+            };
+            write_meta(&store, "lastTextArtifactCell", &artifact_cell);
+        }
 
         // V0.5: per-eval AE datapoint (op/restoreSource/store/sizeGz/usedHeap/cell/ok + valueType).
         let mut dp = Datapoint::new("eval");
@@ -865,11 +945,22 @@ impl KernelDO {
         dp.restore_source = info.source.clone();
         dp.read_ms = info.read_ms;
         dp.total_server_ms = info.total_server_ms;
-        dp.value_type = parsed.get("valueType").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        dp.value_type = parsed
+            .get("valueType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         dp.error_name = parsed
-            .get("error").and_then(|e| e.get("name")).and_then(|v| v.as_str())
-            .unwrap_or("").to_string();
-        dp.store = ckpt.get("store").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            .get("error")
+            .and_then(|e| e.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        dp.store = ckpt
+            .get("store")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         dp.size_raw = ckpt.get("sizeRaw").and_then(|v| v.as_i64()).unwrap_or(0);
         dp.size_gz = ckpt.get("sizeGz").and_then(|v| v.as_i64()).unwrap_or(0);
         dp.used_heap = ckpt.get("usedHeap").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -889,6 +980,64 @@ impl KernelDO {
             "restoreTimings": restore_timings_value(&info),
             "checkpoint": ckpt,
         }))
+    }
+
+    async fn artifact_critical(&self, msg: &serde_json::Value) -> Result<serde_json::Value> {
+        let handle = msg.get("handle").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(cell) = parse_text_artifact_handle(handle) else {
+            return Ok(json!({
+                "ok": false,
+                "t": "artifact",
+                "error": { "name": "ArtifactError", "message": "malformed artifact handle" },
+            }));
+        };
+
+        let committed = read_int(&self.store(), "committedCell", -1);
+        let artifact_cell = read_int(&self.store(), "lastTextArtifactCell", -1);
+        if cell != committed || cell != artifact_cell {
+            return Ok(json!({
+                "ok": false,
+                "t": "artifact",
+                "handle": handle,
+                "error": {
+                    "name": "ArtifactError",
+                    "message": format!("stale or unknown artifact handle for cell {cell}; committed cell is {committed}"),
+                },
+            }));
+        }
+
+        let offset = msg
+            .get("offset")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .max(0);
+        let len = msg
+            .get("len")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(TEXT_ARTIFACT_CHUNK_MAX_CHARS)
+            .clamp(0, TEXT_ARTIFACT_CHUNK_MAX_CHARS);
+
+        let _ = self.ensure_glue().await?;
+        let chunk_json = {
+            let glue = clone_glue(self.glue.borrow().as_ref().unwrap());
+            glue.result_artifact_chunk(offset as f64, len as f64)
+        };
+        let mut parsed: serde_json::Value = match serde_json::from_str(&chunk_json) {
+            Ok(v) => v,
+            Err(e) => json!({
+                "ok": false,
+                "t": "artifact",
+                "handle": handle,
+                "error": {
+                    "name": "ArtifactError",
+                    "message": format!("artifact chunk JSON was invalid or truncated ({} bytes): {e}", chunk_json.len()),
+                },
+            }),
+        };
+        if let Some(obj) = parsed.as_object_mut() {
+            obj.insert("handle".to_string(), json!(handle));
+        }
+        Ok(parsed)
     }
 
     async fn reset_critical(&self) -> Result<serde_json::Value> {
@@ -968,15 +1117,13 @@ impl KernelDO {
             // This is the data-loss fix: failure mode is "temporarily recovered via replay", NOT "gone".
             if is_r2 && gz.is_none() {
                 let journal = self.read_oplog();
-                let _ = JsFuture::from(glue.replay_journal(
-                    journal.as_ref(),
-                    &cfg_str,
-                    &m.kv_json,
-                ))
-                .await
-                .map_err(to_err)?;
+                let _ = JsFuture::from(glue.replay_journal(journal.as_ref(), &cfg_str, &m.kv_json))
+                    .await
+                    .map_err(to_err)?;
                 timings_json = glue.last_restore_timings();
-                r2_replay_reason.unwrap_or("r2-unavailable-replay").to_string()
+                r2_replay_reason
+                    .unwrap_or("r2-unavailable-replay")
+                    .to_string()
             }
             // E6 ENGINE-MIGRATION: if the committed snapshot was written by a DIFFERENT engine
             // build, the byte-blit image is invalid (different layout). Replay the oplog tail into
@@ -984,17 +1131,17 @@ impl KernelDO {
             // effects are fed back from the recorded oplog (no re-fire).
             else if !m.engine_hash.is_empty() && m.engine_hash != get_engine_hash() {
                 let journal = self.read_oplog();
-                let _ = JsFuture::from(glue.replay_journal(
-                    journal.as_ref(),
-                    &cfg_str,
-                    &m.kv_json,
-                ))
-                .await
-                .map_err(to_err)?;
+                let _ = JsFuture::from(glue.replay_journal(journal.as_ref(), &cfg_str, &m.kv_json))
+                    .await
+                    .map_err(to_err)?;
                 timings_json = glue.last_restore_timings();
                 "engine-migration-replay".to_string()
             } else {
-                let label = if is_r2 { "r2-restore" } else { "sqlite-restore" };
+                let label = if is_r2 {
+                    "r2-restore"
+                } else {
+                    "sqlite-restore"
+                };
                 let delta_list = self.read_delta_chain(m.delta_seq)?;
                 match JsFuture::from(glue.restore_w4(
                     gz.expect("gz image present on the non-replay restore path"),
@@ -1064,13 +1211,20 @@ impl KernelDO {
         };
 
         let glue = clone_glue(self.glue.borrow().as_ref().unwrap());
-        let dump = JsFuture::from(glue.dump_w4(force_full)).await.map_err(to_err)?;
+        let dump = JsFuture::from(glue.dump_w4(force_full))
+            .await
+            .map_err(to_err)?;
         let mode = str_field(&dump, "mode").unwrap_or_else(|| "full".to_string());
-        let gz: Uint8Array = Reflect::get(&dump, &JsValue::from_str("gz")).map_err(to_err)?.into();
+        let gz: Uint8Array = Reflect::get(&dump, &JsValue::from_str("gz"))
+            .map_err(to_err)?
+            .into();
         let size_raw = num_field(&dump, "sizeRaw").unwrap_or(0.0) as i64;
         let size_gz = num_field(&dump, "sizeGz").unwrap_or(0.0) as i64;
         let used_heap = num_field(&dump, "usedHeap").unwrap_or(0.0) as i64;
-        let scrubbed = Reflect::get(&dump, &JsValue::from_str("scrubbed")).ok().and_then(|v| v.as_bool()).unwrap_or(false);
+        let scrubbed = Reflect::get(&dump, &JsValue::from_str("scrubbed"))
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let clock_calls = num_field(&dump, "clockCalls").unwrap_or(0.0) as i64;
         let rng_calls = num_field(&dump, "rngCalls").unwrap_or(0.0) as i64;
         let grain = num_field(&dump, "grain").unwrap_or(256.0) as i64;
@@ -1091,7 +1245,10 @@ impl KernelDO {
         // cell would no-op). host_results is bounded by the engine HOSTCALL buffer, but clamp it too
         // as a belt-and-suspenders guard.
         let src: String = if src.len() > SQLITE_MAX_VALUE_BYTES {
-            format!("/* engram: cell source {}B omitted from oplog (exceeds SQLite value cap) */", src.len())
+            format!(
+                "/* engram: cell source {}B omitted from oplog (exceeds SQLite value cap) */",
+                src.len()
+            )
         } else {
             src.to_string()
         };
@@ -1107,7 +1264,9 @@ impl KernelDO {
         if is_delta {
             // ---- DELTA PATH: keep the base intact; append ONE delta row + bump delta_seq + oplog.
             let pm = prev.as_ref().unwrap();
-            let idx_arr: Uint8Array = Reflect::get(&dump, &JsValue::from_str("indicesGz")).map_err(to_err)?.into();
+            let idx_arr: Uint8Array = Reflect::get(&dump, &JsValue::from_str("indicesGz"))
+                .map_err(to_err)?
+                .into();
             let mut idx_bytes = vec![0u8; idx_arr.length() as usize];
             idx_arr.copy_to(&mut idx_bytes);
             let delta_seq_new = pm.delta_seq; // 0-based row seq == prior chain length
@@ -1122,11 +1281,23 @@ impl KernelDO {
             let txn = || -> Result<()> {
                 store.exec(
                     "INSERT INTO delta_chunks(seq, payload, indices, grain) VALUES (?,?,?,?);",
-                    Some(vec![delta_seq_new.into(), bytes.clone().into(), idx_bytes.clone().into(), grain.into()]),
+                    Some(vec![
+                        delta_seq_new.into(),
+                        bytes.clone().into(),
+                        idx_bytes.clone().into(),
+                        grain.into(),
+                    ]),
                 )?;
                 // append oplog tail row.
-                store.exec("INSERT INTO oplog(seq,cell,src,host_results) VALUES (?,?,?,?);",
-                    Some(vec![oplog_seq.into(), cell.into(), src.into(), host_results.clone().into()]))?;
+                store.exec(
+                    "INSERT INTO oplog(seq,cell,src,host_results) VALUES (?,?,?,?);",
+                    Some(vec![
+                        oplog_seq.into(),
+                        cell.into(),
+                        src.into(),
+                        host_results.clone().into(),
+                    ]),
+                )?;
                 store.exec("DELETE FROM snap_manifest;", None)?;
                 store.exec(
                     "INSERT INTO snap_manifest
@@ -1134,14 +1305,24 @@ impl KernelDO {
                          store,r2_key,created_ms,kv_json,used_heap,delta_seq,snap_mode,final_crc)
                      VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
                     Some(vec![
-                        cell.into(), epoch.into(), base_n_chunks.into(),
+                        cell.into(),
+                        epoch.into(),
+                        base_n_chunks.into(),
                         // size_raw is the FULL reconstructed image length of THIS delta tail (the
                         // glue's imageLen), NOT the base length — restoreW4's CRC is over size_raw.
-                        size_raw.into(), base_size_gz.into(), base_engine.clone().into(),
-                        clock_calls.into(), rng_calls.into(), base_store.clone().into(),
-                        base_r2_key.clone().into(), now_ms().into(), kv_json.clone().into(),
-                        used_heap.into(), (delta_seq_new + 1).into(),
-                        "delta".to_string().into(), image_crc.into(),
+                        size_raw.into(),
+                        base_size_gz.into(),
+                        base_engine.clone().into(),
+                        clock_calls.into(),
+                        rng_calls.into(),
+                        base_store.clone().into(),
+                        base_r2_key.clone().into(),
+                        now_ms().into(),
+                        kv_json.clone().into(),
+                        used_heap.into(),
+                        (delta_seq_new + 1).into(),
+                        "delta".to_string().into(),
+                        image_crc.into(),
                     ]),
                 )?;
                 store.exec("INSERT INTO meta(k,v) VALUES('committedCell',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v;",
@@ -1162,7 +1343,11 @@ impl KernelDO {
 
         // ---- FULL BASE PATH (W5-compacted base; resets the delta chain + oplog) ----
         let old_r2_key: Option<String> = prev.as_ref().and_then(|m| {
-            if m.store == "r2" && !m.r2_key.is_empty() { Some(m.r2_key.clone()) } else { None }
+            if m.store == "r2" && !m.r2_key.is_empty() {
+                Some(m.r2_key.clone())
+            } else {
+                None
+            }
         });
         let to_r2 = bytes.len() > SQLITE_HOT_MAX;
         let (store, new_r2_key) = if to_r2 {
@@ -1186,26 +1371,41 @@ impl KernelDO {
             } else {
                 let mut seq = 0i64;
                 for chunk in bytes.chunks(CHUNK_BYTES) {
-                    kstore.exec("INSERT INTO snap_chunks(seq,data) VALUES (?,?);",
-                        Some(vec![seq.into(), chunk.to_vec().into()]))?;
+                    kstore.exec(
+                        "INSERT INTO snap_chunks(seq,data) VALUES (?,?);",
+                        Some(vec![seq.into(), chunk.to_vec().into()]),
+                    )?;
                     seq += 1;
                 }
                 seq
             };
             // oplog: a full base is a fresh recovery point — seed the tail with THIS cell.
-            kstore.exec("INSERT INTO oplog(seq,cell,src,host_results) VALUES (0,?,?,?);",
-                Some(vec![cell.into(), src.into(), host_results.clone().into()]))?;
+            kstore.exec(
+                "INSERT INTO oplog(seq,cell,src,host_results) VALUES (0,?,?,?);",
+                Some(vec![cell.into(), src.into(), host_results.clone().into()]),
+            )?;
             kstore.exec(
                 "INSERT INTO snap_manifest
                     (id,cell,epoch,n_chunks,size_raw,size_gz,engine_hash,clock_calls,rng_calls,
                      store,r2_key,created_ms,kv_json,used_heap,delta_seq,snap_mode,final_crc)
                  VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
                 Some(vec![
-                    cell.into(), epoch.into(), n_chunks.into(),
-                    size_raw.into(), size_gz.into(), get_engine_hash().into(),
-                    clock_calls.into(), rng_calls.into(), store.clone().into(),
-                    r2_key_for_manifest.clone().into(), now_ms().into(), kv_json.clone().into(),
-                    used_heap.into(), 0i64.into(), "full".to_string().into(), image_crc.into(),
+                    cell.into(),
+                    epoch.into(),
+                    n_chunks.into(),
+                    size_raw.into(),
+                    size_gz.into(),
+                    get_engine_hash().into(),
+                    clock_calls.into(),
+                    rng_calls.into(),
+                    store.clone().into(),
+                    r2_key_for_manifest.clone().into(),
+                    now_ms().into(),
+                    kv_json.clone().into(),
+                    used_heap.into(),
+                    0i64.into(),
+                    "full".to_string().into(),
+                    image_crc.into(),
                 ]),
             )?;
             kstore.exec("INSERT INTO meta(k,v) VALUES('committedCell',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v;",
@@ -1289,7 +1489,10 @@ impl KernelDO {
         }
         let rows = self
             .store()
-            .query_raw("SELECT payload, indices, grain FROM delta_chunks ORDER BY seq ASC;", None)
+            .query_raw(
+                "SELECT payload, indices, grain FROM delta_chunks ORDER BY seq ASC;",
+                None,
+            )
             .map_err(|e| worker::Error::RustError(format!("read deltas: {e:?}")))?;
         let mut count = 0i64;
         for row in rows {
@@ -1313,7 +1516,12 @@ impl KernelDO {
             let obj = js_sys::Object::new();
             Reflect::set(&obj, &JsValue::from_str("gz"), &p_arr).ok();
             Reflect::set(&obj, &JsValue::from_str("indicesGz"), &i_arr).ok();
-            Reflect::set(&obj, &JsValue::from_str("grain"), &JsValue::from_f64(grain as f64)).ok();
+            Reflect::set(
+                &obj,
+                &JsValue::from_str("grain"),
+                &JsValue::from_f64(grain as f64),
+            )
+            .ok();
             out.push(&obj);
             count += 1;
         }
@@ -1330,10 +1538,16 @@ impl KernelDO {
     fn read_oplog(&self) -> js_sys::Array {
         let out = js_sys::Array::new();
         #[derive(serde::Deserialize)]
-        struct Row { src: String, host_results: String }
+        struct Row {
+            src: String,
+            host_results: String,
+        }
         let rows: Vec<Row> = self
             .store()
-            .query_typed("SELECT src, host_results FROM oplog ORDER BY seq ASC;", None)
+            .query_typed(
+                "SELECT src, host_results FROM oplog ORDER BY seq ASC;",
+                None,
+            )
             .unwrap_or_default();
         for r in rows {
             let obj = js_sys::Object::new();
@@ -1467,7 +1681,10 @@ fn read_int<S: KernelStore>(store: &S, k: &str, dflt: i64) -> i64 {
         v: String,
     }
     let rows: Vec<Row> = store
-        .query_typed("SELECT v FROM meta WHERE k=? LIMIT 1;", Some(vec![k.into()]))
+        .query_typed(
+            "SELECT v FROM meta WHERE k=? LIMIT 1;",
+            Some(vec![k.into()]),
+        )
         .unwrap_or_default();
     rows.first().and_then(|r| r.v.parse().ok()).unwrap_or(dflt)
 }
@@ -1478,9 +1695,18 @@ fn read_str<S: KernelStore>(store: &S, k: &str) -> Option<String> {
         v: String,
     }
     let rows: Vec<Row> = store
-        .query_typed("SELECT v FROM meta WHERE k=? LIMIT 1;", Some(vec![k.into()]))
+        .query_typed(
+            "SELECT v FROM meta WHERE k=? LIMIT 1;",
+            Some(vec![k.into()]),
+        )
         .unwrap_or_default();
     rows.into_iter().next().map(|r| r.v)
+}
+
+fn parse_text_artifact_handle(handle: &str) -> Option<i64> {
+    let rest = handle.strip_prefix("cell:")?;
+    let cell = rest.strip_suffix(":text")?;
+    cell.parse().ok()
 }
 
 fn write_meta<S: KernelStore>(store: &S, k: &str, v: &str) {
@@ -1602,8 +1828,13 @@ async fn r2_fs_op(
     match op.as_str() {
         "read" => match bucket.get(&key).execute().await {
             Ok(Some(obj)) => {
-                let body = obj.body().ok_or_else(|| JsValue::from_str("FsError: empty body"))?;
-                let bytes = body.bytes().await.map_err(|e| JsValue::from_str(&format!("{e}")))?;
+                let body = obj
+                    .body()
+                    .ok_or_else(|| JsValue::from_str("FsError: empty body"))?;
+                let bytes = body
+                    .bytes()
+                    .await
+                    .map_err(|e| JsValue::from_str(&format!("{e}")))?;
                 let arr = Uint8Array::new_with_length(bytes.len() as u32);
                 arr.copy_from(&bytes);
                 set("ok", &JsValue::TRUE);
@@ -1657,15 +1888,22 @@ async fn r2_fs_op(
             set("ok", &JsValue::TRUE);
             set("names", &names.into());
         }
-        other => set("error", &JsValue::from_str(&format!("FsError: unknown op '{}'", other))),
+        other => set(
+            "error",
+            &JsValue::from_str(&format!("FsError: unknown op '{}'", other)),
+        ),
     }
     Ok(out.into())
 }
 
 fn num_field(obj: &JsValue, k: &str) -> Option<f64> {
-    Reflect::get(obj, &JsValue::from_str(k)).ok().and_then(|v| v.as_f64())
+    Reflect::get(obj, &JsValue::from_str(k))
+        .ok()
+        .and_then(|v| v.as_f64())
 }
 
 fn str_field(obj: &JsValue, k: &str) -> Option<String> {
-    Reflect::get(obj, &JsValue::from_str(k)).ok().and_then(|v| v.as_string())
+    Reflect::get(obj, &JsValue::from_str(k))
+        .ok()
+        .and_then(|v| v.as_string())
 }

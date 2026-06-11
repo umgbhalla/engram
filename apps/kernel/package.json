@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build:engine": "node scripts/build-engine.mjs && node scripts/engine-hash.mjs",
+    "build:engine": "node scripts/build-engine.ts && node scripts/engine-hash.ts",
     "build:worker": "bun x tsc -p tsconfig.json && node scripts/build-ts.ts && node scripts/build-engine.ts && node scripts/engine-hash.ts && worker-build --release",
     "deploy": "wrangler deploy",
     "deploy:alchemy": "npm run build:worker && alchemy deploy",
@@ -16,7 +16,6 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^4",
     "alchemy": "^0.93.9",
-    "ts-blank-space": "^0.9.0",
     "ws": "^8.21.0"
   }
 }
