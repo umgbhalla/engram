@@ -16,7 +16,7 @@ import path from "node:path";
 import readline from "node:readline";
 import WebSocket from "ws";
 import { connect, type EngramSession, type EngramConfig, type EvalResult } from "@engram/sdk";
-import { runRepl, isComplete } from "./repl";
+import { runRepl, isComplete, printEvalResult } from "./repl";
 
 const DEFAULT_ENDPOINT =
   process.env.ENGRAM_ENDPOINT || "wss://engram.umgbhalla.xyz";
@@ -97,15 +97,6 @@ function stableTtyId(): string {
   return `repl-${h}`;
 }
 
-function printEval(r: EvalResult): void {
-  for (const l of r.console || []) console.log(`  [${l.level}] ${l.text}`);
-  if (!r.ok) {
-    console.log(`  ERROR ${r.error?.name}: ${r.error?.message}`);
-  } else {
-    console.log(`  => ${r.valuePreview !== undefined ? r.valuePreview : JSON.stringify(r.value)}`);
-  }
-}
-
 async function cmdRepl(args: Args): Promise<void> {
   const endpoint = str(args.endpoint) || DEFAULT_ENDPOINT;
   const id = str(args.session) || stableTtyId();
@@ -141,7 +132,7 @@ async function cmdRepl(args: Args): Promise<void> {
 
   // non-interactive: --exec runs one cell and exits (smoke-friendly).
   if (args.exec) {
-    printEval(await session.eval(String(args.exec)));
+    await printEvalResult(await session.eval(String(args.exec)), session, id);
     session.close();
     return;
   }
@@ -154,13 +145,13 @@ async function cmdRepl(args: Args): Promise<void> {
       const candidate = buf ? buf + "\n" + line : line;
       if (candidate.trim() === "") continue;
       if (isComplete(candidate)) {
-        printEval(await session.eval(candidate));
+        await printEvalResult(await session.eval(candidate), session, id);
         buf = "";
       } else {
         buf = candidate;
       }
     }
-    if (buf.trim()) printEval(await session.eval(buf));
+    if (buf.trim()) await printEvalResult(await session.eval(buf), session, id);
     session.close();
     return;
   }

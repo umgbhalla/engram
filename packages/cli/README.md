@@ -39,6 +39,30 @@ printf 'host.ctx.len("context")\nhost.ctx.grep("TODO",{max:5}).length\n' \
   | engram repl --session ctx --context-file ./big.txt
 ```
 
+Rich MIME outputs are saved locally by the terminal client. By default files go to
+`./engram-artifacts`; set `ENGRAM_MIME_DIR=/path/to/dir` to choose another directory.
+Set `ENGRAM_INLINE_IMAGES=1` in iTerm2 to also emit iTerm inline-image escape sequences.
+
+Real image download example:
+
+```sh
+engram repl --session image-demo --exec '
+const res = await fetch("https://placehold.co/120x60/png?text=Engram");
+if (!res.ok) throw new Error(`fetch failed: ${res.status}`);
+const mime = (res.headers.get("content-type") || "image/png").split(";")[0];
+const bytes = new Uint8Array(await res.arrayBuffer());
+if (bytes.length === 0) throw new Error("downloaded image was empty");
+displayImage(Buffer.from(bytes).toString("base64"), mime, { alt: "downloaded image" });
+`downloaded ${bytes.length} bytes as ${mime}`;
+'
+```
+
+The CLI prints a line like:
+
+```text
+[image/png] saved 1100 bytes -> ./engram-artifacts/image-demo-cell0-out0.png
+```
+
 ### `engram rlm <query> --context <file>`
 
 End-to-end canonical depth-1 RLM loop: binds the context as a host-side handle, drives the root

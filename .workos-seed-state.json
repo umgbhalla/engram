@@ -1,0 +1,43 @@
+{
+  "permissions": [
+    {
+      "slug": "kernel:eval"
+    },
+    {
+      "slug": "kernel:read"
+    },
+    {
+      "slug": "kernel:reset"
+    },
+    {
+      "slug": "session:list"
+    },
+    {
+      "slug": "session:share"
+    },
+    {
+      "slug": "usage:read"
+    },
+    {
+      "slug": "account:admin"
+    }
+  ],
+  "roles": [
+    {
+      "slug": "engram-admin"
+    },
+    {
+      "slug": "engram-developer"
+    },
+    {
+      "slug": "engram-viewer"
+    }
+  ],
+  "organizations": [
+    {
+      "id": "org_01KTTNFWQ30N2KK16F80SJ49XZ",
+      "name": "Engram Sandbox"
+    }
+  ],
+  "createdAt": "2026-06-11T06:21:33.822Z"
+}

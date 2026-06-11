@@ -23,6 +23,7 @@ dist/
 snapshots/
 *.snap.bin
 scratch/
+engram-artifacts/
 
 # claude harness
 .claude/

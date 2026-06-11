@@ -19,7 +19,9 @@ mod store;
 use js_sys::{Reflect, Uint8Array};
 use serde_json::json;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::future::Future;
+use std::rc::Rc;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -198,6 +200,27 @@ const SQLITE_MAX_VALUE_BYTES: usize = 1_500_000;
 const TEXT_ARTIFACT_CHUNK_MAX_CHARS: i64 = 128 * 1024;
 
 #[durable_object]
+/// A single staged host.fs mutation for the in-flight cell. Staged ops are buffered in DO memory
+/// (never durable) until the cell's checkpoint flushes them to R2 + the committed `fs_files` meta
+/// table IN THE SAME COMMIT as the heap dump — honoring the SANDBOX-API staged-commit coherence
+/// invariant (a cold restore can never see a file written by a cell whose checkpoint did not commit,
+/// nor a heap that references a file not yet durable). A crash before checkpoint drops the staged
+/// set with the rolled-back heap (both revert together). `Write` carries the bytes; `Delete` is a
+/// tombstone. The per-cell ordering is preserved (last write to a path wins at flush).
+enum FsStageOp {
+    Write(Vec<u8>),
+    Delete,
+}
+
+struct FsStage {
+    path: String,
+    op: FsStageOp,
+}
+
+/// Shared per-DO staging buffer for the R2 fs provider. `Rc<RefCell<..>>` so the per-eval fs handler
+/// closure (which is `forget()`-leaked) and the `checkpoint`/`handle_eval` methods share ONE buffer.
+type StagedFs = Rc<RefCell<Vec<FsStage>>>;
+
 pub struct KernelDO {
     state: State,
     env: Env,
@@ -208,6 +231,10 @@ pub struct KernelDO {
     // AUTH (resolved once from env; NEVER snapshotted). keys = comma-split ENGRAM_KERNEL_KEY.
     auth_keys: Vec<String>,
     auth_enforce: bool,
+    // host.fs (config.fs.provider=="r2") staged mutations for the in-flight cell; flushed at
+    // checkpoint, dropped on crash. In-memory only — NEVER snapshotted (the durable authority is
+    // R2 + the `fs_files` SQLite table).
+    staged_fs: StagedFs,
 }
 
 /// Semantic snapshot layout epoch (bump on quickjs-ng/rustc/feature/static-layout change). Recorded
@@ -291,6 +318,17 @@ impl DurableObject for KernelDO {
                 None,
             )
             .expect("create oplog");
+        // host.fs (config.fs.provider=="r2") committed path namespace. The AUTHORITY for which
+        // paths exist under THIS session: `r2_key` is the content body key in the bound bucket
+        // (always prefixed `fs/<doId>/` — see r2_fs_op key derivation, NOT user-overridable). A row
+        // here is committed ATOMICALLY with the heap manifest at checkpoint, so a cold restore sees
+        // the file namespace at the exact same version as the heap (staged-commit coherence).
+        store
+            .exec(
+                "CREATE TABLE IF NOT EXISTS fs_files (path TEXT PRIMARY KEY, r2_key TEXT, size INTEGER, cell INTEGER, created_ms INTEGER);",
+                None,
+            )
+            .expect("create fs_files");
 
         let cur = read_int(&store, "generation", 0);
         let generation = cur + 1;
@@ -331,6 +369,7 @@ impl DurableObject for KernelDO {
             mutex: new_mutex(),
             auth_keys,
             auth_enforce,
+            staged_fs: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -895,8 +934,13 @@ impl KernelDO {
         // FS PROVIDER: when config.fs.provider == "r2", install a DO-side handler for the
         // engine's `host.__fs` effect. R2 is a DO binding (env), NOT a glue global, so it must
         // be serviced here (unlike host.fetch). The handler is an async JS closure returning a
-        // Promise; the glue awaits it from the eval pump. Keyed under <prefix><path> in the
-        // configured bucket binding. provider == vfs (default) clears the handler (in-heap fs).
+        // Promise; the glue awaits it from the eval pump. provider == vfs (default) clears the
+        // handler (in-heap fs). COHERENCE: writes/deletes are STAGED in DO memory (self.staged_fs)
+        // and flushed to R2 + the committed `fs_files` table only at checkpoint, in the SAME commit
+        // as the heap dump (SANDBOX-API staged-commit invariant). Reads within a cell see the
+        // committed namespace (captured below) OVERLAID with this cell's staged ops.
+        // ISOLATION: the R2 key prefix is ALWAYS `fs/<doId>/` — derived from the DO id, NEVER from
+        // user config — so a session can never address another session's fs namespace.
         {
             let cfg: serde_json::Value = serde_json::from_str(
                 &read_str(&self.store(), "config").unwrap_or_else(|| "{}".into()),
@@ -909,25 +953,31 @@ impl KernelDO {
                 .unwrap_or("vfs");
             let glue = clone_glue(self.glue.borrow().as_ref().unwrap());
             if fsv == "r2" {
+                // Bucket binding is user-selectable (which R2 bucket), but the KEY PREFIX is not.
                 let binding = cfg
                     .get("fs")
                     .and_then(|f| f.get("binding"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("SNAPSHOTS")
                     .to_string();
-                let prefix = cfg
-                    .get("fs")
-                    .and_then(|f| f.get("prefix"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("fs/{}/", self.do_id));
+                // Per-session prefix is hard-bound to the DO id (isolation invariant); any user
+                // `config.fs.prefix` is intentionally IGNORED.
+                let prefix = format!("fs/{}/", self.do_id);
+                // Snapshot the committed path namespace so in-cell reads/list/stat see prior cells'
+                // files overlaid with this cell's staged ops. Cheap (paths + sizes, no bodies).
+                let committed = self.read_fs_committed();
                 let env = self.env.clone();
+                let staged = self.staged_fs.clone();
+                // Fresh cell => discard any leftover staged ops from a prior (failed/rolled-back) cell.
+                staged.borrow_mut().clear();
                 let handler = Closure::wrap(Box::new(move |payload: JsValue| -> js_sys::Promise {
                     let env = env.clone();
                     let binding = binding.clone();
                     let prefix = prefix.clone();
+                    let staged = staged.clone();
+                    let committed = committed.clone();
                     wasm_bindgen_futures::future_to_promise(async move {
-                        r2_fs_op(&env, &binding, &prefix, payload).await
+                        r2_fs_op(&env, &binding, &prefix, &staged, &committed, payload).await
                     })
                 })
                     as Box<dyn FnMut(JsValue) -> js_sys::Promise>);

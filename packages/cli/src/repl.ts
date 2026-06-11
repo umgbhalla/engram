@@ -328,6 +328,232 @@ function formatResult(
   return String(preview);
 }
 
+interface MimeRenderOptions {
+  includeExecuteResult?: boolean;
+}
+
+interface ArtifactValue {
+  kind: "artifact";
+  handle: string;
+  mime?: string;
+  chars?: number;
+  bytes?: number;
+  encoding?: string;
+  chunkMaxChars?: number;
+}
+
+type MimeBundle = Record<string, unknown | ArtifactValue>;
+
+interface MimeOutput {
+  output_type: string;
+  data?: MimeBundle;
+  metadata?: Record<string, unknown>;
+  transient?: Record<string, unknown>;
+  execution_count?: number | null;
+  name?: string;
+  text?: string;
+  wait?: boolean;
+}
+
+type RichEvalResult = EvalResult & {
+  outputs?: MimeOutput[];
+  mimeBundle?: MimeBundle;
+};
+
+type ArtifactSession = EngramSession & {
+  readArtifact?: (artifact: ArtifactValue | string, opts?: { timeoutMs?: number; chunkChars?: number }) => Promise<string>;
+};
+
+const SAVEABLE_TEXT_MIME: Record<string, string> = {
+  "image/svg+xml": "svg",
+  "text/html": "html",
+};
+
+const SAVEABLE_BASE64_MIME: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/jpg": "jpg",
+  "image/gif": "gif",
+  "image/webp": "webp",
+  "application/pdf": "pdf",
+};
+
+const INLINE_TEXT_MIME = ["text/markdown", "text/plain", "application/json"];
+
+function artifactDir(): string {
+  return process.env.ENGRAM_MIME_DIR || process.env.ENGRAM_ARTIFACT_DIR || path.join(process.cwd(), "engram-artifacts");
+}
+
+function safeSegment(s: string): string {
+  return s.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "session";
+}
+
+function isArtifactValue(value: unknown): value is ArtifactValue {
+  return !!value && typeof value === "object" && (value as ArtifactValue).kind === "artifact" && typeof (value as ArtifactValue).handle === "string";
+}
+
+function bestMime(bundle: MimeBundle): string | undefined {
+  for (const mime of [...Object.keys(SAVEABLE_BASE64_MIME), ...Object.keys(SAVEABLE_TEXT_MIME), ...INLINE_TEXT_MIME]) {
+    if (bundle[mime] !== undefined) return mime;
+  }
+  return Object.keys(bundle)[0];
+}
+
+async function mimePayload(session: EngramSession, value: unknown): Promise<unknown> {
+  if (isArtifactValue(value)) {
+    const reader = (session as ArtifactSession).readArtifact;
+    if (!reader) throw new Error("this @engram/sdk build does not support artifact reads; rebuild/update the SDK package");
+    return reader.call(session, value);
+  }
+  return value;
+}
+
+function bufferFromBase64(s: string): Buffer {
+  const clean = s.replace(/^data:[^,]+,/, "").replace(/\s+/g, "");
+  return Buffer.from(clean, "base64");
+}
+
+async function saveMimePayload(
+  session: EngramSession,
+  sessionId: string,
+  cell: number | undefined,
+  outputIndex: number,
+  mime: string,
+  value: unknown,
+): Promise<{ file: string; bytes: number }> {
+  const ext = SAVEABLE_BASE64_MIME[mime] || SAVEABLE_TEXT_MIME[mime] || "bin";
+  const dir = artifactDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `${safeSegment(sessionId)}-cell${cell ?? "x"}-out${outputIndex}.${ext}`);
+  const payload = await mimePayload(session, value);
+  if (typeof payload !== "string") {
+    const text = JSON.stringify(payload, null, 2);
+    fs.writeFileSync(file, text);
+    return { file, bytes: Buffer.byteLength(text) };
+  }
+  if (SAVEABLE_BASE64_MIME[mime]) {
+    const buf = bufferFromBase64(payload);
+    if (buf.byteLength === 0) throw new Error(`empty ${mime} payload; refusing to save ${file}`);
+    fs.writeFileSync(file, buf);
+    return { file, bytes: buf.byteLength };
+  }
+  fs.writeFileSync(file, payload, "utf8");
+  return { file, bytes: Buffer.byteLength(payload) };
+}
+
+function shortText(s: string, max = 4000): string {
+  if (s.length <= max) return s;
+  return s.slice(0, max) + `\n... ${s.length - max} more chars`;
+}
+
+async function renderInlineMime(
+  session: EngramSession,
+  bundle: MimeBundle,
+  c: ReturnType<typeof makeColors>,
+): Promise<string | undefined> {
+  if (bundle["application/json"] !== undefined) {
+    const value = await mimePayload(session, bundle["application/json"]);
+    return typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  }
+  for (const mime of ["text/markdown", "text/plain"]) {
+    if (bundle[mime] === undefined) continue;
+    const value = await mimePayload(session, bundle[mime]);
+    return typeof value === "string" ? shortText(value) : shortText(JSON.stringify(value, null, 2));
+  }
+  const mime = bestMime(bundle);
+  if (!mime) return undefined;
+  return c.dim(`[${mime}]`);
+}
+
+async function renderMimeOutputs(
+  r: RichEvalResult,
+  session: EngramSession,
+  sessionId: string,
+  c: ReturnType<typeof makeColors>,
+  options: MimeRenderOptions = {},
+): Promise<string[]> {
+  const lines: string[] = [];
+  let outputIndex = 0;
+  for (const output of r.outputs || []) {
+    if (output.output_type === "clear_output") {
+      lines.length = 0;
+      continue;
+    }
+    if (output.output_type === "stream") {
+      if (output.text) lines.push(String(output.text));
+      continue;
+    }
+    if (output.output_type === "error") {
+      if (output.text) lines.push(c.red(String(output.text)));
+      continue;
+    }
+    if (output.output_type === "execute_result" && !options.includeExecuteResult) continue;
+    if (!output.data) continue;
+    const rendered = await renderMimeBundle(output, output.data, r, session, sessionId, c, outputIndex);
+    outputIndex++;
+    if (rendered.length) lines.push(...rendered);
+  }
+  return lines;
+}
+
+async function renderMimeBundle(
+  output: MimeOutput,
+  bundle: MimeBundle,
+  r: RichEvalResult,
+  session: EngramSession,
+  sessionId: string,
+  c: ReturnType<typeof makeColors>,
+  outputIndex: number,
+): Promise<string[]> {
+  const lines: string[] = [];
+  for (const mime of Object.keys(SAVEABLE_BASE64_MIME)) {
+    if (bundle[mime] === undefined) continue;
+    try {
+      const saved = await saveMimePayload(session, sessionId, r.cell, outputIndex, mime, bundle[mime]);
+      lines.push(c.cyan(`[${mime}]`) + c.dim(` saved ${saved.bytes} bytes -> ${saved.file}`));
+      maybeEmitInlineImage(mime, saved.file);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      lines.push(c.red(`[${mime}] save failed: ${msg}`));
+    }
+    return lines;
+  }
+  for (const mime of Object.keys(SAVEABLE_TEXT_MIME)) {
+    if (bundle[mime] === undefined) continue;
+    try {
+      const saved = await saveMimePayload(session, sessionId, r.cell, outputIndex, mime, bundle[mime]);
+      lines.push(c.cyan(`[${mime}]`) + c.dim(` saved ${saved.bytes} bytes -> ${saved.file}`));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      lines.push(c.red(`[${mime}] save failed: ${msg}`));
+    }
+    if (bundle["text/plain"] !== undefined) {
+      const fallback = await renderInlineMime(session, { "text/plain": bundle["text/plain"] }, c);
+      if (fallback) lines.push(fallback);
+    }
+    return lines;
+  }
+  const inline = await renderInlineMime(session, bundle, c);
+  if (inline !== undefined) {
+    const prefix = output.output_type === "display_data" ? c.dim("[display] ") : "";
+    lines.push(prefix + inline);
+  }
+  return lines;
+}
+
+function maybeEmitInlineImage(mime: string, file: string): void {
+  if (process.env.ENGRAM_INLINE_IMAGES !== "1") return;
+  if (process.env.TERM_PROGRAM !== "iTerm.app") return;
+  if (!mime.startsWith("image/")) return;
+  try {
+    const data = fs.readFileSync(file).toString("base64");
+    const name = Buffer.from(path.basename(file)).toString("base64");
+    process.stdout.write(`\x1b]1337;File=name=${name};inline=1:${data}\x07\n`);
+  } catch {
+    /* best-effort */
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Spinner (slow-cell feedback, TTY only)
 // ---------------------------------------------------------------------------
@@ -381,6 +607,21 @@ export interface ReplDeps {
   sessionId: string;
   config: EngramConfig;
   WebSocketImpl: unknown;
+}
+
+export async function printEvalResult(r: EvalResult, session: EngramSession, sessionId: string): Promise<void> {
+  const useColor = !!process.stdout.isTTY && !process.env.NO_COLOR;
+  const c = makeColors(useColor);
+  for (const l of r.console || []) console.log(`  [${l.level}] ${l.text}`);
+  const richLines = await renderMimeOutputs(r, session, sessionId, c);
+  for (const line of richLines) console.log(`  ${line}`);
+  if (!r.ok) {
+    console.log(`  ERROR ${r.error?.name}: ${r.error?.message}`);
+  } else if (richLines.length && r.valueType === "undefined") {
+    return;
+  } else {
+    console.log(`  => ${r.valuePreview !== undefined ? r.valuePreview : JSON.stringify(r.value)}`);
+  }
 }
 
 export async function runRepl(deps: ReplDeps): Promise<void> {
@@ -494,7 +735,9 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
       const prefix = c.dim(`${l.level}: `);
       console.log(prefix + l.text);
     }
-    const formatted = formatResult(r, c);
+    const richLines = await renderMimeOutputs(r, session, sessionId, c);
+    for (const line of richLines) console.log(line);
+    const formatted = richLines.length && r.valueType === "undefined" ? undefined : formatResult(r, c);
     printValueAndLatency(formatted, ms);
   };
 

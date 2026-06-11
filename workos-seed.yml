@@ -1,0 +1,71 @@
+# Engram WorkOS seed file.
+# Apply with: npx workos@latest seed --file workos-seed.yml
+# This provisions the shared-cloud auth model: WorkOS org == Engram account/tenant.
+
+permissions:
+  - name: Kernel Eval
+    slug: kernel:eval
+    description: Run cells against Engram kernels
+  - name: Kernel Read
+    slug: kernel:read
+    description: Read kernel/session status and outputs
+  - name: Kernel Reset
+    slug: kernel:reset
+    description: Reset or evict owned kernel sessions
+  - name: Session List
+    slug: session:list
+    description: List sessions visible to the account
+  - name: Session Share
+    slug: session:share
+    description: Create or manage account-shared sessions
+  - name: Usage Read
+    slug: usage:read
+    description: Read account usage and metering
+  - name: Account Admin
+    slug: account:admin
+    description: Manage account members, roles, and automation credentials
+
+roles:
+  - name: Engram Admin
+    slug: engram-admin
+    description: Full account access for Engram Cloud
+    permissions:
+      - kernel:eval
+      - kernel:read
+      - kernel:reset
+      - session:list
+      - session:share
+      - usage:read
+      - account:admin
+  - name: Engram Developer
+    slug: engram-developer
+    description: Day-to-day kernel/session access
+    permissions:
+      - kernel:eval
+      - kernel:read
+      - kernel:reset
+      - session:list
+      - session:share
+  - name: Engram Viewer
+    slug: engram-viewer
+    description: Read-only account access
+    permissions:
+      - kernel:read
+      - session:list
+      - usage:read
+
+organizations:
+  - name: Engram Sandbox
+
+config:
+  redirect_uris:
+    - http://localhost:3000/auth/callback
+    - http://localhost:5173/auth/callback
+    - https://engram-ui.umg-bhalla88.workers.dev/auth/callback
+    - https://engram-cloud.umg-bhalla88.workers.dev/auth/callback
+  cors_origins:
+    - http://localhost:3000
+    - http://localhost:5173
+    - https://engram-ui.umg-bhalla88.workers.dev
+    - https://engram-cloud.umg-bhalla88.workers.dev
+  homepage_url: https://engram-ui.umg-bhalla88.workers.dev
