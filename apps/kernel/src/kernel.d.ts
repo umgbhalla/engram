@@ -36,6 +36,7 @@ declare global {
   // globals stamped by entry.ts onto globalThis for the glue + engine to read.
   // eslint-disable-next-line no-var
   var __ENGINE_MODULE: WebAssembly.Module | undefined;
+  var __ZSTD_MODULE: WebAssembly.Module | undefined; // issue #9 snapshot codec (CompiledWasm)
   // eslint-disable-next-line no-var
   var __ENGINE_HASH: string | undefined;
   // eslint-disable-next-line no-var

@@ -52,6 +52,7 @@ extern "C" {
         label: &str,
         kv_json: &str,
         used_heap: f64,
+        base_codec: &str,
     ) -> js_sys::Promise;
     #[wasm_bindgen(method, js_name = restoreW4)]
     fn restore_w4(
@@ -67,6 +68,7 @@ extern "C" {
         used_heap: f64,
         expect_crc: f64,
         expect_len: f64,
+        base_codec: &str,
     ) -> js_sys::Promise;
     #[wasm_bindgen(method, js_name = lastRestoreTimings)]
     fn last_restore_timings(this: &GlueKernel) -> String;
@@ -266,6 +268,9 @@ impl DurableObject for KernelDO {
             "ALTER TABLE snap_manifest ADD COLUMN final_crc INTEGER;",
             None,
         );
+        // Issue #9: codec for the BASE image blob ("gzip" | "zstd"). NULL/absent => "gzip" so any
+        // snapshot written before this deploy still restores. New full bases write "zstd".
+        store.exec_ignore("ALTER TABLE snap_manifest ADD COLUMN snap_codec TEXT;", None);
         write_meta(&store, "snapFormat", SNAPSHOT_FORMAT_VERSION);
         store
             .exec(
@@ -275,6 +280,9 @@ impl DurableObject for KernelDO {
                 None,
             )
             .expect("create delta_chunks");
+        // Issue #9: per-delta codec ("gzip" | "zstd"). NULL/absent => "gzip". A chain can straddle a
+        // deploy boundary, so each delta row records its OWN codec and restore decodes per-chunk.
+        store.exec_ignore("ALTER TABLE delta_chunks ADD COLUMN codec TEXT;", None);
         // E6 oplog: per-cell {src, hostResults} appended for the crash tail + engine-migration
         // replay. Bounded to the cells since the last full base (cleared on base reset).
         store
@@ -1220,6 +1228,7 @@ impl KernelDO {
                     m.used_heap as f64,
                     m.final_crc as f64,
                     m.size_raw as f64,
+                    &m.snap_codec,
                 ))
                 .await
                 {
@@ -1295,6 +1304,7 @@ impl KernelDO {
         let grain = num_field(&dump, "grain").unwrap_or(256.0) as i64;
         let n_changed = num_field(&dump, "nChanged").unwrap_or(0.0) as i64;
         let image_crc = num_field(&dump, "imageCrc").unwrap_or(0.0) as i64;
+        let snap_codec = str_field(&dump, "snapCodec").unwrap_or_else(|| "gzip".to_string());
         let kv_json = str_field(&dump, "kvJson").unwrap_or_else(|| "{}".to_string());
 
         let mut bytes = vec![0u8; gz.length() as usize];
@@ -1341,16 +1351,18 @@ impl KernelDO {
             let base_n_chunks = pm.n_chunks;
             let _base_size_raw = pm.size_raw; // superseded: delta tail stores its own reconstructed size_raw
             let base_size_gz = pm.size_gz;
+            let base_codec = pm.snap_codec.clone(); // base blob's codec is unchanged by a delta append
             let oplog_seq = delta_seq_new + 1;
             let store = self.store();
             let txn = || -> Result<()> {
                 store.exec(
-                    "INSERT INTO delta_chunks(seq, payload, indices, grain) VALUES (?,?,?,?);",
+                    "INSERT INTO delta_chunks(seq, payload, indices, grain, codec) VALUES (?,?,?,?,?);",
                     Some(vec![
                         delta_seq_new.into(),
                         bytes.clone().into(),
                         idx_bytes.clone().into(),
                         grain.into(),
+                        snap_codec.clone().into(),
                     ]),
                 )?;
                 // append oplog tail row.
@@ -1367,8 +1379,8 @@ impl KernelDO {
                 store.exec(
                     "INSERT INTO snap_manifest
                         (id,cell,epoch,n_chunks,size_raw,size_gz,engine_hash,clock_calls,rng_calls,
-                         store,r2_key,created_ms,kv_json,used_heap,delta_seq,snap_mode,final_crc)
-                     VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
+                         store,r2_key,created_ms,kv_json,used_heap,delta_seq,snap_mode,final_crc,snap_codec)
+                     VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
                     Some(vec![
                         cell.into(),
                         epoch.into(),
@@ -1388,6 +1400,7 @@ impl KernelDO {
                         (delta_seq_new + 1).into(),
                         "delta".to_string().into(),
                         image_crc.into(),
+                        base_codec.clone().into(),
                     ]),
                 )?;
                 store.exec("INSERT INTO meta(k,v) VALUES('committedCell',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v;",
@@ -1452,8 +1465,8 @@ impl KernelDO {
             kstore.exec(
                 "INSERT INTO snap_manifest
                     (id,cell,epoch,n_chunks,size_raw,size_gz,engine_hash,clock_calls,rng_calls,
-                     store,r2_key,created_ms,kv_json,used_heap,delta_seq,snap_mode,final_crc)
-                 VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
+                     store,r2_key,created_ms,kv_json,used_heap,delta_seq,snap_mode,final_crc,snap_codec)
+                 VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
                 Some(vec![
                     cell.into(),
                     epoch.into(),
@@ -1471,6 +1484,7 @@ impl KernelDO {
                     0i64.into(),
                     "full".to_string().into(),
                     image_crc.into(),
+                    snap_codec.clone().into(),
                 ]),
             )?;
             kstore.exec("INSERT INTO meta(k,v) VALUES('committedCell',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v;",
@@ -1520,10 +1534,12 @@ impl KernelDO {
             size_gz: Option<i64>,
             #[serde(default)]
             final_crc: Option<i64>,
+            #[serde(default)]
+            snap_codec: Option<String>,
         }
         let rows: Vec<Row> = store
             .query_typed(
-                "SELECT cell,epoch,n_chunks,engine_hash,clock_calls,rng_calls,store,r2_key,kv_json,used_heap,delta_seq,size_raw,size_gz,final_crc
+                "SELECT cell,epoch,n_chunks,engine_hash,clock_calls,rng_calls,store,r2_key,kv_json,used_heap,delta_seq,size_raw,size_gz,final_crc,snap_codec
                  FROM snap_manifest WHERE id=1 LIMIT 1;",
                 None,
             )
@@ -1543,6 +1559,8 @@ impl KernelDO {
             size_raw: r.size_raw.unwrap_or(0),
             size_gz: r.size_gz.unwrap_or(0),
             final_crc: r.final_crc.unwrap_or(0),
+            // back-compat: NULL/absent => "gzip" (pre-issue-#9 bases were gzip).
+            snap_codec: r.snap_codec.filter(|c| !c.is_empty()).unwrap_or_else(|| "gzip".into()),
         })
     }
 
@@ -1555,7 +1573,7 @@ impl KernelDO {
         let rows = self
             .store()
             .query_raw(
-                "SELECT payload, indices, grain FROM delta_chunks ORDER BY seq ASC;",
+                "SELECT payload, indices, grain, codec FROM delta_chunks ORDER BY seq ASC;",
                 None,
             )
             .map_err(|e| worker::Error::RustError(format!("read deltas: {e:?}")))?;
@@ -1564,11 +1582,14 @@ impl KernelDO {
             let mut payload: Option<Vec<u8>> = None;
             let mut indices: Option<Vec<u8>> = None;
             let mut grain: i64 = 256;
+            // issue #9: per-delta codec; NULL/absent => "gzip" (back-compat).
+            let mut codec: String = "gzip".to_string();
             for (i, val) in row.into_iter().enumerate() {
                 match (i, val) {
                     (0, store::StoreValue::Blob(b)) => payload = Some(b),
                     (1, store::StoreValue::Blob(b)) => indices = Some(b),
                     (2, store::StoreValue::Integer(n)) => grain = n,
+                    (3, store::StoreValue::String(t)) => { if !t.is_empty() { codec = t; } }
                     _ => {}
                 }
             }
@@ -1587,6 +1608,7 @@ impl KernelDO {
                 &JsValue::from_f64(grain as f64),
             )
             .ok();
+            Reflect::set(&obj, &JsValue::from_str("codec"), &JsValue::from_str(&codec)).ok();
             out.push(&obj);
             count += 1;
         }
@@ -1689,6 +1711,7 @@ struct Manifest {
     size_raw: i64,
     size_gz: i64,
     final_crc: i64,
+    snap_codec: String,
 }
 
 #[event(fetch)]

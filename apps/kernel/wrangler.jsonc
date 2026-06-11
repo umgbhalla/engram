@@ -26,7 +26,7 @@
   // engine.wasm bundled as CompiledWasm => importable as a precompiled WebAssembly.Module
   // (workerd forbids runtime WebAssembly.compile of arbitrary bytes).
   "rules": [
-    { "type": "CompiledWasm", "globs": ["src/engine.wasm"], "fallthrough": true },
+    { "type": "CompiledWasm", "globs": ["src/engine.wasm", "src/zstd-codec.wasm"], "fallthrough": true },
     { "type": "Text", "globs": ["src/stdlib.bundle.txt"], "fallthrough": true }
   ],
 

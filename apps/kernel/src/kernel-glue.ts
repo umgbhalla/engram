@@ -331,6 +331,9 @@ interface DumpCommon {
 interface DumpResult extends DumpCommon {
   gz: Uint8Array;
   sizeGz: number;
+  // Codec used for `gz` (and, on a delta, `indicesGz`): "zstd" for new dumps, "gzip" historically.
+  // The DO persists it in the manifest / delta row; restore dispatches on it (back-compat). Issue #9.
+  snapCodec: SnapCodec;
   mode: "full" | "delta";
   grain: number;
   imageLen: number;
@@ -354,6 +357,13 @@ interface W4Delta {
   gz: Uint8Array;
   indicesGz: Uint8Array;
   grain?: number;
+  // Per-delta codec (a chain can straddle a deploy boundary: gzip base + zstd deltas, or vice
+  // versa). Absent => "gzip" (back-compat). Issue #9.
+  codec?: string;
+  // Recorded uncompressed byte-lengths of the payload/index blobs (= nChanged*grain / nChanged*4).
+  // Used to size the zstd dst buffer; the gzip path ignores them. Optional for back-compat.
+  payloadLen?: number;
+  indicesLen?: number;
 }
 
 interface ReplayCell {
@@ -1250,12 +1260,13 @@ class GlueKernel {
     configJson: string,
     label: string,
     kvJson: string,
-    usedHeap: number
+    usedHeap: number,
+    baseCodec?: string
   ): Promise<string> {
     this._applyConfig(configJson);
     const t0 = Date.now();
-    // gunzip the snapshot image.
-    const raw = await gunzip(gz);
+    // decompress the snapshot image by its recorded codec (zstd | gzip — back-compat). Issue #9.
+    const raw = await codecDecompress(gz, baseCodec);
     const gunzipMs = Date.now() - t0;
     // W5 RESTORE admission: a spiked-then-freed image gunzips back to the full (zeroed) raw
     // extent. Admit on the RECORDED used heap (the genuine fence); the raw ceiling only fails
@@ -1312,11 +1323,15 @@ class GlueKernel {
     kvJson: string,
     usedHeap: number,
     expectCrc: number,
-    expectLen: number
+    expectLen: number,
+    baseCodec?: string
   ): Promise<string> {
     this._applyConfig(configJson);
     const t0 = Date.now();
-    const base = await gunzip(baseGz);
+    // Decompress the base by its recorded codec (zstd | gzip). expectLen (the full reconstructed
+    // image length) is NOT the base length here (deltas extend it), so let zstd read its own frame
+    // content size. Issue #9.
+    const base = await codecDecompress(baseGz, baseCodec);
     let image = base; // grown + mutated by deltas
     const deltas = Array.isArray(deltaList) ? deltaList : [];
     // Pre-decode each delta so we can size the reconstructed image to the LARGEST grain target
@@ -1324,8 +1339,9 @@ class GlueKernel {
     const decoded: Array<{ payload: Uint8Array; dv: DataView; grain: number; nIdx: number }> = [];
     let maxLen = image.byteLength;
     for (const d of deltas) {
-      const payload = await gunzip(d.gz);
-      const idxBytes = await gunzip(d.indicesGz);
+      // each delta blob carries its OWN codec (a chain can straddle a deploy boundary). Issue #9.
+      const payload = await codecDecompress(d.gz, d.codec, d.payloadLen);
+      const idxBytes = await codecDecompress(d.indicesGz, d.codec, d.indicesLen);
       const grain = d.grain || DELTA_GRAIN_BYTES;
       const nIdx = (idxBytes.byteLength / 4) | 0;
       const dv = new DataView(idxBytes.buffer, idxBytes.byteOffset, idxBytes.byteLength);
@@ -2239,10 +2255,10 @@ class GlueKernel {
   // dump: full-image W5-compacted snapshot (used by the non-delta path / first base).
   async dump(): Promise<DumpResult> {
     const { raw, usedHeap, bufferBytes, scrubbed } = this._serializeForDump();
-    const gz = await gzip(raw);
+    const gz = zstdCompress(raw);
     // W4 commit-ordering: stage; commitDump() promotes to _lastImage only after the DO txn commits.
     this._pendingImage = raw.slice();
-    return { gz, sizeGz: gz.length, mode: "full", grain: DELTA_GRAIN_BYTES, imageLen: raw.length,
+    return { gz, sizeGz: gz.length, snapCodec: SNAP_CODEC, mode: "full", grain: DELTA_GRAIN_BYTES, imageLen: raw.length,
       nChanged: 0, indicesGz: null, imageCrc: crc32(raw),
       ...this._dumpCommon(usedHeap, bufferBytes, scrubbed, raw) };
   }
@@ -2268,8 +2284,8 @@ class GlueKernel {
       this._lastImage = null;
       this._pendingImage = null;
       prev = null;
-      const gz = await gzip(raw);
-      return { mode: "full", gz, indicesGz: null, nChanged: 0, grain: DELTA_GRAIN_BYTES,
+      const gz = zstdCompress(raw);
+      return { mode: "full", gz, snapCodec: SNAP_CODEC, indicesGz: null, nChanged: 0, grain: DELTA_GRAIN_BYTES,
         imageLen: raw.byteLength, sizeGz: gz.byteLength, imageCrc, ...common };
     }
     // W4 (growth-tolerant): the WASM linear buffer is MONOTONIC and commonly grows by whole 64KB
@@ -2305,28 +2321,29 @@ class GlueKernel {
       const idx = new Uint32Array(changed.length);
       for (let k = 0; k < changed.length; k++) idx[k] = changed[k];
       const idxBytes = new Uint8Array(idx.buffer, idx.byteOffset, idx.byteLength);
-      const [payGz, idxGz] = await Promise.all([gzip(payload), gzip(idxBytes)]);
+      const payGz = zstdCompress(payload);
+      const idxGz = zstdCompress(idxBytes);
       const deltaStored = payGz.byteLength + idxGz.byteLength;
-      // AUTO-FALLBACK: dense mutation (delta >= FALLBACK_PCT of a full gz image) => store full.
-      const fullGz = await gzip(raw);
+      // AUTO-FALLBACK: dense mutation (delta >= FALLBACK_PCT of a full image) => store full.
+      const fullGz = zstdCompress(raw);
       const deltaBlobsFit = payGz.byteLength <= DELTA_MAX_BLOB_BYTES && idxGz.byteLength <= DELTA_MAX_BLOB_BYTES;
       if (deltaBlobsFit && deltaStored < fullGz.byteLength * DELTA_FALLBACK_PCT) {
         // STAGE the candidate base; commitDump() promotes it ONLY after the DO appends this delta
         // row + bumps delta_seq. imageCrc = crc of the FULL image this delta reconstructs to.
         this._pendingImage = raw.slice();
-        return { mode: "delta", gz: payGz, indicesGz: idxGz, nChanged: changed.length, grain,
+        return { mode: "delta", gz: payGz, indicesGz: idxGz, snapCodec: SNAP_CODEC, nChanged: changed.length, grain,
           imageLen: raw.byteLength, sizeGz: deltaStored, imageCrc: crc32(raw), ...common };
       }
       // dense — fall through to full base, reuse fullGz.
       this._pendingImage = raw.slice();
-      return { mode: "full", gz: fullGz, indicesGz: null, nChanged: 0, grain: DELTA_GRAIN_BYTES,
+      return { mode: "full", gz: fullGz, snapCodec: SNAP_CODEC, indicesGz: null, nChanged: 0, grain: DELTA_GRAIN_BYTES,
         imageLen: raw.byteLength, sizeGz: fullGz.byteLength, imageCrc: crc32(raw), ...common };
     }
 
     // FULL (W5-compacted) base. Resets the delta chain.
     this._pendingImage = raw.slice();
-    const gz = await gzip(raw);
-    return { mode: "full", gz, indicesGz: null, nChanged: 0, grain: DELTA_GRAIN_BYTES,
+    const gz = zstdCompress(raw);
+    return { mode: "full", gz, snapCodec: SNAP_CODEC, indicesGz: null, nChanged: 0, grain: DELTA_GRAIN_BYTES,
       imageLen: raw.byteLength, sizeGz: gz.byteLength, imageCrc: crc32(raw), ...common };
   }
 
@@ -2440,6 +2457,98 @@ async function gunzip(u8: Uint8Array): Promise<Uint8Array> {
   w.write(u8);
   w.close();
   return new Uint8Array(await new Response(ds.readable).arrayBuffer());
+}
+
+// ---- zstd codec (issue #9) — a precompiled CompiledWasm module (workerd forbids runtime
+// WebAssembly.compile). zstd level 9 is measurably SMALLER and FASTER than the platform gzip
+// CompressionStream on the snapshot image (fresh -31%, stdlib -16%, incompressible -7%; compress
+// 0.56-0.90x gzip time; decompress 2-4x faster). The codec is a tiny zstd-sys cdylib (codec/ crate)
+// exporting a clean C ABI (cz_alloc/cz_free/cz_bound/cz_compress/cz_decompress/cz_frame_size) over
+// its OWN linear memory; we drive it with a stubbed WASI (it only imports environ/fd_write/proc_exit
+// and never touches them on the compress/decompress path). Lazy singleton — instantiated once on
+// first use, reused for every dump/restore. GLUE-side: does NOT touch engine.wasm => ENGINE_HASH
+// unchanged => no forced oplog-replay for live sessions on deploy.
+const ZSTD_LEVEL = 9; // measured sweet spot (best size, still faster than gzip)
+interface ZstdExports {
+  memory: WebAssembly.Memory;
+  cz_alloc: (len: number) => number;
+  cz_free: (ptr: number, len: number) => void;
+  cz_bound: (srcLen: number) => number;
+  cz_compress: (dst: number, dstCap: number, src: number, srcLen: number, level: number) => number;
+  cz_decompress: (dst: number, dstCap: number, src: number, srcLen: number) => number;
+  cz_frame_size: (src: number, srcLen: number) => number;
+}
+let _zstd: ZstdExports | null = null;
+function zstdCodec(): ZstdExports {
+  if (_zstd) return _zstd;
+  const mod = globalThis.__ZSTD_MODULE as WebAssembly.Module | undefined;
+  if (!mod) throw new Error("ZstdCodecError: __ZSTD_MODULE not present (entry.ts must import zstd-codec.wasm)");
+  const noop = (): number => 0;
+  const inst = new WebAssembly.Instance(mod, {
+    wasi_snapshot_preview1: {
+      environ_get: noop,
+      environ_sizes_get: noop,
+      fd_write: noop,
+      proc_exit: (): void => { throw new Error("ZstdCodecError: unexpected proc_exit"); },
+    },
+  });
+  _zstd = inst.exports as unknown as ZstdExports;
+  return _zstd;
+}
+function zstdCompress(u8: Uint8Array): Uint8Array {
+  const z = zstdCodec();
+  const srcLen = u8.length;
+  const sp = z.cz_alloc(srcLen || 1);
+  if (srcLen) new Uint8Array(z.memory.buffer).set(u8, sp);
+  const cap = z.cz_bound(srcLen);
+  const dp = z.cz_alloc(cap);
+  try {
+    const n = z.cz_compress(dp, cap, sp, srcLen, ZSTD_LEVEL);
+    if (n === 0 && srcLen !== 0) throw new Error("ZstdCodecError: cz_compress failed (" + srcLen + "B)");
+    return new Uint8Array(z.memory.buffer, dp, n).slice();
+  } finally {
+    z.cz_free(sp, srcLen || 1);
+    z.cz_free(dp, cap);
+  }
+}
+// Decompress a zstd frame. rawLenHint (the recorded uncompressed length) is used when present;
+// otherwise the frame's own content-size header is read. Throws on a size/decode error.
+function zstdDecompress(u8: Uint8Array, rawLenHint?: number): Uint8Array {
+  const z = zstdCodec();
+  const srcLen = u8.length;
+  const sp = z.cz_alloc(srcLen || 1);
+  if (srcLen) new Uint8Array(z.memory.buffer).set(u8, sp);
+  let dstLen = rawLenHint && rawLenHint > 0 ? rawLenHint : 0;
+  try {
+    if (!dstLen) dstLen = z.cz_frame_size(sp, srcLen);
+    if (!dstLen) { z.cz_free(sp, srcLen || 1); return new Uint8Array(0); }
+    const dp = z.cz_alloc(dstLen);
+    try {
+      const n = z.cz_decompress(dp, dstLen, sp, srcLen);
+      if (n === 0 && dstLen !== 0) throw new Error("ZstdCodecError: cz_decompress failed");
+      return new Uint8Array(z.memory.buffer, dp, n).slice();
+    } finally {
+      z.cz_free(dp, dstLen);
+    }
+  } finally {
+    z.cz_free(sp, srcLen || 1);
+  }
+}
+
+// CODEC SELECTOR (back-compat). Snapshots/deltas written before issue #9 carry NO codec tag (or
+// tag "gzip") and MUST still restore — the decompressor dispatches on the recorded tag. New dumps
+// tag "zstd". A W4 delta chain can straddle a deploy boundary (base gzip, new deltas zstd); every
+// chunk is decompressed by ITS OWN recorded codec, so mixed chains restore correctly.
+const SNAP_CODEC = "zstd"; // codec for NEW dumps
+type SnapCodec = "gzip" | "zstd";
+function normCodec(tag: string | null | undefined): SnapCodec {
+  return tag === "zstd" ? "zstd" : "gzip"; // absent/empty/"gzip" => gzip (back-compat default)
+}
+async function codecCompress(u8: Uint8Array): Promise<{ out: Uint8Array; codec: SnapCodec }> {
+  return { out: zstdCompress(u8), codec: "zstd" };
+}
+async function codecDecompress(u8: Uint8Array, codec: string | null | undefined, rawLenHint?: number): Promise<Uint8Array> {
+  return normCodec(codec) === "zstd" ? zstdDecompress(u8, rawLenHint) : gunzip(u8);
 }
 
 // CRC32 (IEEE 802.3, table-driven) over a byte buffer. Used as the W4 reconstruction checksum:
