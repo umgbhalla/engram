@@ -112,6 +112,17 @@ interface FrameReply {
 const SHARD_COUNT = 64;
 const MAX_FACETS_PER_SUPERVISOR = 128;
 
+// Typed error carrying an HTTP status so the DO fetch catch can fail-closed with the right code
+// (used by the requireTenant() tenant guard — see SECURITY #38).
+class HttpError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "HttpError";
+    this.status = status;
+  }
+}
+
 // Idle TTL: a facet untouched this long is hard-evicted (ctx.facets.abort). Its SQLite snapshot
 // survives -> next /frame cold-restores. Supervisor-alarm-driven (facets can't alarm).
 const FACET_IDLE_TTL_MS = 5 * 60 * 1000;
@@ -428,8 +439,18 @@ export class SupervisorDO extends DurableObject<Env> {
     const p = url.pathname;
     const J = (o: unknown, code = 200): Response =>
       new Response(JSON.stringify(o, null, 2), { status: code, headers: { "content-type": "application/json" } });
-    const tenant = req.headers.get("x-md-tenant") || url.searchParams.get("tenant") || "anon";
+    // SECURITY (#38): the tenant for any TENANT-SCOPED op comes ONLY from the server-set
+    // x-md-tenant header, which is set EXCLUSIVELY by the Worker-entry validated-key gate
+    // (resolved.tenantId). We DO NOT read a client-supplied ?tenant= query and there is NO
+    // "anon" catch-all fallback. A tenant-scoped op with no server tenant fails closed (403)
+    // via requireTenant() below — so a client can never spoof or share a tenant bucket.
+    const tenant = req.headers.get("x-md-tenant") || "";
     const sessionId = url.searchParams.get("session") || "default";
+    // Fail-closed guard for tenant-scoped routes. Returns the resolved tenant or throws a 403.
+    const requireTenant = (): string => {
+      if (!tenant) throw new HttpError(403, "tenant not resolved (server-set x-md-tenant required; route only reachable via the validated-key data-plane gate)");
+      return tenant;
+    };
 
     // ---- control-plane RPC routes (entry -> AUTH shard), not client-facing ----
     if (p === "/_auth/resolve") {
@@ -453,47 +474,56 @@ export class SupervisorDO extends DurableObject<Env> {
     try {
       // create a session kernel (config: clock/rngSeed/cellBudgetTicks/etc).
       if (p === "/create") {
-        this._touch(tenant, sessionId);
+        const t = requireTenant();
+        this._touch(t, sessionId);
         let config: unknown = {};
         try { config = JSON.parse((await req.text()) || "{}"); } catch (_) {}
-        return J({ tenant, sessionId, ...(await this._frame(tenant, sessionId, { t: "create", config })) });
+        return J({ tenant: t, sessionId, ...(await this._frame(t, sessionId, { t: "create", config })) });
       }
       // eval one cell (metered).
       if (p === "/eval") {
-        this._touch(tenant, sessionId);
+        const t = requireTenant();
+        this._touch(t, sessionId);
         const src = url.searchParams.get("src") || "1+1";
-        return J({ tenant, sessionId, ...(await this._evalMetered(tenant, sessionId, src, Date.now() & 0xffff)) });
+        return J({ tenant: t, sessionId, ...(await this._evalMetered(t, sessionId, src, Date.now() & 0xffff)) });
       }
       if (p === "/frame") {
-        this._touch(tenant, sessionId);
+        const t = requireTenant();
+        this._touch(t, sessionId);
         let frame: Record<string, unknown> = {};
         try { frame = JSON.parse((await req.text()) || "{}"); } catch (_) {}
-        return J({ tenant, sessionId, ...(await this._frame(tenant, sessionId, frame)) });
+        return J({ tenant: t, sessionId, ...(await this._frame(t, sessionId, frame)) });
       }
-      if (p === "/gen") return J(await this._frame(tenant, sessionId, { t: "gen" }));
-      if (p === "/ping") return J(await this._frame(tenant, sessionId, { t: "ping" }));
-      if (p === "/reset") return J(await this._frame(tenant, sessionId, { t: "reset" }));
+      if (p === "/gen") { const t = requireTenant(); return J(await this._frame(t, sessionId, { t: "gen" })); }
+      if (p === "/ping") { const t = requireTenant(); return J(await this._frame(t, sessionId, { t: "ping" })); }
+      if (p === "/reset") { const t = requireTenant(); return J(await this._frame(t, sessionId, { t: "reset" })); }
 
       // (1) keep-warm view for a session: cadence stats + whether the sweep would warm it now.
       if (p === "/warm") {
+        const t = requireTenant();
         const ls = url.searchParams.get("latencySensitive");
-        if (ls != null) this._setLatencySensitive(tenant, sessionId, ls === "1" || ls === "true");
+        if (ls != null) this._setLatencySensitive(t, sessionId, ls === "1" || ls === "true");
         const row = this.sctx.storage.sql
-          .exec<SessionRow>("SELECT * FROM sessions WHERE facet=?;", facetName(tenant, sessionId)).toArray()[0] || null;
-        return J({ tenant, sessionId, willWarm: this._shouldWarm(row, Date.now()), session: row });
+          .exec<SessionRow>("SELECT * FROM sessions WHERE facet=?;", facetName(t, sessionId)).toArray()[0] || null;
+        return J({ tenant: t, sessionId, willWarm: this._shouldWarm(row, Date.now()), session: row });
       }
 
       // hard-evict the facet (ctx.facets.abort). SQLite snapshot survives -> next eval cold-restores.
       if (p === "/evict") {
-        this.sctx.facets.abort(facetName(tenant, sessionId), new Error("manual evict"));
+        const t = requireTenant();
+        this.sctx.facets.abort(facetName(t, sessionId), new Error("manual evict"));
         this.sctx.storage.sql.exec(
-          "UPDATE sessions SET last_activity=0, warm_until=0 WHERE facet=?;", facetName(tenant, sessionId));
-        return J({ op: "evict", tenant, sessionId, aborted: true });
+          "UPDATE sessions SET last_activity=0, warm_until=0 WHERE facet=?;", facetName(t, sessionId));
+        return J({ op: "evict", tenant: t, sessionId, aborted: true });
       }
+      // /sessions is tenant-scoped: only the caller's own tenant's sessions are listed (no
+      // cross-tenant session enumeration). Fails closed without a server-set tenant.
       if (p === "/sessions") {
-        const rows = this.sctx.storage.sql.exec<SessionRow>("SELECT * FROM sessions;").toArray();
+        const t = requireTenant();
+        const rows = this.sctx.storage.sql.exec<SessionRow>("SELECT * FROM sessions WHERE tenant=?;", t).toArray();
         return J({ count: rows.length, max: MAX_FACETS_PER_SUPERVISOR, sessions: rows });
       }
+      // /health is NOT tenant-scoped — must not read any client tenant.
       if (p === "/health") return J({ ok: true, codeId: KERNEL_CODE_ID, engineHash: ENGINE_HASH, kernel: "rust" });
       return J({
         service: "engram-cloud-rust",
@@ -502,6 +532,7 @@ export class SupervisorDO extends DurableObject<Env> {
         routes: ["POST /create", "/eval?src=", "/gen", "/ping", "/reset", "/warm[?latencySensitive=1]", "/evict", "/sessions", "/health", "GET /usage?tenant=&window=", "POST /admin/keys (mint)", "GET /admin/keys (list)", "DELETE /admin/keys (revoke)"],
       });
     } catch (e) {
+      if (e instanceof HttpError) return J({ ok: false, error: e.message }, e.status);
       return J({ ok: false, error: String((e && (e as Error).stack) || e) }, 500);
     }
   }
@@ -651,12 +682,24 @@ export default {
     }
 
     // ---- Health/info pass-through (no auth) ----
+    // SECURITY (#38): these are NON-TENANT routes. We MUST NOT forward the client's
+    // x-md-tenant / x-md-plan headers (the DO trusts x-md-tenant as the server-derived tenant).
+    // Strip them so a client can never inject a tenant the DO would trust via /health or /.
     if (p === "/health" || p === "/") {
       const sessionId = url.searchParams.get("session") || "default";
-      return env.SUPERVISOR.get(env.SUPERVISOR.idFromName(shardFor(sessionId, SHARD_COUNT))).fetch(req);
+      const headers = new Headers(req.headers);
+      headers.delete("x-md-tenant");
+      headers.delete("x-md-plan");
+      const safeReq = new Request(req.url, { method: req.method, headers, body: req.body, redirect: "manual" });
+      return env.SUPERVISOR.get(env.SUPERVISOR.idFromName(shardFor(sessionId, SHARD_COUNT))).fetch(safeReq);
     }
 
     // ---- DATA-PLANE: require valid API key -> tenant; inject x-md-tenant; (4) shard + route ----
+    // SECURITY (#38): the DO's internal control-plane routes (/_auth/*, /_admin/*) are NEVER
+    // client-reachable — they exist only for server-side RPC from this entry (authStub). They are
+    // inert on data-plane shards (the tenants table lives only on AUTH_SHARD), but reject outright
+    // so a client can never address them.
+    if (p.startsWith("/_")) return j({ error: "not found" }, 404);
     const key = getApiKey(req, url);
     if (!key) return j({ error: "missing API key (x-api-key header or ?apiKey=)" }, 401);
     const resolved = await authStub(env)
