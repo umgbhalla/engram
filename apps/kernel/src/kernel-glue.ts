@@ -999,8 +999,11 @@ class GlueKernel {
       if (!name) continue;
       const kind = (e.backend && e.backend.kind) || "client";
       if (kind !== "client") continue; // defense-in-depth: lib.rs already rejects non-client at create
-      const callsPerCell = Math.max(1, Math.min(EXT_MAX_CALLS_PER_CELL, ((e.limits && e.limits.callsPerCell) | 0) || EXT_MAX_CALLS_PER_CELL));
-      const maxResultBytes = Math.max(1, Math.min(EXT_MAX_RESULT_BYTES, ((e.limits && e.limits.maxResultBytes) | 0) || EXT_MAX_RESULT_BYTES));
+      const lim = e.limits || {};
+      const cpc = (lim.callsPerCell ?? 0) | 0;
+      const mrb = (lim.maxResultBytes ?? 0) | 0;
+      const callsPerCell = Math.max(1, Math.min(EXT_MAX_CALLS_PER_CELL, cpc || EXT_MAX_CALLS_PER_CELL));
+      const maxResultBytes = Math.max(1, Math.min(EXT_MAX_RESULT_BYTES, mrb || EXT_MAX_RESULT_BYTES));
       const list = Array.isArray(e.tools) ? e.tools : [];
       for (const t of list) {
         if (!t || typeof t.fn !== "string" || !t.fn) continue;

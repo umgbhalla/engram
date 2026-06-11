@@ -3,7 +3,7 @@
 // (kernel.ts) and run/eval/config/E2E wiring are unchanged; this is the UI shell.
 import "./styles.css";
 import { Kernel } from "./kernel";
-import type { EngramConfig, KernelReply, KernelState } from "./kernel";
+import type { ArtifactValue, EngramConfig, KernelReply, KernelState, MimeBundle, MimeOutput } from "./kernel";
 import { SEED_CELLS } from "./seed";
 import type { SeedCell } from "./seed";
 
@@ -175,7 +175,7 @@ function addCell(seed?: SeedCell): CellEl {
     const t0 = performance.now();
     try {
       const r = await kernel.eval(ta.value);
-      renderResult(out, r);
+      await renderRichResult(out, r);
       div.classList.add(r.ok === false ? "state-error" : "state-ok");
       renderMeta(meta, r, Math.round(performance.now() - t0));
     } catch (e) {
@@ -217,6 +217,82 @@ function renderResult(out: HTMLElement, r: KernelReply): void {
   if (r.final && r.final.kind)
     html += `<div class="final">★ FINAL [${esc(r.final.kind)}]: ${esc(String(r.final.value))}</div>`;
   out.innerHTML = html;
+}
+
+async function renderRichResult(out: HTMLElement, r: KernelReply): Promise<void> {
+  if (!Array.isArray(r.outputs) || r.outputs.length === 0) {
+    renderResult(out, r);
+    return;
+  }
+  let html = "";
+  for (const l of r.logs || []) {
+    const txt = typeof l === "string" ? l : l.text ?? l.msg ?? "";
+    html += '<div class="log"><span class="lead">› </span>' + esc(txt) + '</div>';
+  }
+  if (r.ok === false && r.error) {
+    html += '<div class="err"><span class="lead">✖ </span>' + esc(r.error.name || "Error") + ": " + esc(r.error.message || "") + "</div>";
+    if (r.error.stack) html += '<div class="err-stack">' + esc(r.error.stack) + "</div>";
+  }
+  for (const output of r.outputs) {
+    html += await renderMimeOutput(output);
+  }
+  if (r.final && r.final.kind) {
+    html += '<div class="final">★ FINAL [' + esc(r.final.kind) + "]: " + esc(String(r.final.value)) + "</div>";
+  }
+  out.innerHTML = html;
+}
+
+async function renderMimeOutput(output: MimeOutput): Promise<string> {
+  if (output.output_type === "clear_output") return "";
+  if (output.output_type === "stream") return '<div class="log"><span class="lead">› </span>' + esc(String(output.text || "")) + "</div>";
+  if (output.output_type === "error") return '<div class="err"><span class="lead">✖ </span>' + esc(String(output.text || "error")) + "</div>";
+  if (!output.data) return "";
+  const rendered = await renderMimeBundle(output.data);
+  const cls = output.output_type === "execute_result" ? "mime-result" : "mime-display";
+  return '<div class="' + cls + '">' + rendered + "</div>";
+}
+
+async function renderMimeBundle(bundle: MimeBundle): Promise<string> {
+  const html = bundle["text/html"];
+  if (html !== undefined) return '<iframe class="mime-html" sandbox="" srcdoc="' + escAttr(await mimeText(html)) + '"></iframe>';
+  const svg = bundle["image/svg+xml"];
+  if (svg !== undefined) return '<iframe class="mime-svg" sandbox="" srcdoc="' + escAttr(await mimeText(svg)) + '"></iframe>';
+  const png = bundle["image/png"];
+  if (png !== undefined) return '<img class="mime-image" alt="" src="data:image/png;base64,' + escAttr(await mimeText(png)) + '">';
+  const jpeg = bundle["image/jpeg"] || bundle["image/jpg"];
+  if (jpeg !== undefined) return '<img class="mime-image" alt="" src="data:image/jpeg;base64,' + escAttr(await mimeText(jpeg)) + '">';
+  const md = bundle["text/markdown"];
+  if (md !== undefined) return '<div class="mime-markdown">' + renderMarkdownText(await mimeText(md)) + "</div>";
+  const json = bundle["application/json"];
+  if (json !== undefined) return '<pre class="mime-json">' + esc(JSON.stringify(json, null, 2)) + "</pre>";
+  const text = bundle["text/plain"];
+  if (text !== undefined) return '<pre class="mime-plain">' + esc(await mimeText(text)) + "</pre>";
+  const firstKey = Object.keys(bundle)[0];
+  return firstKey ? '<pre class="mime-plain">' + esc(firstKey + "\\n" + JSON.stringify(bundle[firstKey], null, 2)) + "</pre>" : "";
+}
+
+async function mimeText(value: unknown): Promise<string> {
+  if (isArtifact(value)) return kernel.readArtifact(value, 120000);
+  if (typeof value === "string") return value;
+  return JSON.stringify(value, null, 2);
+}
+
+function isArtifact(value: unknown): value is ArtifactValue {
+  return !!value && typeof value === "object" && (value as ArtifactValue).kind === "artifact" && typeof (value as ArtifactValue).handle === "string";
+}
+
+function renderMarkdownText(text: string): string {
+  const escaped = esc(text);
+  return escaped
+    .replace(/^### (.*)$/gm, "<h4>$1</h4>")
+    .replace(/^## (.*)$/gm, "<h3>$1</h3>")
+    .replace(/^# (.*)$/gm, "<h2>$1</h2>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\n/g, "<br>");
+}
+
+function escAttr(s: string): string {
+  return esc(s).replace(/'/g, "&#39;");
 }
 
 function renderMeta(meta: HTMLElement, r: KernelReply, ms: number): void {

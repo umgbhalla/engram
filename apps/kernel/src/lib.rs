@@ -777,6 +777,18 @@ impl KernelDO {
 
     async fn create_critical(&self, msg: &serde_json::Value) -> Result<serde_json::Value> {
         let cfg = msg.get("config").cloned().unwrap_or_else(|| json!({}));
+        // EXTENSIBILITY API — REDUCED Phase 1 (#32): validate config.extensions BEFORE persisting.
+        // CLIENT backend only (http/worker rejected); reject __-prefixed / built-in-shadowing names;
+        // cap manifest size. A failure returns a typed {ok:false} create reply (socket stays alive),
+        // never persists a bad manifest. Zero engine change (discoverability is glue-seeded).
+        if let Some(err) = validate_extensions(&cfg) {
+            return Ok(json!({
+                "ok": false, "t": "create",
+                "valueType": "error",
+                "error": err,
+                "generation": self.generation,
+            }));
+        }
         let cfg_str = serde_json::to_string(&cfg).unwrap_or_else(|_| "{}".into());
         write_meta(&self.store(), "config", &cfg_str);
         let info = self.ensure_glue().await?;
@@ -882,6 +894,26 @@ impl KernelDO {
                 handler.forget();
             } else {
                 glue.set_fs_handler(&JsValue::NULL);
+            }
+        }
+
+        // EXTENSIBILITY API — REDUCED Phase 1 (#32): install a per-eval AE sink so the glue can emit
+        // ONE datapoint per ext call (op="ext:<name>"). Mirrors the host-sender install (a 'static
+        // closure capturing env+do_id+generation). Cleared to NULL on the no-ws path.
+        {
+            let glue = clone_glue(self.glue.borrow().as_ref().unwrap());
+            if ws.is_some() {
+                let env = self.env.clone();
+                let do_id = self.do_id.clone();
+                let generation = self.generation;
+                let sink = Closure::wrap(Box::new(move |op: JsValue| {
+                    let op = op.as_string().unwrap_or_default();
+                    write_ext_ae(&env, &do_id, generation, &op);
+                }) as Box<dyn FnMut(JsValue)>);
+                glue.set_ext_ae_sink(sink.as_ref().unchecked_ref());
+                sink.forget();
+            } else {
+                glue.set_ext_ae_sink(&JsValue::NULL);
             }
         }
 
@@ -1673,6 +1705,197 @@ fn restore_timings_value(info: &RestoreInfo) -> serde_json::Value {
     let glue: serde_json::Value =
         serde_json::from_str(&info.timings_json).unwrap_or_else(|_| json!({}));
     json!({ "readMs": info.read_ms, "totalServerMs": info.total_server_ms, "glue": glue })
+}
+
+/// EXTENSIBILITY API — REDUCED Phase 1 (#32): validate config.extensions at create. Returns
+/// Some(typed-error-json) on the FIRST violation, else None. Enforces: client-backend only
+/// (http/worker rejected); each ext.name is a non-empty string, NOT __-prefixed, and does NOT
+/// shadow a built-in host effect / namespace (fetch/ws/stream/__fs/host/...); manifest total size
+/// capped. CUT (rejected): http/worker backends, binding:NAME credential injection.
+fn validate_extensions(cfg: &serde_json::Value) -> Option<serde_json::Value> {
+    const MAX_MANIFEST_BYTES: usize = 64 * 1024; // 64KB total manifest cap
+    const MAX_EXTENSIONS: usize = 32;
+    const RESERVED: &[&str] = &[
+        "fetch",
+        "fetchStream",
+        "ws",
+        "stream",
+        "streamRead",
+        "streamWrite",
+        "streamCancel",
+        "__fs",
+        "fs",
+        "host",
+        "subLM",
+        "ctx",
+        "final",
+        "kv",
+    ];
+    let exts = match cfg.get("extensions") {
+        None => return None,
+        Some(serde_json::Value::Null) => return None,
+        Some(serde_json::Value::Array(a)) => a,
+        Some(_) => {
+            return Some(json!({
+                "name": "ExtConfigError",
+                "message": "config.extensions must be an array of manifests"
+            }))
+        }
+    };
+    // total manifest size cap (defends the persisted config + snapshot).
+    let sz = serde_json::to_string(&serde_json::Value::Array(exts.clone()))
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX);
+    if sz > MAX_MANIFEST_BYTES {
+        return Some(json!({
+            "name": "ExtConfigError",
+            "message": format!("config.extensions manifest {}B exceeds cap {}B", sz, MAX_MANIFEST_BYTES)
+        }));
+    }
+    if exts.len() > MAX_EXTENSIONS {
+        return Some(json!({
+            "name": "ExtConfigError",
+            "message": format!("too many extensions ({} > {})", exts.len(), MAX_EXTENSIONS)
+        }));
+    }
+    let mut seen: Vec<String> = Vec::new();
+    for e in exts {
+        let obj = match e.as_object() {
+            Some(o) => o,
+            None => {
+                return Some(json!({
+                    "name": "ExtConfigError",
+                    "message": "each extension must be an object {name, backend, tools, limits}"
+                }))
+            }
+        };
+        let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if name.is_empty() {
+            return Some(json!({
+                "name": "ExtConfigError",
+                "message": "extension.name must be a non-empty string"
+            }));
+        }
+        if name.starts_with("__") {
+            return Some(json!({
+                "name": "ExtConfigError",
+                "message": format!("extension.name '{}' may not be __-prefixed (reserved)", name)
+            }));
+        }
+        if RESERVED.contains(&name) {
+            return Some(json!({
+                "name": "ExtConfigError",
+                "message": format!("extension.name '{}' shadows a built-in host effect/namespace", name)
+            }));
+        }
+        // valid identifier-ish (so host.<name>.<fn> is reachable and cannot inject arbitrary JS).
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        {
+            return Some(json!({
+                "name": "ExtConfigError",
+                "message": format!("extension.name '{}' must be alphanumeric/_/$ only", name)
+            }));
+        }
+        if seen.iter().any(|n| n == name) {
+            return Some(json!({
+                "name": "ExtConfigError",
+                "message": format!("duplicate extension.name '{}'", name)
+            }));
+        }
+        seen.push(name.to_string());
+        // backend.kind MUST be "client" (default). http/worker are CUT in this phase.
+        let kind = obj
+            .get("backend")
+            .and_then(|b| b.get("kind"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("client");
+        if kind != "client" {
+            return Some(json!({
+                "name": "ExtBackendError",
+                "message": format!("backend.kind '{}' is not supported (only 'client' in this phase; http/worker are cut)", kind)
+            }));
+        }
+        // tools[].fn must be valid identifiers (reachable as host.<name>.<fn>).
+        if let Some(tools) = obj.get("tools").and_then(|t| t.as_array()) {
+            for t in tools {
+                let fnname = t.get("fn").and_then(|v| v.as_str()).unwrap_or("");
+                if fnname.is_empty()
+                    || !fnname
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+                {
+                    return Some(json!({
+                        "name": "ExtConfigError",
+                        "message": format!("extension '{}' tool.fn '{}' must be a non-empty alphanumeric/_/$ identifier", name, fnname)
+                    }));
+                }
+            }
+        }
+        // limits caps (defense-in-depth; glue also clamps).
+        if let Some(limits) = obj.get("limits").and_then(|l| l.as_object()) {
+            if let Some(cpc) = limits.get("callsPerCell").and_then(|v| v.as_i64()) {
+                if cpc < 1 || cpc > 64 {
+                    return Some(json!({
+                        "name": "ExtConfigError",
+                        "message": format!("extension '{}' limits.callsPerCell {} out of range [1,64]", name, cpc)
+                    }));
+                }
+            }
+            if let Some(mrb) = limits.get("maxResultBytes").and_then(|v| v.as_i64()) {
+                if mrb < 1 || mrb > 65536 {
+                    return Some(json!({
+                        "name": "ExtConfigError",
+                        "message": format!("extension '{}' limits.maxResultBytes {} out of range [1,65536]", name, mrb)
+                    }));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// EXTENSIBILITY API — REDUCED Phase 1 (#32): emit ONE AE datapoint per ext call (op="ext:<name>")
+/// from the glue-installed sink. Standalone (the sink closure is 'static, can't borrow &self), so it
+/// captures env+do_id+generation and mirrors KernelDO::write_ae's blob/double layout. Best-effort.
+fn write_ext_ae(env: &Env, do_id: &str, generation: i64, op: &str) {
+    let envj: &JsValue = env.as_ref();
+    let ae = match Reflect::get(envj, &JsValue::from_str("AE")) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    if ae.is_undefined() || ae.is_null() {
+        return;
+    }
+    let write_fn: js_sys::Function =
+        match Reflect::get(&ae, &JsValue::from_str("writeDataPoint")).and_then(|f| f.dyn_into()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+    let indexes = js_sys::Array::new();
+    indexes.push(&JsValue::from_str(do_id));
+    let blobs = js_sys::Array::new();
+    blobs.push(&JsValue::from_str(op));
+    blobs.push(&JsValue::from_str("")); // restore_source
+    blobs.push(&JsValue::from_str("")); // store
+    blobs.push(&JsValue::from_str("")); // error_name
+    blobs.push(&JsValue::from_str("ext")); // value_type
+    blobs.push(&JsValue::from_str("")); // label
+    let doubles = js_sys::Array::new();
+    for _ in 0..6 {
+        doubles.push(&JsValue::from_f64(0.0));
+    }
+    doubles.push(&JsValue::from_f64(generation as f64));
+    doubles.push(&JsValue::from_f64(1.0)); // ok
+    let point = js_sys::Object::new();
+    let _ = Reflect::set(&point, &JsValue::from_str("indexes"), &indexes);
+    let _ = Reflect::set(&point, &JsValue::from_str("blobs"), &blobs);
+    let _ = Reflect::set(&point, &JsValue::from_str("doubles"), &doubles);
+    let _ = write_fn.call1(&ae, &point);
+    let log = json!({ "ev": "op", "op": op, "doId": do_id, "valueType": "ext",
+        "generation": generation, "ok": true });
+    console_log(&log.to_string());
 }
 
 fn read_int<S: KernelStore>(store: &S, k: &str, dflt: i64) -> i64 {

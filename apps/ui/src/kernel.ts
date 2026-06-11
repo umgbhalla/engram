@@ -36,6 +36,28 @@ export interface FinalInfo {
   value?: unknown;
 }
 
+export interface ArtifactValue {
+  kind: "artifact";
+  handle: string;
+  mime?: string;
+  chars?: number;
+  encoding?: string;
+  chunkMaxChars?: number;
+}
+
+export type MimeBundle = Record<string, unknown | ArtifactValue>;
+
+export interface MimeOutput {
+  output_type: string;
+  data?: MimeBundle;
+  metadata?: Record<string, unknown>;
+  transient?: Record<string, unknown>;
+  execution_count?: number | null;
+  wait?: boolean;
+  name?: string;
+  text?: string;
+}
+
 /** A frame sent to the kernel. `t` is the discriminator. */
 export interface KernelFrame {
   t: "create" | "eval" | "gen" | "evict" | "reset" | "ping" | string;
@@ -50,6 +72,8 @@ export interface KernelReply {
   value?: unknown;
   valuePreview?: unknown;
   valueType?: string;
+  mimeBundle?: MimeBundle;
+  outputs?: MimeOutput[];
   logs?: ConsoleLine[];
   error?: EvalErrorInfo;
   cell?: number;
@@ -212,6 +236,21 @@ export class Kernel {
 
   eval(src: string, timeoutMs?: number): Promise<KernelReply> {
     return this.send({ t: "eval", src }, timeoutMs);
+  }
+  async readArtifact(artifact: ArtifactValue | string, timeoutMs?: number): Promise<string> {
+    const handle = typeof artifact === "string" ? artifact : artifact.handle;
+    const len = typeof artifact === "string" ? 128 * 1024 : artifact.chunkMaxChars || 128 * 1024;
+    let offset = 0;
+    let out = "";
+    for (;;) {
+      const r = await this.send({ t: "artifact", handle, offset, len }, timeoutMs);
+      if (r.ok === false) throw new Error(r.error?.message || "artifact read failed");
+      const data = typeof (r as { data?: unknown }).data === "string" ? (r as { data: string }).data : "";
+      out += data;
+      offset += data.length;
+      if ((r as { done?: boolean }).done || data.length === 0) break;
+    }
+    return out;
   }
   gen(): Promise<KernelReply> {
     return this.send({ t: "gen" });

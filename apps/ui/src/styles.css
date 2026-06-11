@@ -355,6 +355,46 @@ code {
 .out .err-stack { color: var(--faint); font-size: 11px; margin-top: 2px; }
 .out .final { color: var(--amber); }
 .out .running-line { color: var(--accent); display: inline-flex; align-items: center; gap: 8px; }
+.mime-display,
+.mime-result {
+  margin: 7px 0;
+}
+.mime-result::before {
+  content: "⇒";
+  color: var(--green);
+  opacity: 0.7;
+  margin-right: 8px;
+}
+.mime-html,
+.mime-svg {
+  width: 100%;
+  min-height: 72px;
+  max-height: 360px;
+  border: 1px solid var(--hairline);
+  background: white;
+}
+.mime-image {
+  max-width: 100%;
+  max-height: 360px;
+  border: 1px solid var(--hairline);
+  background: white;
+}
+.mime-json,
+.mime-plain {
+  margin: 0;
+  white-space: pre-wrap;
+  color: var(--green);
+}
+.mime-markdown {
+  font-family: var(--sans);
+  color: var(--text);
+}
+.mime-markdown h2,
+.mime-markdown h3,
+.mime-markdown h4 {
+  margin: 8px 0 4px;
+  font-size: 14px;
+}
 .spin-inline {
   width: 11px; height: 11px;
   border: 2px solid var(--accent-soft);
