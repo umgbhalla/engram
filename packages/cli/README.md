@@ -20,6 +20,7 @@ creates it.
 ```
 engram repl [--session <id>] [--config <file>] [--tools <file>] [--context-file <path>]
               [--endpoint <wss>] [--exec '<one cell>'] [--interactive]
+              [--keepalive-ms <ms>]
 ```
 
 - `--config <file>` — JSON session config (`clock`, `rngSeed`, `cellBudgetTicks`,
@@ -28,6 +29,11 @@ engram repl [--session <id>] [--config <file>] [--tools <file>] [--context-file 
 - `--context-file <path>` — load a big blob **host-side** as a `host.ctx.*` peek/grep handle
   (NOT into the VM heap).
 - `--exec '<src>'` — run one cell and exit (smoke-friendly).
+- `--keepalive-ms <ms>` — after each user cell, keep the kernel warm for this idle window before
+  allowing hibernation. Defaults to `900000` (15 minutes); `ENGRAM_REPL_KEEPALIVE_MS=0` disables it.
+  With the default warm window, the CLI uses `durability: "warmBuffered"`: evals return from the
+  live heap and the checkpoint flushes on idle/close/explicit flush. Set `durability:
+  "eagerDurable"` in `--config` for checkpoint-before-reply semantics.
 - Pipe mode: with no TTY, each stdin line is evaluated as a cell. Interactive otherwise
   (`.reset`, `.exit`).
 

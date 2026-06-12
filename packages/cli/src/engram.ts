@@ -21,7 +21,9 @@ import { runRepl, isComplete, printEvalResult } from "./repl";
 const DEFAULT_ENDPOINT =
   process.env.ENGRAM_ENDPOINT || "wss://engram.umgbhalla.xyz";
 // Bare-kernel shared bearer key (engram-kernel auth). Passed as kernelKey to every connect().
-const API_KEY = process.env.ENGRAM_API_KEY || undefined;
+// Keep ENGRAM_API_KEY for older CLI installs, but prefer the repo/deploy name used by
+// scripts and Cloudflare secrets.
+const API_KEY = process.env.ENGRAM_KERNEL_KEY || process.env.ENGRAM_API_KEY || undefined;
 const STORE = path.join(os.homedir(), ".engram-sessions.json");
 
 interface Args {
@@ -86,6 +88,13 @@ function str(v: string | boolean | string[] | undefined): string | undefined {
   return typeof v === "string" ? v : undefined;
 }
 
+function num(v: string | boolean | string[] | undefined, fallback: number): number {
+  const s = str(v);
+  if (!s) return fallback;
+  const n = Number(s);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
 /**
  * A stable per-tty session id (so re-launching the REPL in the same terminal
  * reattaches to the same hibernated heap). Keeps the existing `repl-` scheme;
@@ -101,6 +110,14 @@ async function cmdRepl(args: Args): Promise<void> {
   const endpoint = str(args.endpoint) || DEFAULT_ENDPOINT;
   const id = str(args.session) || stableTtyId();
   const config = readConfig(args.config);
+  const keepAliveAfterActivityMs = num(
+    args["keepalive-ms"] ?? process.env.ENGRAM_REPL_KEEPALIVE_MS,
+    15 * 60_000,
+  );
+  if (keepAliveAfterActivityMs > 0 && config.durability === undefined) {
+    config.durability = "warmBuffered";
+    config.warmFlushIdleMs = config.warmFlushIdleMs ?? keepAliveAfterActivityMs;
+  }
   const trace = !!args.trace;
   // --trace uses the SDK's onEval interceptor to print a per-cell timing/metadata line to
   // stderr (kept off stdout so it never pollutes the REPL's value output / pipe mode).
@@ -116,12 +133,29 @@ async function cmdRepl(args: Args): Promise<void> {
         return r;
       }
     : undefined;
-  // Surface transport resilience (the durable session reattaches transparently).
-  const onClose = (): void => void process.stderr.write("\x1b[2m· connection dropped — reconnecting…\x1b[22m\n");
-  const onReconnect = (): void => void process.stderr.write("\x1b[2m· reconnected\x1b[22m\n");
+  // Surface only genuinely unexpected transport churn. The default REPL mode deliberately
+  // rotates sockets between cells while keeping the durable session heap intact.
+  const noisyTransport = keepAliveAfterActivityMs === 0;
+  const onClose = noisyTransport
+    ? (): void => void process.stderr.write("\x1b[2m· connection dropped — reconnecting…\x1b[22m\n")
+    : undefined;
+  const onReconnect = noisyTransport
+    ? (): void => void process.stderr.write("\x1b[2m· reconnected\x1b[22m\n")
+    : undefined;
   let session: EngramSession;
   try {
-    session = await connect({ url: endpoint, session: id, config, kernelKey: API_KEY, throwOnError: false, WebSocket, onEval, onClose, onReconnect });
+    session = await connect({
+      url: endpoint,
+      session: id,
+      config,
+      kernelKey: API_KEY,
+      throwOnError: false,
+      WebSocket,
+      onEval,
+      onClose,
+      onReconnect,
+      keepAliveAfterActivityMs,
+    });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error(`could not connect to ${endpoint}`);

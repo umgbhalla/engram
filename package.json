@@ -15,6 +15,9 @@
     "endpoints:check": "node scripts/check-deployed-endpoints.mjs",
     "smoke:live": "node scripts/smoke-live.mjs",
     "telemetry:probe": "node scripts/telemetry-probe.mjs",
+    "stress:single": "node scripts/stress-single-instance.mjs",
+    "hammer:single": "node scripts/hammer-single-connection.mjs",
+    "probe:warm-buffered": "node scripts/probe-warm-buffered.mjs",
     "build:sdk": "bun run --filter @engram/sdk build",
     "build:cli": "bun run --filter @engram/cli build",
     "build:ui": "bun run --filter @engram/ui-app build"

@@ -19,6 +19,29 @@ Useful knobs:
     bun run stress:single -- --skipSequence --skipBurst --payloadKb 64,256,512,1024 --out scratch/stress/payloads.json
     bun run stress:single -- --memoryMb 16 --memoryChunkMb 1 --out scratch/stress/memory-16mb.json
 
+scripts/hammer-single-connection.mjs is the focused SDK/transport hammer. It uses ONE
+EngramSession/WebSocket and intentionally queues many concurrent eval promises through the SDK,
+then measures warm eval and warm TimeoutError latency distributions.
+
+scripts/probe-warm-buffered.mjs is the foreground-zero checkpointing probe. It creates a
+warmBuffered session, runs 5 continuous evals, verifies status reports dirty live state before
+flush, explicitly flushes the dirty heap, evicts, then verifies the flushed value restores from the
+durable checkpoint.
+
+Default run:
+
+    bun run hammer:single -- --out scratch/stress/hammer-single.json --markdown scratch/stress/hammer-single.md
+    bun run probe:warm-buffered -- --out scratch/stress/warm-buffered.json
+
+Default gates:
+
+- 64 concurrent queued eval promises on a single connection must commit exactly once each, in order,
+  with no duplicate side effects; end-to-end queue p50/p95/p99 is recorded as pressure evidence.
+- 40 warm eval samples report p50/p95/p99.
+- 16 warm timeout samples must all return typed TimeoutError, with timeout p95 <= 10000 ms.
+- Multi-turn keepalive uses a 10000 ms warm window with 6000 ms gaps and must not reconnect inside
+  the under-window gaps.
+
 Safety defaults:
 
 - Fresh session IDs; no deploys and no global Cloudflare mutations.

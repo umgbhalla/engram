@@ -23,6 +23,7 @@
   ],
   "sideEffects": false,
   "scripts": {
+    "test": "bun test test",
     "typecheck": "tsc --noEmit",
     "build": "tsc --noEmit && esbuild src/index.ts --bundle --format=esm --platform=neutral --target=es2022 --external:node:* --outfile=dist/index.mjs && esbuild src/effect.ts --bundle --format=esm --platform=neutral --target=es2022 --external:node:* --external:effect --outfile=dist/effect.mjs && tsc --emitDeclarationOnly --outDir dist",
     "prepublishOnly": "npm run build"

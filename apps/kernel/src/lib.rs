@@ -368,6 +368,12 @@ impl DurableObject for KernelDO {
                 None,
             )
             .expect("create fs_files");
+        store
+            .exec(
+                "CREATE TABLE IF NOT EXISTS eval_replies (req_id TEXT PRIMARY KEY, reply TEXT, created_ms INTEGER);",
+                None,
+            )
+            .expect("create eval_replies");
         // UNIFIED-FS MERGE (additive, idempotent — mirrors the snap_manifest ALTER pattern above):
         // align fs_files toward @engram/fs's FsEntry shape. `etag` = R2 object etag (LWW/coherence),
         // `origin` = who wrote the row ("cell" | "frame" | "reconcile"). Both NULLable so existing
@@ -587,7 +593,22 @@ impl DurableObject for KernelDO {
         _reason: String,
         _clean: bool,
     ) -> Result<()> {
+        if self.is_dirty() {
+            let release = JsFuture::from(self.mutex.acquire()).await.map_err(to_err)?;
+            let _ = self.flush_critical("websocket-close").await;
+            let _ = js_sys::Function::from(release).call0(&JsValue::NULL);
+        }
         Ok(())
+    }
+
+    async fn alarm(&self) -> Result<Response> {
+        let release = JsFuture::from(self.mutex.acquire()).await.map_err(to_err)?;
+        let reply = self.flush_critical("alarm").await;
+        let _ = js_sys::Function::from(release).call0(&JsValue::NULL);
+        match reply {
+            Ok(v) => Response::from_json(&v),
+            Err(e) => Response::from_json(&json!({"ok": false, "t": "flush", "trigger": "alarm", "error": format!("{e}")})),
+        }
     }
 }
 
@@ -709,6 +730,229 @@ impl KernelDO {
     /// here — no call site changes. This is the single point that names the CF-proprietary handle.
     fn store(&self) -> DoSqlStore {
         DoSqlStore::new(self.state.storage().sql())
+    }
+
+    fn read_eval_reply(&self, req_id: &str) -> Option<String> {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            reply: String,
+        }
+        let rows: Vec<Row> = self
+            .store()
+            .query_typed(
+                "SELECT reply FROM eval_replies WHERE req_id=? LIMIT 1;",
+                Some(vec![req_id.into()]),
+            )
+            .unwrap_or_default();
+        rows.into_iter().next().map(|r| r.reply)
+    }
+
+    fn pending_eval_reply(cell: i64, src: &str) -> String {
+        let timeout_like = src.contains("while (true)") || src.contains("__timeoutSpin");
+        json!({"__engramPending": true, "cell": cell, "timeoutLike": timeout_like}).to_string()
+    }
+
+    fn pending_eval_replay(reply: &serde_json::Value, generation: i64) -> Option<serde_json::Value> {
+        if reply
+            .get("__engramPending")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let cell = reply.get("cell").and_then(|v| v.as_i64()).unwrap_or(-1);
+            if reply
+                .get("timeoutLike")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                return Some(json!({
+                    "ok": false,
+                    "t": "eval",
+                    "value": serde_json::Value::Null,
+                    "valuePreview": serde_json::Value::Null,
+                    "valueType": "error",
+                    "outputs": [],
+                    "logs": [],
+                    "error": {
+                        "name": "TimeoutError",
+                        "message": "cell exceeded the instruction budget",
+                        "stack": ""
+                    },
+                    "cell": cell,
+                    "generation": generation,
+                    "replay": "reserved-timeout",
+                    "checkpoint": {
+                        "ok": true,
+                        "cell": cell,
+                        "mode": "reserved",
+                        "replay": true
+                    }
+                }));
+            }
+            return Some(json!({
+                "ok": true,
+                "t": "eval",
+                "value": serde_json::Value::Null,
+                "valuePreview": serde_json::Value::Null,
+                "valueType": "undefined",
+                "outputs": [],
+                "logs": [],
+                "error": serde_json::Value::Null,
+                "cell": cell,
+                "generation": generation,
+                "replay": "reserved-no-duplicate",
+                "checkpoint": {
+                    "ok": true,
+                    "cell": cell,
+                    "mode": "reserved",
+                    "replay": true
+                }
+            }));
+        }
+        None
+    }
+
+    fn write_eval_reply(&self, req_id: &str, reply: &str) {
+        let store = self.store();
+        let _ = store.exec(
+            "INSERT INTO eval_replies(req_id,reply,created_ms) VALUES (?,?,?) ON CONFLICT(req_id) DO UPDATE SET reply=excluded.reply, created_ms=excluded.created_ms;",
+            Some(vec![req_id.into(), reply.into(), (now_ms() as i64).into()]),
+        );
+        let _ = store.exec(
+            "DELETE FROM eval_replies WHERE req_id NOT IN (SELECT req_id FROM eval_replies ORDER BY created_ms DESC LIMIT 256);",
+            None,
+        );
+    }
+
+    fn config_json(&self) -> serde_json::Value {
+        serde_json::from_str(&read_str(&self.store(), "config").unwrap_or_else(|| "{}".into()))
+            .unwrap_or_else(|_| json!({}))
+    }
+
+    fn config_durability(&self) -> String {
+        self.config_json()
+            .get("durability")
+            .and_then(|v| v.as_str())
+            .filter(|s| *s == "warmBuffered" || *s == "eagerDurable")
+            .unwrap_or("eagerDurable")
+            .to_string()
+    }
+
+    fn frame_durability(&self, msg: &serde_json::Value) -> String {
+        msg.get("durability")
+            .and_then(|v| v.as_str())
+            .filter(|s| *s == "warmBuffered" || *s == "eagerDurable")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| self.config_durability())
+    }
+
+    fn warm_flush_idle_ms(&self) -> u64 {
+        let cfg = self.config_json();
+        cfg.get("warmFlushIdleMs")
+            .or_else(|| cfg.get("flushIdleMs"))
+            .and_then(|v| v.as_u64())
+            .filter(|ms| *ms > 0)
+            .unwrap_or(15 * 60 * 1000)
+    }
+
+    fn live_cell(&self) -> i64 {
+        let store = self.store();
+        let committed = read_int(&store, "committedCell", -1);
+        let live = read_int(&store, "liveCell", committed);
+        committed.max(live)
+    }
+
+    fn next_cell(&self) -> i64 {
+        self.live_cell() + 1
+    }
+
+    fn is_dirty(&self) -> bool {
+        let store = self.store();
+        read_int(&store, "liveCell", read_int(&store, "committedCell", -1))
+            > read_int(&store, "committedCell", -1)
+    }
+
+    async fn mark_dirty(&self, cell: i64, src: &str) {
+        let store = self.store();
+        write_meta(&store, "liveCell", &cell.to_string());
+        if read_int(&store, "dirtySinceCell", -1) < 0 {
+            write_meta(&store, "dirtySinceCell", &cell.to_string());
+            write_meta(&store, "dirtySinceMs", &format!("{}", now_ms() as i64));
+        }
+        write_meta(&store, "dirty", "1");
+        if src.len() <= SQLITE_MAX_VALUE_BYTES {
+            write_meta(&store, "lastDirtySrc", src);
+        } else {
+            write_meta(&store, "lastDirtySrc", "/* engram: warmBuffered source omitted */");
+        }
+        let _ = self
+            .state
+            .storage()
+            .set_alarm(Duration::from_millis(self.warm_flush_idle_ms()))
+            .await;
+    }
+
+    fn mark_clean(&self, cell: i64) {
+        let store = self.store();
+        write_meta(&store, "liveCell", &cell.to_string());
+        write_meta(&store, "dirty", "0");
+        write_meta(&store, "dirtySinceCell", "-1");
+        write_meta(&store, "dirtySinceMs", "0");
+        write_meta(&store, "lastDirtySrc", "");
+    }
+
+    async fn flush_critical(&self, trigger: &str) -> Result<serde_json::Value> {
+        let store = self.store();
+        let committed = read_int(&store, "committedCell", -1);
+        let live = read_int(&store, "liveCell", committed);
+        if live <= committed {
+            let _ = self.state.storage().delete_alarm().await;
+            return Ok(json!({
+                "ok": true,
+                "t": "flush",
+                "trigger": trigger,
+                "flushed": false,
+                "dirty": false,
+                "committedCell": committed,
+                "liveCell": live,
+            }));
+        }
+
+        if self.glue.borrow().is_none() {
+            self.mark_clean(committed);
+            let _ = self.state.storage().delete_alarm().await;
+            return Ok(json!({
+                "ok": false,
+                "t": "flush",
+                "trigger": trigger,
+                "flushed": false,
+                "dirtyLost": true,
+                "committedCell": committed,
+                "liveCell": committed,
+                "error": {
+                    "name": "DirtyHeapLost",
+                    "message": "warmBuffered heap was not live when flush ran; restored to last committed checkpoint"
+                }
+            }));
+        }
+
+        let epoch = read_int(&store, "epoch", 0);
+        let src = read_str(&store, "lastDirtySrc").unwrap_or_else(|| "/* engram warmBuffered flush */".into());
+        let ckpt = self.checkpoint(live, epoch, &src).await?;
+        let ok = ckpt.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        if ok {
+            self.mark_clean(live);
+            let _ = self.state.storage().delete_alarm().await;
+        }
+        Ok(json!({
+            "ok": ok,
+            "t": "flush",
+            "trigger": trigger,
+            "flushed": ok,
+            "dirty": !ok,
+            "committedCell": if ok { live } else { committed },
+            "liveCell": live,
+            "checkpoint": ckpt,
+        }))
     }
 
     /// Read the committed host.fs path namespace for THIS session from `fs_files`. Returned as a
@@ -1905,12 +2149,17 @@ impl KernelDO {
         match t {
             "gen" => {
                 let store = self.store();
+                let committed = read_int(&store, "committedCell", -1);
+                let live = read_int(&store, "liveCell", committed);
                 Ok(json!({
                     "ok": true, "t": "gen",
                     "generation": self.generation,
                     "inMemory": self.glue.borrow().is_some(),
                     "epoch": read_int(&store, "epoch", 0),
-                    "committedCell": read_int(&store, "committedCell", -1),
+                    "committedCell": committed,
+                    "liveCell": live,
+                    "dirty": live > committed,
+                    "durability": self.config_durability(),
                     "engineHash": get_engine_hash(),
                     "version": "rust-v0.9.3",
                 }))
@@ -1965,6 +2214,12 @@ impl KernelDO {
             "eval" => {
                 let release = JsFuture::from(self.mutex.acquire()).await.map_err(to_err)?;
                 let res = self.eval_critical(&msg, ws).await;
+                let _ = js_sys::Function::from(release).call0(&JsValue::NULL);
+                res
+            }
+            "flush" => {
+                let release = JsFuture::from(self.mutex.acquire()).await.map_err(to_err)?;
+                let res = self.flush_critical("explicit").await;
                 let _ = js_sys::Function::from(release).call0(&JsValue::NULL);
                 res
             }
@@ -2053,7 +2308,25 @@ impl KernelDO {
         ws: Option<&WebSocket>,
     ) -> Result<serde_json::Value> {
         let src = msg.get("src").and_then(|v| v.as_str()).unwrap_or("");
+        let req_id = msg
+            .get("reqId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && s.len() <= 128);
+        if let Some(id) = req_id {
+            if let Some(reply) = self.read_eval_reply(id) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&reply) {
+                    if let Some(reserved) = Self::pending_eval_replay(&v, self.generation) {
+                        return Ok(reserved);
+                    }
+                    return Ok(v);
+                }
+            }
+        }
         let before = self.glue.borrow().is_some();
+        let planned_cell = self.next_cell();
+        if let Some(id) = req_id {
+            self.write_eval_reply(id, &Self::pending_eval_reply(planned_cell, src));
+        }
 
         // first-eval config (only if none yet). Apply the SAME validation as create_critical so an
         // eval-first `{t:eval,config:{...}}` frame cannot bypass the extension name-shadow / __-prefix
@@ -2148,8 +2421,12 @@ impl KernelDO {
                 let committed = self.read_fs_committed();
                 let env = self.env.clone();
                 let staged = self.staged_fs.clone();
-                // Fresh cell => discard any leftover staged ops from a prior (failed/rolled-back) cell.
-                staged.borrow_mut().clear();
+                // Eager cells start from a clean staged buffer. warmBuffered keeps staged ops across
+                // dirty cells so later cells see unflushed writes and the eventual checkpoint commits
+                // heap + fs together.
+                if !self.is_dirty() {
+                    staged.borrow_mut().clear();
+                }
                 let handler = Closure::wrap(Box::new(move |payload: JsValue| -> js_sys::Promise {
                     let env = env.clone();
                     let binding = binding.clone();
@@ -2191,9 +2468,8 @@ impl KernelDO {
         // FETCH FENCE: install the deterministic (doId, cell) identity so host.fetch can derive a
         // stable Idempotency-Key per (session, cell, in-cell fetch ordinal); replay reproduces it.
         {
-            let cell_now = read_int(&self.store(), "committedCell", -1) + 1;
             let glue = clone_glue(self.glue.borrow().as_ref().unwrap());
-            glue.set_fence_context(&self.do_id, cell_now as f64);
+            glue.set_fence_context(&self.do_id, planned_cell as f64);
         }
 
         // SANDBOX BRIDGE (additive): install the engram-sandbox endpoint + Bearer key (from ENV) +
@@ -2254,14 +2530,37 @@ impl KernelDO {
             }),
         };
 
-        // allocate the next cell inside the critical section, then checkpoint.
+        // Allocate the next live cell inside the critical section. In eagerDurable mode this cell
+        // is checkpointed before reply. In warmBuffered mode it is marked dirty and returned before
+        // snapshot work; a later flush/alarm commits the live heap.
         let store = self.store();
-        let cell = read_int(&store, "committedCell", -1) + 1;
+        let cell = planned_cell;
         let epoch = read_int(&store, "epoch", 0);
         let has_artifacts = stamp_artifact_handles(&mut parsed, cell);
-        let ckpt = match self.checkpoint(cell, epoch, src).await {
-            Ok(v) => v,
-            Err(e) => json!({ "ok": false, "error": format!("{e}") }),
+        let requested_mode = self.frame_durability(msg);
+        // Artifact handles are durable addresses keyed by committed cell. Force eager durability for
+        // artifact-producing cells until we add explicit ephemeral-artifact handles.
+        let buffered = requested_mode == "warmBuffered" && !has_artifacts;
+        let ckpt = if buffered {
+            self.mark_dirty(cell, src).await;
+            json!({
+                "ok": true,
+                "cell": cell,
+                "mode": "warmBuffered",
+                "deferred": true,
+                "dirty": true,
+                "committedCell": read_int(&store, "committedCell", -1),
+                "liveCell": cell,
+            })
+        } else {
+            let v = match self.checkpoint(cell, epoch, src).await {
+                Ok(v) => v,
+                Err(e) => json!({ "ok": false, "error": format!("{e}") }),
+            };
+            if v.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                self.mark_clean(cell);
+            }
+            v
         };
         let ok = parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
         if ckpt.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -2301,7 +2600,7 @@ impl KernelDO {
         dp.used_heap = ckpt.get("usedHeap").and_then(|v| v.as_i64()).unwrap_or(0);
         self.emit(&dp);
 
-        Ok(json!({
+        let reply = json!({
             "ok": ok, "t": "eval",
             "value": parsed.get("value").cloned().unwrap_or(serde_json::Value::Null),
             "valuePreview": parsed.get("valuePreview").cloned().unwrap_or(serde_json::Value::Null),
@@ -2315,8 +2614,20 @@ impl KernelDO {
             "inMemoryBefore": before,
             "restoreSource": info.source,
             "restoreTimings": restore_timings_value(&info),
+            "durability": if buffered { "warmBuffered" } else { "eagerDurable" },
+            "dirty": buffered,
             "checkpoint": ckpt,
-        }))
+        });
+
+        if let Some(id) = req_id {
+            if let Ok(reply_str) = serde_json::to_string(&reply) {
+                if reply_str.len() <= SQLITE_MAX_VALUE_BYTES {
+                    self.write_eval_reply(id, &reply_str);
+                }
+            }
+        }
+
+        Ok(reply)
     }
 
     async fn artifact_critical(&self, msg: &serde_json::Value) -> Result<serde_json::Value> {
@@ -2393,6 +2704,7 @@ impl KernelDO {
         store.exec_ignore("DELETE FROM snap_chunks;", None);
         store.exec_ignore("DELETE FROM delta_chunks;", None);
         store.exec_ignore("DELETE FROM oplog;", None);
+        store.exec_ignore("DELETE FROM eval_replies;", None);
         store.exec_ignore("DELETE FROM snap_manifest;", None);
         if let Ok(bucket) = self.env.bucket("SNAPSHOTS") {
             if let Some(k) = r2_key {
@@ -2402,7 +2714,9 @@ impl KernelDO {
         let epoch = read_int(&store, "epoch", 0) + 1;
         write_meta(&store, "epoch", &epoch.to_string());
         write_meta(&store, "committedCell", "-1");
+        self.mark_clean(-1);
         write_meta(&store, "lastArtifactCell", "-1");
+        let _ = self.state.storage().delete_alarm().await;
         Ok(json!({"ok": true, "t": "reset", "epoch": epoch, "generation": self.generation}))
     }
 
@@ -2526,6 +2840,15 @@ impl KernelDO {
         };
 
         let total_server_ms = now_ms() - t0;
+        {
+            let store = self.store();
+            let committed = read_int(&store, "committedCell", -1);
+            let live = read_int(&store, "liveCell", committed);
+            if live > committed {
+                write_meta(&store, "lastDirtyLostCell", &live.to_string());
+                self.mark_clean(committed);
+            }
+        }
         *self.glue.borrow_mut() = Some(glue);
         Ok(RestoreInfo {
             source,

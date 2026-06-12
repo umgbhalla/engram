@@ -137,6 +137,12 @@ export interface RuntimeEnv {
 /** A namespaced bundle of host functions registered together via {@link EngramSession.defineHostModule}. */
 export type HostModule = Record<string, (...args: any[]) => unknown | Promise<unknown>>;
 
+export interface EvalOptions {
+  throwOnError?: boolean;
+  timeoutMs?: number;
+  durability?: "eagerDurable" | "warmBuffered";
+}
+
 /**
  * An eval interceptor (middleware) — see {@link ConnectOptions.onEval}. Wraps every
  * {@link EngramSession.eval}: receives the cell `code` and resolved `opts`, and a `next`
@@ -154,7 +160,7 @@ export type HostModule = Record<string, (...args: any[]) => unknown | Promise<un
  */
 export type EvalInterceptor = (
   code: string,
-  opts: { throwOnError?: boolean; timeoutMs?: number },
+  opts: EvalOptions,
   next: (code: string) => Promise<EvalResult>,
 ) => Promise<EvalResult>;
 
@@ -240,6 +246,13 @@ export interface EngramConfig {
   /** Capture `console.*` output per cell (default true). */
   capture?: boolean;
   /**
+   * Durability policy. `eagerDurable` checkpoints before every eval reply. `warmBuffered`
+   * returns from the live heap first and flushes the checkpoint after idle/explicit flush/close.
+   */
+  durability?: "eagerDurable" | "warmBuffered";
+  /** Idle window before a warmBuffered dirty heap is flushed by alarm. Default 900000 ms. */
+  warmFlushIdleMs?: number;
+  /**
    * Enable the Tier-2 sandbox bridge: opt this session into the engram-sandbox container worker
    * over the SHARED R2 VFS (the container mounts this session's `fs/<doId>/` prefix as `/workspace`).
    * When `true`, the `s.sandbox.*` SDK surface (and the in-cell `host.sandbox.*` effect) become
@@ -316,6 +329,12 @@ export interface ConnectOptions {
   throwOnError?: boolean;
   /** Auto-reconnect with backoff on transport drop (default true). */
   autoReconnect?: boolean;
+  /**
+   * Keep the bare-kernel WebSocket warm for this many milliseconds after each user
+   * request by sending lightweight ping frames. This delays platform hibernation
+   * during interactive pauses without disabling sleep indefinitely.
+   */
+  keepAliveAfterActivityMs?: number;
   /** Per-request timeout in ms (default 60000). */
   timeoutMs?: number;
   /** Override the WebSocket implementation (Node: pass `(await import('ws')).default`). */
@@ -556,6 +575,10 @@ class WsTransport implements Transport {
   private hostFns = new Map<string, HostFn>();
   /** The resolver/rejecter for the single in-flight rpc on this socket, if any. */
   private pending: { resolve: (v: any) => void; reject: (e: any) => void; timer: any } | null = null;
+  private keepAliveUntil = 0;
+  private keepAliveTimer: ReturnType<typeof setTimeout> | null = null;
+  private suppressNextReconnect = false;
+  private ignoreCloseUntil = 0;
 
   /**
    * True once a one-shot injected `socket` has been consumed. A one-shot socket cannot be
@@ -581,6 +604,8 @@ class WsTransport implements Transport {
       onReconnect?: () => void;
       /** Fired on an unexpected socket drop (listeners are detached before deliberate closes). */
       onClose?: () => void;
+      /** Keep the socket/DO warm briefly after user activity. */
+      keepAliveAfterActivityMs?: number;
     },
   ) {}
 
@@ -607,7 +632,9 @@ class WsTransport implements Transport {
     const data = ev && ev.data !== undefined ? ev.data : ev;
     let msg: any;
     try {
-      msg = JSON.parse(typeof data === "string" ? data : data.toString());
+      const text = typeof data === "string" ? data : data.toString();
+      if (text === "pong") return;
+      msg = JSON.parse(text);
     } catch {
       // Malformed frame. If it was meant to be the rpc reply, surface a typed error.
       const p = this.pending;
@@ -638,11 +665,18 @@ class WsTransport implements Transport {
   };
 
   private onClose = (): void => {
+    if (Date.now() < this.ignoreCloseUntil) {
+      return;
+    }
     const p = this.pending;
+    this.ws = null;
     if (p) {
       this.pending = null;
       clearTimeout(p.timer);
       p.reject(new EngramError("__ws_closed__"));
+    }
+    if (this.opts.keepAliveAfterActivityMs) {
+      return;
     }
     try {
       this.opts.onClose?.();
@@ -677,6 +711,7 @@ class WsTransport implements Transport {
       /* ignore */
     }
     try {
+      this.ignoreCloseUntil = Date.now() + 1000;
       ws.close();
     } catch {
       /* ignore */
@@ -693,6 +728,47 @@ class WsTransport implements Transport {
       ws.on("message", this.onMessage);
       ws.on("close", this.onClose);
     }
+  }
+
+  private canRetryFrame(frame: Frame): boolean {
+    return (
+      frame.t === "ping" ||
+      frame.t === "gen" ||
+      frame.t === "create" ||
+      (frame.t === "eval" && typeof frame.reqId === "string" && frame.reqId.length > 0 && frame.reqId.length <= 128)
+    );
+  }
+
+  private clearKeepAlive(): void {
+    if (this.keepAliveTimer) {
+      clearTimeout(this.keepAliveTimer);
+      this.keepAliveTimer = null;
+    }
+    this.keepAliveUntil = 0;
+  }
+
+  private armKeepAlive(): void {
+    const windowMs = Math.max(0, this.opts.keepAliveAfterActivityMs ?? 0);
+    if (!windowMs || this.closed) return;
+    this.keepAliveUntil = Math.max(this.keepAliveUntil, Date.now() + windowMs);
+    if (this.keepAliveTimer) return;
+
+    const tick = (): void => {
+      this.keepAliveTimer = null;
+      if (this.closed) return;
+      const remaining = this.keepAliveUntil - Date.now();
+      if (remaining <= 0) {
+        this.suppressNextReconnect = true;
+        this.dropSocket();
+        return;
+      }
+
+      const delay = Math.min(1000, Math.max(100, this.keepAliveUntil - Date.now()));
+      this.keepAliveTimer = setTimeout(tick, delay);
+    };
+
+    const initialDelay = Math.min(100, Math.max(25, Math.floor(windowMs / 4)));
+    this.keepAliveTimer = setTimeout(tick, initialDelay);
   }
 
   private async open(): Promise<void> {
@@ -719,7 +795,7 @@ class WsTransport implements Transport {
         const ws = new this.WS(this.wsUrl);
         this.ws = ws;
         const ok = () => resolve();
-        const fail = (e: any) => reject(e instanceof Error ? e : new EngramError("ws connect failed"));
+        const fail = () => reject(new EngramError("ws connect failed"));
         if (ws.addEventListener) {
           ws.addEventListener("open", ok, { once: true });
           ws.addEventListener("error", fail, { once: true });
@@ -748,6 +824,8 @@ class WsTransport implements Transport {
       } catch {
         /* user callback must not break the connect path */
       }
+    } else if (this.suppressNextReconnect) {
+      this.suppressNextReconnect = false;
     } else {
       try {
         this.opts.onReconnect?.();
@@ -756,6 +834,16 @@ class WsTransport implements Transport {
       }
     }
   }
+
+  private async refreshSocketBeforeUserFrame(frame: Frame): Promise<void> {
+    if (frame.t === "ping" || !this.opts.keepAliveAfterActivityMs || this.closed) return;
+    if (this.ws && this.ws.readyState !== 1) {
+      this.suppressNextReconnect = true;
+      this.dropSocket();
+      await sleep(25);
+    }
+  }
+
 
   /**
    * Send one frame and await its rpc reply. Does NOT install its own message listener —
@@ -788,26 +876,36 @@ class WsTransport implements Transport {
   request(frame: Frame, timeoutMs: number): Promise<any> {
     const run = async (): Promise<any> => {
       try {
+        await this.refreshSocketBeforeUserFrame(frame);
         await this.open();
-        return await this.rawRequest(frame, timeoutMs);
+        const reply = await this.rawRequest(frame, timeoutMs);
+        if (frame.t !== "ping") {
+          this.armKeepAlive();
+        }
+        return reply;
       } catch (e: any) {
         const dropped = e instanceof EngramError && e.message === "__ws_closed__";
+        const connectFailed = e instanceof EngramError && e.message === "ws connect failed";
         // A one-shot injected socket cannot be reopened — never attempt reconnect for it.
         const reconnectable = !this.opts.socket || !!this.opts.openSocket;
-        if (this.opts.autoReconnect && reconnectable && !this.closed && dropped) {
+        if (this.opts.autoReconnect && reconnectable && !this.closed && (dropped || connectFailed) && this.canRetryFrame(frame)) {
           // Detach + close the old socket before replacing it, so its persistent
           // message/close handlers can't fire into the new socket's state.
           this.dropSocket();
           const backoff = Math.min(2000, 100 * 2 ** this.reconnects++);
           await sleep(backoff);
           await this.open();
-          return await this.rawRequest(frame, timeoutMs);
+          const reply = await this.rawRequest(frame, timeoutMs);
+          if (frame.t !== "ping") {
+            this.armKeepAlive();
+          }
+          return reply;
         }
-        if (dropped) {
+        if (dropped || connectFailed) {
           if (this.opts.socket && !this.opts.openSocket) {
             throw new EngramError("injected socket closed and cannot be reopened (use openSocket for reconnect)");
           }
-          throw new EngramError("connection closed before reply");
+          throw new EngramError(dropped ? "connection closed before reply" : "ws connect failed");
         }
         throw e;
       }
@@ -822,6 +920,7 @@ class WsTransport implements Transport {
 
   close(): void {
     this.closed = true;
+    this.clearKeepAlive();
     this.dropSocket();
   }
 }
@@ -1026,6 +1125,8 @@ export class EngramSession {
 
   /** Monotonic correlation id for vfs-* frames (cosmetic — WS matches positionally, the DO echoes it back). */
   private _vfsId = 0;
+  /** Monotonic client request id for eval replay protection. */
+  private _evalReqId = 0;
 
   /**
    * Per-eval capture of the LAST `host.__engram_final(value)` hostcall. `WsTransport`
@@ -1279,7 +1380,7 @@ export class EngramSession {
    * @param opts `throwOnError` overrides the session default for this call; `timeoutMs` overrides the timeout.
    * @returns a typed {@link EvalResult}. Throws a typed {@link EngramError} on failure unless `throwOnError` is false.
    */
-  async eval<T = unknown, F = unknown>(code: string, opts: { throwOnError?: boolean; timeoutMs?: number } = {}): Promise<EvalResult<T, F>> {
+  async eval<T = unknown, F = unknown>(code: string, opts: EvalOptions = {}): Promise<EvalResult<T, F>> {
     // No interceptors: straight to the core (the common, zero-overhead path).
     if (!this.interceptors.length) return this._evalCore<T, F>(code, opts);
     // Build the chain inside-out: the core is the innermost `next`; each interceptor wraps it.
@@ -1293,11 +1394,14 @@ export class EngramSession {
   }
 
   /** The actual eval rpc + result normalisation, wrapped by any {@link EvalInterceptor}s. */
-  private async _evalCore<T = unknown, F = unknown>(code: string, opts: { throwOnError?: boolean; timeoutMs?: number }): Promise<EvalResult<T, F>> {
+  private async _evalCore<T = unknown, F = unknown>(code: string, opts: EvalOptions): Promise<EvalResult<T, F>> {
     // Reset the captured final before each eval; the reserved __engram_final hostfn
     // records the LAST value during this (serialised) rpc.
     this.capturedFinal = { set: false, value: undefined };
-    const reply = await this.transport.request({ t: "eval", src: code }, opts.timeoutMs ?? this.timeoutMs);
+    const reqId = this.session + ":" + Date.now().toString(36) + ":" + ++this._evalReqId;
+    const frame: Frame = { t: "eval", src: code, reqId };
+    if (opts.durability) frame.durability = opts.durability;
+    const reply = await this.transport.request(frame, opts.timeoutMs ?? this.timeoutMs);
     const result = this.normalize<T, F>(reply);
     // Surface the faithful final (crossed as hostcall args, not the value-preview path).
     result.finalSet = this.capturedFinal.set;
@@ -1689,6 +1793,11 @@ export class EngramSession {
     return this.transport.request({ t: "gen" }, this.timeoutMs);
   }
 
+  /** Flush any warmBuffered dirty live heap to the durable checkpoint store. */
+  async flush(): Promise<{ ok?: boolean; flushed?: boolean; dirty?: boolean; [k: string]: unknown }> {
+    return this.transport.request({ t: "flush" }, this.timeoutMs);
+  }
+
   /** Force-evict the in-memory kernel. The durable snapshot is kept; the next op cold-restores. */
   async evict(): Promise<void> {
     await this.transport.request({ t: "evict" }, this.timeoutMs);
@@ -1852,6 +1961,7 @@ export const Engram = {
       onConnect: opts.onConnect,
       onReconnect: opts.onReconnect,
       onClose: opts.onClose,
+      keepAliveAfterActivityMs: opts.keepAliveAfterActivityMs,
       onReady: async (raw) => {
         // AUTH FIRST: send {t:"auth",token} before anything else so a credential-less upgrade (and
         // every reconnect-after-hibernation) re-auths transparently. Idempotent on an already-authed
@@ -1872,7 +1982,8 @@ export const Engram = {
     s = new EngramSession(transport, { session, throwOnError, timeoutMs, config, bootstrap: fullBootstrap, onConsole: opts.onConsole, onEval: opts.onEval });
     applyHost(s);
     // Force the first connect (onReady applies config; onConnect fires inside the transport).
-    await transport.request({ t: "ping" }, timeoutMs).catch(() => {});
+    // Do not return a session backed by a stale socket; the caller can retry connect.
+    await transport.request({ t: "ping" }, timeoutMs);
     return s;
   },
 };
@@ -2063,7 +2174,7 @@ export class EngramClient {
   }
 
   /** Shorthand: connect-or-reuse `id`, then eval one cell against it. */
-  async eval<T = unknown, F = unknown>(id: string, code: string, opts?: { throwOnError?: boolean; timeoutMs?: number }): Promise<EvalResult<T, F>> {
+  async eval<T = unknown, F = unknown>(id: string, code: string, opts?: EvalOptions): Promise<EvalResult<T, F>> {
     const s = await this.session(id);
     return s.eval<T, F>(code, opts);
   }
