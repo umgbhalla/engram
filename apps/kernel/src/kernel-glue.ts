@@ -443,7 +443,13 @@ export function normFsPath(p: string): string {
   const out: string[] = [];
   for (const seg of String(p).split("/")) {
     if (seg === "" || seg === ".") continue;
-    if (seg === "..") { out.pop(); continue; }
+    if (seg === "..") {
+      // A `..` that pops below the session root is an escape — throw (matches norm_fs_path /
+      // @engram/fs resolve), never silently no-op back to root.
+      if (out.length === 0) throw new Error("EACCES: path escapes the session root");
+      out.pop();
+      continue;
+    }
     out.push(seg);
   }
   return "/" + out.join("/");

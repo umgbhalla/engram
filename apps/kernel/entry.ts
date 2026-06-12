@@ -70,6 +70,12 @@ export class VfsGateway extends WorkerEntrypoint<any> {
       const e = new FsPathError(`VfsGateway: bad path ${String(path)}`);
       throw e;
     }
+    if (norm === "") {
+      // The bare root (/workspace) is a directory, not a file — guard so a file op never targets
+      // the bare `fs/<doId>/` prefix key (mirrors @engram/fs liveKey EISDIR).
+      const e = new FsPathError(`VfsGateway: ${String(path)} is a directory`, "EISDIR");
+      throw e;
+    }
     return `fs/${doId}/${norm}`;
   }
   // Read a file from the shared VFS. Returns a UTF-8 string (text channel) or null if absent.
@@ -105,7 +111,9 @@ export class VfsGateway extends WorkerEntrypoint<any> {
     const root = `fs/${String(((this.ctx as any)?.props?.doId) ?? "")}/`;
     const cwd = String(((this.ctx as any)?.props?.cwd) ?? WORKSPACE_ROOT);
     const norm = resolveWs(prefix, cwd); // NO-leading-slash <rel> form (back-compat: bare-/ -> rel)
-    const r2prefix = root + norm;
+    // Append "/" for a sub-dir so the R2 prefix matches only entries UNDER it (norm "foo" must not
+    // bleed into siblings "foobar"/"foo.txt"). Root listing (norm "") stays the bare session prefix.
+    const r2prefix = norm ? `${root}${norm}/` : root;
     const listed = await this._bucket().list({ prefix: r2prefix });
     return (listed.objects || []).map((o: any) => "/" + String(o.key).slice(root.length));
   }

@@ -90,6 +90,40 @@ function parseAddr(addrOrUrl, opts) {
   return { hostname, port };
 }
 
+// Fail-closed SSRF guard at the CAPABILITY boundary (defense-in-depth — kernel-glue _socketOpen
+// also checks, but the socket provider must never connect to a loopback / link-local / private
+// target regardless of caller). Mirrors kernel-glue isBlockedSsrfHost. Returns a reason or null.
+function ssrfReason(hostname) {
+  const h = String(hostname || "").trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (!h) return "empty host";
+  if (h === "localhost" || h.endsWith(".localhost")) return "loopback";
+  if (h.endsWith(".internal") || h.endsWith(".local")) return "internal/link-local name";
+  // IPv4 literal
+  const m4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (m4) {
+    const a = +m4[1], b = +m4[2];
+    if (a === 127) return "loopback";
+    if (a === 0) return "this-host (0.0.0.0)";
+    if (a === 10) return "RFC1918 private";
+    if (a === 172 && b >= 16 && b <= 31) return "RFC1918 private";
+    if (a === 192 && b === 168) return "RFC1918 private";
+    if (a === 169 && b === 254) return "link-local (cloud metadata)";
+    if (a === 100 && b >= 64 && b <= 127) return "CGNAT (RFC6598)";
+    return null;
+  }
+  // IPv6 literal
+  if (h.includes(":")) {
+    if (h === "::1" || h === "::") return "loopback";
+    if (h.startsWith("fe80")) return "link-local";
+    if (h.startsWith("fc") || h.startsWith("fd")) return "ULA private";
+    // IPv4-mapped ::ffff:169.254.169.254 etc
+    const mapped = /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(h);
+    if (mapped) return ssrfReason(mapped[1]);
+    return null;
+  }
+  return null; // a public DNS name — allowed (the fetch/allowlist layer narrows further upstream)
+}
+
 export function makeSocketHost() {
   // handleId -> { socket, reader, writer, closed, tls }
   const map = new Map();
@@ -171,6 +205,10 @@ export function makeSocketHost() {
       const { hostname, port } = parseAddr(addrOrUrl, opts);
       if (!hostname || port == null || Number.isNaN(port)) {
         return err("SocketAddrError: could not resolve host:port from " + JSON.stringify(addrOrUrl), "EINVAL");
+      }
+      const blocked = ssrfReason(hostname);
+      if (blocked) {
+        return err("SSRFBlockedError: refusing to connect to " + hostname + " (" + blocked + ")", "EACCES");
       }
       const secureTransport = opts.secureTransport; // 'off' | 'on' | 'starttls' | undefined
       const allowHalfOpen = opts.allowHalfOpen;

@@ -795,13 +795,14 @@ globalThis.global = globalThis;
   p.config = { target_defaults: {}, variables: {} };
   p.features = { inspector: false, debug: false, uv: true, ipv6: true, tls: false, cached_builtins: true };
   // Resolve a path to an absolute /workspace-rooted form: relative -> under cwd, absolute -> under
-  // the /workspace root; `..` is clamped so it can never escape /workspace (the one fs root).
+  // the /workspace root. A `..` that would escape /workspace THROWS EACCES (matches the host
+  // norm_fs_path + @engram/fs resolve — one canonical escape semantics, no silent clamp).
   globalThis.__wsResolveAbs = function(path, cwd){
     cwd = cwd || '/workspace';
     var s = String(path == null ? '' : path);
     var base = (s.charAt(0) === '/') ? ((s === '/workspace' || s.indexOf('/workspace/') === 0) ? s : ('/workspace' + s)) : (String(cwd).replace(/\/+$/, '') + '/' + s);
     var parts = base.split('/'), out = [];
-    for (var i=0;i<parts.length;i++){ var seg = parts[i]; if (seg === '' || seg === '.') continue; if (seg === '..'){ if (out.length > 1) out.pop(); } else out.push(seg); }
+    for (var i=0;i<parts.length;i++){ var seg = parts[i]; if (seg === '' || seg === '.') continue; if (seg === '..'){ if (out.length > 1) out.pop(); else { var __e = new Error('EACCES: path escapes /workspace'); __e.code = 'EACCES'; throw __e; } } else out.push(seg); }
     if (out[0] !== 'workspace') out.unshift('workspace');
     return '/' + out.join('/');
   };
