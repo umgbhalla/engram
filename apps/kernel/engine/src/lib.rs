@@ -794,8 +794,19 @@ globalThis.global = globalThis;
   p.allowedNodeEnvironmentFlags = (typeof Set !== 'undefined') ? new Set() : { has: function(){ return false; } };
   p.config = { target_defaults: {}, variables: {} };
   p.features = { inspector: false, debug: false, uv: true, ipv6: true, tls: false, cached_builtins: true };
-  p.cwd = function(){ return globalThis.__cwd || '/'; };
-  p.chdir = function(d){ globalThis.__cwd = (typeof d === 'string' && d) ? d : '/'; };
+  // Resolve a path to an absolute /workspace-rooted form: relative -> under cwd, absolute -> under
+  // the /workspace root; `..` is clamped so it can never escape /workspace (the one fs root).
+  globalThis.__wsResolveAbs = function(path, cwd){
+    cwd = cwd || '/workspace';
+    var s = String(path == null ? '' : path);
+    var base = (s.charAt(0) === '/') ? ((s === '/workspace' || s.indexOf('/workspace/') === 0) ? s : ('/workspace' + s)) : (String(cwd).replace(/\/+$/, '') + '/' + s);
+    var parts = base.split('/'), out = [];
+    for (var i=0;i<parts.length;i++){ var seg = parts[i]; if (seg === '' || seg === '.') continue; if (seg === '..'){ if (out.length > 1) out.pop(); } else out.push(seg); }
+    if (out[0] !== 'workspace') out.unshift('workspace');
+    return '/' + out.join('/');
+  };
+  p.cwd = function(){ return globalThis.__cwd || '/workspace'; };
+  p.chdir = function(d){ globalThis.__cwd = globalThis.__wsResolveAbs((typeof d === 'string' && d) ? d : '/workspace', globalThis.__cwd || '/workspace'); return globalThis.__cwd; };
   p.umask = function(){ return 0; };
   p.getuid = function(){ return 0; }; p.getgid = function(){ return 0; };
   p.geteuid = function(){ return 0; }; p.getegid = function(){ return 0; };
@@ -2333,6 +2344,9 @@ globalThis.__vfs = globalThis.__vfs || { files: {}, dirs: { '/': true } };
   var V = globalThis.__vfs;
   var ENC = new TextEncoder(), DEC = new TextDecoder();
   function norm(p){
+    // Resolve against the session CWD (default /workspace): a relative path lands under cwd, an
+    // absolute path under the /workspace root — matching process.cwd()/chdir + the host resolver.
+    if (typeof globalThis.__wsResolveAbs === 'function') return globalThis.__wsResolveAbs(p, globalThis.__cwd || '/workspace');
     p = String(p == null ? '' : p);
     if (p[0] !== '/') p = '/' + p;
     var parts = p.split('/'), out = [];
