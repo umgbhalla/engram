@@ -15,6 +15,9 @@ const keepAliveMs = positiveInt(args.keepAliveMs, 15_000);
 const warmFlushIdleMs = positiveInt(args.warmFlushIdleMs, 5_000);
 const maxDelayMs = positiveInt(args.maxDelayMs, 2_500);
 const longDelayMs = positiveInt(args.longDelayMs, Math.min(12_000, Math.max(2_000, keepAliveMs - 3_000)));
+const burstMin = positiveInt(args.burstMin, 4);
+const burstMax = Math.max(burstMin, positiveInt(args.burstMax, 8));
+const churnKb = positiveInt(args.churnKb, 128);
 const out = args.out ? String(args.out) : "";
 
 const kernelKey = process.env.ENGRAM_KERNEL_KEY || process.env.ENGRAM_API_KEY || "";
@@ -30,7 +33,7 @@ const run = {
   startedAt: new Date().toISOString(),
   endpoint,
   session,
-  config: { iterations, seed, keepAliveMs, warmFlushIdleMs, maxDelayMs, longDelayMs },
+  config: { iterations, seed, keepAliveMs, warmFlushIdleMs, maxDelayMs, longDelayMs, burstMin, burstMax, churnKb },
   events: [],
   failures: [],
   latencies: [],
@@ -58,24 +61,31 @@ try {
 
   for (let i = 0; i < iterations; i++) {
     const roll = rng();
-    if (roll < 0.42) {
+    if (roll < 0.30) {
       await step("inc", async () => {
         const r = await timedEval("globalThis.n = (globalThis.n || 0) + 1; n");
         expected++;
         assertEq(r.result.value, expected, "inc value");
       });
-    } else if (roll < 0.56) {
+    } else if (roll < 0.42) {
       await step("read", async () => {
         const r = await timedEval("globalThis.n");
         assertEq(r.result.value, expected, "read value");
       });
-    } else if (roll < 0.68) {
+    } else if (roll < 0.52) {
       const ms = Math.floor(rng() * maxDelayMs);
       await step("delay", async () => {
         await sleep(ms);
         return { ms };
       });
-    } else if (roll < 0.78) {
+    } else if (roll < 0.60) {
+      await step("long-delay-preserve", async () => {
+        await sleep(longDelayMs);
+        const r = await timedEval("globalThis.n");
+        assertEq(r.result.value, expected, "state after repeated long warm delay");
+        return { delayMs: longDelayMs, value: r.result.value };
+      });
+    } else if (roll < 0.70) {
       await step("flush-evict-restore", async () => {
         const flush = await s.flush();
         if (flush.ok !== true) throw new Error("flush failed: " + JSON.stringify(flush));
@@ -84,7 +94,7 @@ try {
         assertEq(r.value, expected, "restore after flush");
         return { flush, restored: { value: r.value, restoreSource: r.restoreSource } };
       });
-    } else if (roll < 0.88) {
+    } else if (roll < 0.80) {
       await step("timeout-guard", async () => {
         const r = await s.eval("while (true) { globalThis.__chaosSpin = 1 }", {
           throwOnError: false,
@@ -97,7 +107,7 @@ try {
         assertEq(check.value, expected, "state after timeout");
         return { errorName: name };
       });
-    } else if (roll < 0.95) {
+    } else if (roll < 0.87) {
       await step("reconnect-after-flush", async () => {
         const flush = await s.flush();
         if (flush.ok !== true) throw new Error("flush before reconnect failed");
@@ -107,9 +117,9 @@ try {
         assertEq(r.value, expected, "state after reconnect");
         return { restored: r.value };
       });
-    } else {
+    } else if (roll < 0.94) {
       await step("burst-queue", async () => {
-        const width = 4 + Math.floor(rng() * 5);
+        const width = burstMin + Math.floor(rng() * (burstMax - burstMin + 1));
         const start = expected;
         const results = await Promise.all(Array.from({ length: width }, (_, j) =>
           timedEval("globalThis.n = (globalThis.n || 0) + 1; n").then((r) => ({ j, ...r }))
@@ -121,6 +131,16 @@ try {
           throw new Error("burst values mismatch got=" + JSON.stringify(values) + " want=" + JSON.stringify(want));
         }
         return { width, values };
+      });
+    } else {
+      await step("heap-churn", async () => {
+        const kb = 1 + Math.floor(rng() * churnKb);
+        const bytes = kb * 1024;
+        const wrote = await timedEval("globalThis.__chaosBlob = 'x'.repeat(" + bytes + "); __chaosBlob.length");
+        assertEq(wrote.result.value, bytes, "heap churn write length");
+        const deleted = await timedEval("delete globalThis.__chaosBlob; globalThis.n");
+        assertEq(deleted.result.value, expected, "state after heap churn delete");
+        return { kb, bytes };
       });
     }
   }
@@ -153,6 +173,7 @@ try {
     failures: run.failures.length,
     fatal: run.fatal,
     latency: run.latency,
+    eventCounts: counts(run.events.map((event) => event.kind)),
     lastEvents: run.events.slice(-8),
   }, null, 2));
   if (!run.ok) process.exitCode = 1;
@@ -236,6 +257,12 @@ function compactError(error) {
   return error instanceof Error
     ? { name: error.name, message: error.message, stack: error.stack }
     : { message: String(error) };
+}
+
+function counts(values) {
+  const out = {};
+  for (const value of values) out[value] = (out[value] || 0) + 1;
+  return out;
 }
 
 function round(n) {
