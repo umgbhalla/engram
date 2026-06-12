@@ -31,9 +31,9 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use worker::{
-    durable_object, event, wasm_bindgen, wasm_bindgen_futures, Delay, DurableObject, Env, Method,
-    Request, Response, Result, State, WebSocket, WebSocketIncomingMessage, WebSocketPair,
-    WebSocketRequestResponsePair,
+    durable_object, event, wasm_bindgen, wasm_bindgen_futures, Delay, DurableObject, Env, Fetch,
+    Headers, Method, Request, RequestInit, Response, Result, State, WebSocket,
+    WebSocketIncomingMessage, WebSocketPair, WebSocketRequestResponsePair,
 };
 
 #[wasm_bindgen(module = "/src/kernel-glue.mjs")]
@@ -84,6 +84,8 @@ extern "C" {
     fn set_fs_handler(this: &GlueKernel, handler: &JsValue);
     #[wasm_bindgen(method, js_name = setFenceContext)]
     fn set_fence_context(this: &GlueKernel, do_id: &str, cell: f64);
+    #[wasm_bindgen(method, js_name = setSandboxConfig)]
+    fn set_sandbox_config(this: &GlueKernel, url: &str, key: &str, do_id: &str, enabled: bool);
     #[wasm_bindgen(method, js_name = setExtAeSink)]
     fn set_ext_ae_sink(this: &GlueKernel, sink: &JsValue);
     #[wasm_bindgen(method, js_name = dump)]
@@ -106,6 +108,31 @@ extern "C" {
 
     #[wasm_bindgen(js_name = getEngineHash)]
     fn get_engine_hash() -> String;
+
+    // WORKER REGISTRY: run a registered, content-addressed source in a FRESH Dynamic-Worker-Loader
+    // isolate. STANDALONE (not a GlueKernel method) — invoke never touches the VM heap, so it works
+    // without a live kernel. The Rust DO does NOT call env.LOADER itself (LOADER is JS-shaped:
+    // object-literal callback, module dict, stub.getEntrypoint, Request/Response); it routes here.
+    //   env        = the raw DO Env (self.env.as_ref()) → carries env.LOADER + env.SNAPSHOTS.
+    //   ctx        = the DO ctx JsValue (for ctx.exports.VfsGateway), or NULL if unavailable
+    //                → glue FAILS CLOSED (RegistryUnavailableError) rather than leaking the bucket.
+    //   do_id      = trusted DO id (state.id().to_string()) → drives the warm-cache codeId AND the
+    //                fs/<doId>/ prefix; the dynamic worker can NEVER choose either.
+    //   hash       = lowercase-hex sha256(source); used as the content-addressed warm-cache key.
+    //   source     = the registered JS source (ESM); delivered as the "user.js" module.
+    //   input_json = the invoke input (JSON string) POSTed to the harness.
+    //   opts_json  = {timeoutMs,cpuMs} (the DO races timeoutMs; cpuMs is the WorkerCode limit).
+    // Returns a JSON string: the harness envelope {ok, output|error}. Never throws on user error.
+    #[wasm_bindgen(js_name = registryInvoke)]
+    fn registry_invoke(
+        env: &JsValue,
+        ctx: &JsValue,
+        do_id: &str,
+        hash: &str,
+        source: &str,
+        input_json: &str,
+        opts_json: &str,
+    ) -> js_sys::Promise;
 
     // host-callback bridge: resolve a parked VM host call from a {t:hostcall-result}
     // frame. Called from websocket_message OUTSIDE the eval mutex (see DEADLOCK note).
@@ -341,6 +368,23 @@ impl DurableObject for KernelDO {
                 None,
             )
             .expect("create fs_files");
+        // UNIFIED-FS MERGE (additive, idempotent — mirrors the snap_manifest ALTER pattern above):
+        // align fs_files toward @engram/fs's FsEntry shape. `etag` = R2 object etag (LWW/coherence),
+        // `origin` = who wrote the row ("cell" | "frame" | "reconcile"). Both NULLable so existing
+        // rows + the staged-commit core need no migration; they enrich the manifest-export only.
+        store.exec_ignore("ALTER TABLE fs_files ADD COLUMN etag TEXT;", None);
+        store.exec_ignore("ALTER TABLE fs_files ADD COLUMN origin TEXT;", None);
+        // WORKER REGISTRY (content-addressed Dynamic-Worker-Loader source store). One row per
+        // (hash) this SESSION has registered. The R2 object `workers/<hash>.js` is the GLOBAL,
+        // immutable source body (dedup across sessions). This per-session index is the INVOKE GATE:
+        // a session may only invoke a hash it has a row for (register is cheap + idempotent), so an
+        // authed session cannot run an arbitrary source whose hash it merely learned.
+        store
+            .exec(
+                "CREATE TABLE IF NOT EXISTS registry_workers (hash TEXT PRIMARY KEY, bytes INTEGER, created_ms INTEGER);",
+                None,
+            )
+            .expect("create registry_workers");
 
         let cur = read_int(&store, "generation", 0);
         let generation = cur + 1;
@@ -547,10 +591,26 @@ impl DurableObject for KernelDO {
     }
 }
 
+/// Minimal percent-encoder for a single query-param VALUE (sandbox readFile/list paths). Encodes
+/// everything that is not an unreserved char so a path with spaces / `&` / `?` can't break the query.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
 /// V0.5 OBSERVABILITY parity: one Analytics Engine datapoint per op. Mirrors the JS
 /// kernel (apps/kernel/src/lib.rs): blobs op/restoreSource/store/errorName/valueType/label,
 /// doubles totalServerMs/readMs/sizeRaw/sizeGz/usedHeap/cell/generation/ok. Fire-and-forget.
 #[derive(Default)]
+
 struct Datapoint {
     op: String,
     restore_source: String,
@@ -679,6 +739,54 @@ impl KernelDO {
         Rc::new(map)
     }
 
+    /// UNIFIED-FS MERGE: write the committed file index to R2 at `fs/<doId>/.engram/manifest.json`
+    /// (the @engram/fs `manifestKey()`), mirroring `EngramFs.exportManifest`'s shape so an EXTERNAL
+    /// consumer (a container, another binding) can read the session's file namespace + fsVersion
+    /// straight from R2 with NO SQLite access. Called AFTER flush_staged_fs at each checkpoint (both
+    /// the delta and full-base commit paths) and after reconcile_fs_files. Best-effort: a failure here
+    /// must NEVER fail the checkpoint (the manifest is a convenience export, not the coherence
+    /// authority — fs_files remains the truth). The shape matches index.ts:236-252:
+    ///   { doId, fsVersion, exportedMs, files:[{path,size,etag,sha256,origin}] } (sha256 null today).
+    async fn export_manifest(&self) {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            path: String,
+            size: i64,
+            etag: Option<String>,
+            origin: Option<String>,
+        }
+        let store = self.store();
+        let rows: Vec<Row> = store
+            .query_typed(
+                "SELECT path, size, etag, origin FROM fs_files ORDER BY path ASC;",
+                None,
+            )
+            .unwrap_or_default();
+        let files: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|r| {
+                json!({
+                    "path": r.path,
+                    "size": r.size,
+                    "etag": r.etag,
+                    "sha256": serde_json::Value::Null,
+                    "origin": r.origin,
+                })
+            })
+            .collect();
+        let doc = json!({
+            "doId": self.do_id,
+            "fsVersion": read_fs_version(&store),
+            "exportedMs": now_ms(),
+            "files": files,
+        })
+        .to_string();
+        let binding = self.vfs_binding();
+        let key = format!("fs/{}/.engram/manifest.json", self.do_id);
+        // Best-effort PUT: a failure leaves the prior manifest (or none) — never fails the checkpoint.
+        let _ = self.r2_put_resilient(&binding, &key, doc.into_bytes()).await;
+    }
+
     /// Flush this cell's STAGED host.fs mutations to durable storage as part of `store_ckpt` — i.e.
     /// IN THE SAME COMMIT ORDERING as the heap manifest, per the SANDBOX-API staged-commit coherence
     /// invariant. Body bytes are written to R2 FIRST (write-ordering rule: a body is durable before
@@ -726,7 +834,7 @@ impl KernelDO {
                         continue;
                     }
                     let _ = store.exec(
-                        "INSERT INTO fs_files(path,r2_key,size,cell,created_ms) VALUES(?,?,?,?,?)                          ON CONFLICT(path) DO UPDATE SET r2_key=excluded.r2_key, size=excluded.size, cell=excluded.cell, created_ms=excluded.created_ms;",
+                        "INSERT INTO fs_files(path,r2_key,size,cell,created_ms,origin) VALUES(?,?,?,?,?,'cell')                          ON CONFLICT(path) DO UPDATE SET r2_key=excluded.r2_key, size=excluded.size, cell=excluded.cell, created_ms=excluded.created_ms, origin='cell';",
                         Some(vec![path.clone().into(), key.clone().into(), size.into(), cell.into(), now.into()]),
                     );
                 }
@@ -735,6 +843,902 @@ impl KernelDO {
                     let _ = bucket.delete(&key).await; // best-effort body GC; orphan is harmless
                 }
             }
+        }
+        // UNIFIED-FS MERGE: this cell mutated the durable fs — bump fsVersion in the SAME store
+        // handle (so it lands in the same coalesced flush as the manifest txn, preserving staged-
+        // commit coherence). Early-returned above when there were no ops, so this only fires on a
+        // real mutation.
+        bump_fs_version(store);
+    }
+
+    // ─── VFS-* out-of-band file I/O (DO-side, never the VM) ──────────────────────────────────────
+    //
+    // These service file uploads/downloads/listing DIRECTLY against the host.fs R2 store, reusing
+    // its EXACT durability primitives so an uploaded file is the SAME object a later `config.fs.
+    // provider:"r2"` cell sees via `fs.*` / `host.fs.*`:
+    //   - bucket  = config.fs.binding || "SNAPSHOTS"  (mirror of flush_staged_fs)
+    //   - prefix  = "fs/<doId>/"                       (HARD-bound to the DO id, never the frame)
+    //   - path    = norm_fs_path(frame.path)           (REQUIRED; rejects `..`/NUL — isolation)
+    //   - key     = "<prefix><normpath>"               (identical to r2_fs_op)
+    //   - meta    = `fs_files(path,r2_key,size,cell,created_ms)` row (exists iff body durable in R2)
+    //
+    // Unlike the eval path (which STAGES fs ops and flushes them in the heap checkpoint), vfs-write
+    // commits IMMEDIATELY (body to R2 FIRST, then the meta row) — there is no eval checkpoint for an
+    // out-of-band upload. This is by design; it does NOT couple to the heap version, so a cell that
+    // already captured its committed view at eval-start won't see a concurrently-arriving upload until
+    // its next eval. The DO is single-threaded per id, so these `await`s never race a flush_staged_fs.
+
+    /// Resolve the host.fs R2 bucket binding for THIS session (config.fs.binding || "SNAPSHOTS"),
+    /// exactly as flush_staged_fs does. The `fs/<doId>/` prefix is NEVER read from config.
+    fn vfs_binding(&self) -> String {
+        let store = self.store();
+        let cfg: serde_json::Value =
+            serde_json::from_str(&read_str(&store, "config").unwrap_or_else(|| "{}".into()))
+                .unwrap_or_else(|_| json!({}));
+        cfg.get("fs")
+            .and_then(|f| f.get("binding"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("SNAPSHOTS")
+            .to_string()
+    }
+
+    /// Look up the committed `fs_files` meta row for a normalized path: (r2_key, size, created_ms).
+    fn vfs_meta(&self, path: &str) -> Option<(String, i64, i64)> {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            r2_key: String,
+            size: i64,
+            created_ms: i64,
+        }
+        let rows: Vec<Row> = self
+            .store()
+            .query_typed(
+                "SELECT r2_key, size, created_ms FROM fs_files WHERE path=?;",
+                Some(vec![path.into()]),
+            )
+            .unwrap_or_default();
+        rows.into_iter()
+            .next()
+            .map(|r| (r.r2_key, r.size, r.created_ms))
+    }
+
+    /// vfs-write `{path, dataB64, offset?, truncate?}` -> `{ok, bytesWritten, error?}`.
+    /// Commits durably + immediately: body to R2 FIRST (r2_put_resilient), then upsert the
+    /// `fs_files` row with the SAME SQL as flush_staged_fs. R2 has no partial PUT, so offset/append
+    /// is read-modify-write of the whole object (GET existing -> splice at offset -> PUT). `truncate`
+    /// (or offset 0 with no existing file) replaces. Append = offset == current size.
+    async fn vfs_write(&self, msg: &serde_json::Value) -> Result<serde_json::Value> {
+        let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let raw_path = msg.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        // CWD-aware resolution: relative paths resolve against the frame cwd (default /workspace).
+        let cwd = msg.get("cwd").and_then(|v| v.as_str()).unwrap_or(WORKSPACE_ROOT);
+        let path = match norm_fs_path_cwd(raw_path, cwd) {
+            Ok(p) => p,
+            Err(_) => {
+                return Ok(json!({"t":"vfs-write-result","id":id,"ok":false,
+                    "error":"EINVAL: bad path"}))
+            }
+        };
+        let data_b64 = msg.get("dataB64").and_then(|v| v.as_str()).unwrap_or("");
+        let new_bytes = match b64_decode(data_b64) {
+            Some(b) => b,
+            None => {
+                return Ok(json!({"t":"vfs-write-result","id":id,"ok":false,
+                    "error":"EINVAL: bad base64 dataB64"}))
+            }
+        };
+        let truncate = msg.get("truncate").and_then(|v| v.as_bool()).unwrap_or(false);
+        let offset = msg.get("offset").and_then(|v| v.as_f64()).map(|f| f as usize);
+
+        let binding = self.vfs_binding();
+        let prefix = format!("fs/{}/", self.do_id);
+        let key = format!("{}{}", prefix, path.trim_start_matches('/'));
+
+        // Assemble the full object to PUT. For a plain replace (truncate, or no offset and no
+        // existing file) we PUT `new_bytes` as-is. For offset/append we GET the existing committed
+        // body and splice `new_bytes` in at `offset` (zero-filling any gap past current end).
+        let existing = self.vfs_meta(&path);
+        let full: Vec<u8> = if truncate || (offset.is_none() && existing.is_none()) {
+            new_bytes
+        } else {
+            // read-modify-write: load the current committed body (empty if none).
+            let mut base: Vec<u8> = if existing.is_some() {
+                match self.env.bucket(&binding) {
+                    Ok(bucket) => match bucket.get(&key).execute().await {
+                        Ok(Some(obj)) => match obj.body() {
+                            Some(body) => body.bytes().await.unwrap_or_default(),
+                            None => Vec::new(),
+                        },
+                        _ => Vec::new(),
+                    },
+                    Err(_) => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            let at = offset.unwrap_or(base.len());
+            if at > base.len() {
+                base.resize(at, 0u8); // zero-fill a sparse gap
+            }
+            let end = at + new_bytes.len();
+            if end > base.len() {
+                base.resize(end, 0u8);
+            }
+            base[at..end].copy_from_slice(&new_bytes);
+            base
+        };
+
+        let size = full.len() as i64;
+        let bytes_written = if truncate || (offset.is_none() && existing.is_none()) {
+            size
+        } else {
+            // bytes actually placed by this call (the spliced window length).
+            msg.get("dataB64")
+                .and_then(|v| v.as_str())
+                .map(|s| b64_decode(s).map(|b| b.len()).unwrap_or(0))
+                .unwrap_or(0) as i64
+        };
+
+        // Body to R2 FIRST (durable before the meta row references it), then upsert the meta row.
+        if self.r2_put_resilient(&binding, &key, full).await.is_err() {
+            let mut dp = Datapoint::new("vfs-write");
+            dp.ok = false;
+            dp.error_name = "r2-put-failed".into();
+            self.emit(&dp);
+            return Ok(json!({"t":"vfs-write-result","id":id,"ok":false,
+                "error":"FsError: R2 put failed"}));
+        }
+        let now = now_ms();
+        let store = self.store();
+        let _ = store.exec(
+            "INSERT INTO fs_files(path,r2_key,size,cell,created_ms,origin) VALUES(?,?,?,?,?,'frame') \
+             ON CONFLICT(path) DO UPDATE SET r2_key=excluded.r2_key, size=excluded.size, cell=excluded.cell, created_ms=excluded.created_ms, origin='frame';",
+            Some(vec![
+                path.clone().into(),
+                key.into(),
+                size.into(),
+                (-1i64).into(),
+                now.into(),
+            ]),
+        );
+        // UNIFIED-FS MERGE: an out-of-band vfs-write is a durable fs mutation — bump fsVersion and
+        // refresh the exported manifest so external readers see the new file index immediately.
+        bump_fs_version(&store);
+        self.export_manifest().await;
+        self.emit(&Datapoint::new("vfs-write"));
+        Ok(json!({"t":"vfs-write-result","id":id,"ok":true,"bytesWritten":bytes_written,"fsVersion":read_fs_version(&store)}))
+    }
+
+    /// vfs-read `{path, offset?, len?}` -> `{ok, dataB64, eof, size?, error?}`. Client-driven
+    /// chunked/streamable reads (one frame per range), like the artifact streaming model. `size` is
+    /// always the TOTAL committed file size (so the client can drive the chunk loop / detect eof).
+    async fn vfs_read(&self, msg: &serde_json::Value) -> Result<serde_json::Value> {
+        let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let raw_path = msg.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        // CWD-aware resolution: relative paths resolve against the frame cwd (default /workspace).
+        let cwd = msg.get("cwd").and_then(|v| v.as_str()).unwrap_or(WORKSPACE_ROOT);
+        let path = match norm_fs_path_cwd(raw_path, cwd) {
+            Ok(p) => p,
+            Err(_) => {
+                return Ok(json!({"t":"vfs-read-result","id":id,"ok":false,
+                    "error":"EINVAL: bad path"}))
+            }
+        };
+        // The engram-sandbox CONTAINER writes bodies DIRECTLY to R2 at the identical canonical key
+        // fs/<doId>/<rel> with NO committed fs_files row, so vfs_meta() misses them. Fall back to a
+        // direct R2 HEAD at the same key (the transparent container->cell read of the shared VFS).
+        let (key, size, _created) = match self.vfs_meta(&path) {
+            Some(m) => m,
+            None => {
+                let binding0 = self.vfs_binding();
+                let key0 = format!("fs/{}/{}", self.do_id, path.trim_start_matches('/'));
+                let head_size = match self.env.bucket(&binding0) {
+                    Ok(bucket) => match bucket.head(&key0).await {
+                        Ok(Some(obj)) => Some(obj.size() as i64),
+                        _ => None,
+                    },
+                    Err(_) => None,
+                };
+                match head_size {
+                    Some(sz) => (key0, sz, 0i64),
+                    None => {
+                        return Ok(json!({"t":"vfs-read-result","id":id,"ok":false,"eof":true,
+                            "error":"ENOENT: no such file"}))
+                    }
+                }
+            }
+        };
+        let total = size.max(0) as u64;
+        let offset = msg
+            .get("offset")
+            .and_then(|v| v.as_f64())
+            .map(|f| (f as u64).min(total))
+            .unwrap_or(0);
+        let len = msg.get("len").and_then(|v| v.as_f64()).map(|f| f as u64);
+
+        let binding = self.vfs_binding();
+        let bucket = self
+            .env
+            .bucket(&binding)
+            .map_err(|e| to_err(JsValue::from_str(&format!("FsError: bucket — {e}"))))?;
+        let mut gb = bucket.get(&key);
+        if offset > 0 || len.is_some() {
+            let length = len.unwrap_or(total.saturating_sub(offset));
+            gb = gb.range(worker::Range::OffsetWithLength { offset, length });
+        }
+        let bytes: Vec<u8> = match gb.execute().await {
+            Ok(Some(obj)) => match obj.body() {
+                Some(body) => body
+                    .bytes()
+                    .await
+                    .map_err(|e| to_err(JsValue::from_str(&format!("{e}"))))?,
+                None => Vec::new(),
+            },
+            // Committed meta but missing body = torn write (per SANDBOX-API): report distinctly.
+            _ => {
+                let mut dp = Datapoint::new("vfs-read");
+                dp.ok = false;
+                dp.error_name = "torn-file".into();
+                self.emit(&dp);
+                return Ok(json!({"t":"vfs-read-result","id":id,"ok":false,"eof":true,
+                    "size":size,"error":"ENOENT: torn file (committed meta, body absent)"}));
+            }
+        };
+        let eof = offset + (bytes.len() as u64) >= total;
+        self.emit(&Datapoint::new("vfs-read"));
+        Ok(json!({"t":"vfs-read-result","id":id,"ok":true,
+            "dataB64": b64_encode(&bytes),"eof":eof,"size":size}))
+    }
+
+    /// vfs-stat `{path}` -> `{ok, stat:{size,isFile,isDir,mtime}, error?}`. Reads the `fs_files`
+    /// meta row (mtime maps to `created_ms`, which is last-write time). A path that is a prefix of
+    /// other rows but has no own row is a synthetic directory.
+    async fn vfs_stat(&self, msg: &serde_json::Value) -> Result<serde_json::Value> {
+        let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let raw_path = msg.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        // CWD-aware resolution: relative paths resolve against the frame cwd (default /workspace).
+        let cwd = msg.get("cwd").and_then(|v| v.as_str()).unwrap_or(WORKSPACE_ROOT);
+        let path = match norm_fs_path_cwd(raw_path, cwd) {
+            Ok(p) => p,
+            Err(_) => {
+                return Ok(json!({"t":"vfs-stat-result","id":id,"ok":false,
+                    "error":"EINVAL: bad path"}))
+            }
+        };
+        if let Some((_key, size, created)) = self.vfs_meta(&path) {
+            return Ok(json!({"t":"vfs-stat-result","id":id,"ok":true,
+                "stat":{"size":size,"isFile":true,"isDir":false,"mtime":created}}));
+        }
+        // No own row: synthetic dir if it is a parent prefix of any committed row.
+        let committed = self.read_fs_committed();
+        let dir = if path == "/" { "/".to_string() } else { format!("{}/", path) };
+        let is_dir = path == "/" || committed.keys().any(|k| k.starts_with(&dir));
+        if is_dir {
+            return Ok(json!({"t":"vfs-stat-result","id":id,"ok":true,
+                "stat":{"size":0,"isFile":false,"isDir":true,"mtime":0}}));
+        }
+        // Container-written file (direct-to-R2, no fs_files row): fall back to an R2 HEAD at the
+        // identical canonical key so stat() sees the shared-VFS bytes the same way read() does.
+        let binding0 = self.vfs_binding();
+        let key0 = format!("fs/{}/{}", self.do_id, path.trim_start_matches('/'));
+        if let Ok(bucket) = self.env.bucket(&binding0) {
+            if let Ok(Some(obj)) = bucket.head(&key0).await {
+                return Ok(json!({"t":"vfs-stat-result","id":id,"ok":true,
+                    "stat":{"size":obj.size() as i64,"isFile":true,"isDir":false,"mtime":0}}));
+            }
+        }
+        Ok(json!({"t":"vfs-stat-result","id":id,"ok":false,"error":"ENOENT: no such file"}))
+    }
+
+    /// vfs-ls `{path}` -> `{ok, entries:[{name,size,isDir}], error?}`. Immediate children of a dir
+    /// prefix over the committed `fs_files` namespace (files + synthetic subdirs), deduped — same
+    /// list semantics as r2_fs_op's "list". Reads ONLY this DO's per-session SQLite rows (isolation).
+    fn vfs_ls(&self, msg: &serde_json::Value) -> Result<serde_json::Value> {
+        let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let raw_path = msg.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        // CWD-aware resolution: relative paths resolve against the frame cwd (default /workspace).
+        let cwd = msg.get("cwd").and_then(|v| v.as_str()).unwrap_or(WORKSPACE_ROOT);
+        let path = match norm_fs_path_cwd(raw_path, cwd) {
+            Ok(p) => p,
+            Err(_) => {
+                return Ok(json!({"t":"vfs-ls-result","id":id,"ok":false,
+                    "error":"EINVAL: bad path"}))
+            }
+        };
+        let committed = self.read_fs_committed();
+        let pre = if path == "/" { "/".to_string() } else { format!("{}/", path) };
+        // child segment -> (size, isDir). A file child has its own row (isDir=false); a dir child
+        // appears as the first segment of a deeper path with no own row.
+        let mut seen: std::collections::BTreeMap<String, (i64, bool)> =
+            std::collections::BTreeMap::new();
+        for (full, meta) in committed.iter() {
+            if let Some(rest) = full.strip_prefix(pre.as_str()) {
+                if rest.is_empty() {
+                    continue;
+                }
+                match rest.split_once('/') {
+                    None => {
+                        // immediate file child (a real row always wins over a synthetic dir).
+                        seen.insert(rest.to_string(), (meta.size, false));
+                    }
+                    Some((name, _)) => {
+                        // deeper path => `name` is a subdirectory (unless a file row claims it).
+                        seen.entry(name.to_string()).or_insert((0, true));
+                    }
+                }
+            }
+        }
+        let list: Vec<serde_json::Value> = seen
+            .into_iter()
+            .map(|(name, (size, is_dir))| json!({"name":name,"size":size,"isDir":is_dir}))
+            .collect();
+        Ok(json!({"t":"vfs-ls-result","id":id,"ok":true,"entries":list}))
+    }
+
+    /// vfs-sync `{}` -> `{ok, files:[{path,size}]}`. Reconcile the fs_files namespace from the live
+    /// R2 prefix `fs/<doId>/`, then return the committed file list. The engram-sandbox container
+    /// writes bodies DIRECTLY to R2 (s3fs mount), so files it creates carry NO fs_files row and are
+    /// invisible to host.fs / vfs-* until this runs — it is the explicit, on-demand container->cell
+    /// half of the shared-VFS round-trip (mirrors worker_invoke's post-invoke reconcile). Acquires
+    /// the mutex ONLY around the reconcile so it cannot interleave an eval's staged flush.
+    async fn vfs_sync(&self, msg: &serde_json::Value) -> Result<serde_json::Value> {
+        let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let release = JsFuture::from(self.mutex.acquire()).await.map_err(to_err)?;
+        self.reconcile_fs_files().await;
+        let _ = js_sys::Function::from(release).call0(&JsValue::NULL);
+        let committed = self.read_fs_committed();
+        let files: Vec<serde_json::Value> = committed
+            .iter()
+            .map(|(p, m)| json!({"path": p, "size": m.size}))
+            .collect();
+        let mut dp = Datapoint::new("vfs-sync");
+        dp.cell = files.len() as i64; // record reconciled file count on the `cell` double
+        self.emit(&dp);
+        Ok(json!({"t":"vfs-sync-result","id":id,"ok":true,"files":files}))
+    }
+
+    // ─── WORKER REGISTRY — content-addressed Dynamic-Worker-Loader compute ──────────────────────
+    //
+    // The "muscle" tier: a STATIC, hash-identified JS source registered once and invokable many
+    // times in a FRESH isolate, decoupled from the single-threaded durable kernel DO. The isolate
+    // shares the SAME R2-backed VFS the kernel + vfs-* frames use (fs/<doId>/ prefix), so a
+    // hash-worker reads/writes the exact files a cell sees via host.fs / vfs-*.
+    //
+    // ISOLATION (held end-to-end):
+    //   (a) hash = sha256(source) — immutable, content-addressed; same source = same hash.
+    //   (b) warm cache keys on the codeId (glue: `wkr1:<doIdShort>:<hash>`) so two sessions sharing
+    //       a hash get SEPARATE isolates with SEPARATE VFS env — never a cross-session R2 leak.
+    //   (c) the fs/<doId>/ prefix + path normalization are computed gateway-side from the TRUSTED
+    //       do_id this DO passes; the dynamic worker can never choose either.
+    //   (d) globalOutbound: null (glue) — VFS RPC is the worker's ONLY I/O channel.
+    //   (e) the per-session registry_workers row is the invoke gate (see worker_invoke).
+
+    /// worker-register `{id, source}` -> `{ok, hash, bytes, cached}` | `{ok:false, error}`.
+    /// Content-addressed + idempotent: hash = lowercase-hex sha256(source); the source body is
+    /// stored GLOBALLY at R2 `workers/<hash>.js` (immutable — a double PUT of identical content is
+    /// harmless), and a per-session `registry_workers` row is upserted (the invoke gate). `cached`
+    /// is true iff this session already had a row for the hash (no work beyond the response).
+    async fn worker_register(&self, msg: &serde_json::Value) -> Result<serde_json::Value> {
+        const MAX_SOURCE_BYTES: usize = 512 * 1024; // mirrors the stdlib 500KB source-cap culture
+        let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let source = msg.get("source").and_then(|v| v.as_str()).unwrap_or("");
+        let bytes = source.len() as i64;
+        if source.len() > MAX_SOURCE_BYTES {
+            let mut dp = Datapoint::new("worker-register");
+            dp.ok = false;
+            dp.error_name = "SourceTooLargeError".into();
+            dp.size_raw = bytes;
+            self.emit(&dp);
+            return Ok(json!({"t":"worker-register-result","id":id,"ok":false,
+                "error":{"name":"SourceTooLargeError",
+                    "message":format!("source {}B exceeds cap {}B", source.len(), MAX_SOURCE_BYTES)}}));
+        }
+        let hash = sha256_hex(source.as_bytes());
+
+        // Already registered by THIS session? Idempotent no-op (the R2 body is immutable + global).
+        let cached = self.registry_has(&hash);
+
+        if !cached {
+            // Store the source body GLOBALLY (immutable, content-addressed). r2_put_resilient gives
+            // the same retry/backoff/breaker discipline as the host.fs body writes.
+            let key = format!("workers/{}.js", hash);
+            if self
+                .r2_put_resilient("SNAPSHOTS", &key, source.as_bytes().to_vec())
+                .await
+                .is_err()
+            {
+                let mut dp = Datapoint::new("worker-register");
+                dp.ok = false;
+                dp.error_name = "R2WriteError".into();
+                dp.size_raw = bytes;
+                self.emit(&dp);
+                return Ok(json!({"t":"worker-register-result","id":id,"ok":false,
+                    "error":{"name":"R2WriteError","message":"failed to persist source to R2"}}));
+            }
+            let now = now_ms();
+            let _ = self.store().exec(
+                "INSERT INTO registry_workers(hash,bytes,created_ms) VALUES(?,?,?) \
+                 ON CONFLICT(hash) DO UPDATE SET bytes=excluded.bytes;",
+                Some(vec![hash.clone().into(), bytes.into(), now.into()]),
+            );
+        }
+
+        let mut dp = Datapoint::new("worker-register");
+        dp.size_raw = bytes;
+        dp.label = if cached { "cached".into() } else { "stored".into() };
+        self.emit(&dp);
+        Ok(json!({"t":"worker-register-result","id":id,"ok":true,
+            "hash":hash,"bytes":bytes,"cached":cached}))
+    }
+
+    /// worker-invoke `{id, hash, input?, timeoutMs?, cpuMs?}` -> `{ok, output, ms}` |
+    /// `{ok:false, error, ms}`. Validates the hash format + the per-session invoke gate, loads the
+    /// source from R2 `workers/<hash>.js`, runs it in a fresh Worker-Loader isolate (glue), races
+    /// the run against `timeoutMs`, reconciles the shared fs_files namespace, emits AE, replies.
+    async fn worker_invoke(&self, msg: &serde_json::Value) -> Result<serde_json::Value> {
+        let t0 = now_ms();
+        let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let hash = msg.get("hash").and_then(|v| v.as_str()).unwrap_or("");
+        let reply_err = |name: &str, message: String, ms: f64| {
+            json!({"t":"worker-invoke-result","id":id,"ok":false,
+                "error":{"name":name,"message":message},"ms":ms})
+        };
+
+        // hash format: exactly 64 lowercase hex chars (defends the R2 key + the codeId).
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Ok(reply_err("ContractError", "hash must match ^[0-9a-f]{64}$".into(), 0.0));
+        }
+        // INVOKE GATE: this session must have registered the hash (closes "any authed session can
+        // run any source whose hash it learned"). register is cheap + idempotent.
+        if !self.registry_has(hash) {
+            let mut dp = Datapoint::new("worker-invoke");
+            dp.ok = false;
+            dp.error_name = "NotRegisteredError".into();
+            self.emit(&dp);
+            return Ok(reply_err(
+                "NotRegisteredError",
+                "hash not registered by this session; call worker-register first".into(),
+                0.0,
+            ));
+        }
+
+        // timeout/cpu caps (clamped). timeoutMs default 30000 cap 120000; cpuMs default 5000.
+        let timeout_ms = msg
+            .get("timeoutMs")
+            .and_then(|v| v.as_f64())
+            .map(|f| f as u64)
+            .unwrap_or(30000)
+            .clamp(1, 120_000);
+        let cpu_ms = msg
+            .get("cpuMs")
+            .and_then(|v| v.as_f64())
+            .map(|f| f as u64)
+            .unwrap_or(5000)
+            .clamp(1, 60_000);
+        let input_json = msg
+            .get("input")
+            .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".into()))
+            .unwrap_or_else(|| "null".into());
+        const MAX_INPUT_BYTES: usize = 1024 * 1024;
+        if input_json.len() > MAX_INPUT_BYTES {
+            return Ok(reply_err(
+                "ContractError",
+                format!("input JSON {}B exceeds 1MB cap", input_json.len()),
+                now_ms() - t0,
+            ));
+        }
+
+        // Load the GLOBAL immutable source body. A durable miss/exhaust = the R2 object is gone
+        // (registry row without body) — surface a typed error, never wedge.
+        let key = format!("workers/{}.js", hash);
+        let source: String = match self.r2_get_resilient(&key).await {
+            R2Read::Got(arr) => {
+                let mut b = vec![0u8; arr.length() as usize];
+                arr.copy_to(&mut b);
+                match String::from_utf8(b) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        return Ok(reply_err(
+                            "WorkerRuntimeError",
+                            "registered source is not valid UTF-8".into(),
+                            now_ms() - t0,
+                        ))
+                    }
+                }
+            }
+            R2Read::Missing | R2Read::Exhausted => {
+                let mut dp = Datapoint::new("worker-invoke");
+                dp.ok = false;
+                dp.error_name = "NotRegisteredError".into();
+                self.emit(&dp);
+                return Ok(reply_err(
+                    "NotRegisteredError",
+                    "source body missing in R2 (registry desync)".into(),
+                    now_ms() - t0,
+                ));
+            }
+        };
+
+        // Run the loaded worker via the JS glue: env.LOADER.get(codeId, cb) -> stub.getEntrypoint
+        // -> ep.fetch(POST input). The glue builds the VfsGateway from ctx.exports (fail-closed if
+        // unavailable). lib.rs passes env + ctx as raw JsValue (no LOADER calls in Rust).
+        let opts_json = json!({"timeoutMs": timeout_ms, "cpuMs": cpu_ms}).to_string();
+        let env_js: &JsValue = self.env.as_ref();
+        // ctx for ctx.exports.VfsGateway. `&State` does not expose the raw DO ctx JsValue by
+        // reference (worker-rs keeps it private), so we pass NULL HERE — but the wiring IS LIVE and
+        // proven (NOT a future TODO): entry.ts's `KernelDO` subclass captures the real DO ctx into
+        // `globalThis.__ENGRAM_DO_CTX` keyed by the trusted do_id (entry.ts), and kernel-glue.mjs
+        // resolves it out-of-band from that map to mint `captured.exports.VfsGateway({props:{doId}})`.
+        // So NULL ctx is EXPECTED and the glue supplies the gateway; it fails closed (typed
+        // RegistryUnavailableError) only if the map lookup also misses. (Never falls back to handing
+        // the dynamic worker the raw bucket — that is the leak.)
+        let ctx_js = JsValue::NULL;
+        let promise = registry_invoke(
+            env_js,
+            &ctx_js,
+            &self.do_id,
+            hash,
+            &source,
+            &input_json,
+            &opts_json,
+        );
+
+        let out_json: String = match race_timeout(JsFuture::from(promise), timeout_ms).await {
+            Some(Ok(v)) => v.as_string().unwrap_or_else(|| {
+                json!({"ok":false,"error":{"name":"WorkerRuntimeError",
+                    "message":"worker returned a non-string result"}})
+                .to_string()
+            }),
+            Some(Err(e)) => {
+                // glue threw (e.g. RegistryUnavailableError / loader failure) — surface its name+msg.
+                let (name, message) = js_error_parts(&e);
+                json!({"ok":false,"error":{"name":name,"message":message}}).to_string()
+            }
+            None => {
+                let mut dp = Datapoint::new("worker-invoke");
+                dp.ok = false;
+                dp.error_name = "WorkerTimeoutError".into();
+                dp.total_server_ms = now_ms() - t0;
+                self.emit(&dp);
+                return Ok(reply_err(
+                    "WorkerTimeoutError",
+                    format!("worker exceeded {}ms wall timeout", timeout_ms),
+                    now_ms() - t0,
+                ));
+            }
+        };
+
+        // RECONCILE the shared fs_files namespace: the VfsGateway writes to R2 directly (it has no
+        // DO storage), so after the invoke we re-list fs/<doId>/ and upsert/delete fs_files rows
+        // with the SAME SQL as flush_staged_fs, so a later cell / vfs-* sees gateway-written files.
+        // Acquire self.mutex for the reconcile ONLY, so it cannot interleave an eval's staged flush.
+        // Gateway writes are vfs-write-semantics (immediate-durable, OUTSIDE the eval staged-commit).
+        {
+            let release = JsFuture::from(self.mutex.acquire()).await.map_err(to_err)?;
+            self.reconcile_fs_files().await;
+            let _ = js_sys::Function::from(release).call0(&JsValue::NULL);
+        }
+
+        let ms = now_ms() - t0;
+        // The harness envelope is {ok, output|error}. Parse it; cap the output size.
+        const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out_json).unwrap_or_else(|_| json!({"ok":false,
+                "error":{"name":"WorkerRuntimeError","message":"invalid worker envelope"}}));
+        let ok = parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mut dp = Datapoint::new("worker-invoke");
+        dp.total_server_ms = ms;
+        if ok {
+            let output = parsed.get("output").cloned().unwrap_or(serde_json::Value::Null);
+            let out_str = serde_json::to_string(&output).unwrap_or_else(|_| "null".into());
+            if out_str.len() > MAX_OUTPUT_BYTES {
+                dp.ok = false;
+                dp.error_name = "OutputTooLargeError".into();
+                self.emit(&dp);
+                return Ok(reply_err(
+                    "OutputTooLargeError",
+                    format!("output JSON {}B exceeds 1MB cap (use env.VFS for large data)", out_str.len()),
+                    ms,
+                ));
+            }
+            dp.size_raw = out_str.len() as i64;
+            self.emit(&dp);
+            Ok(json!({"t":"worker-invoke-result","id":id,"ok":true,"output":output,"ms":ms}))
+        } else {
+            let err = parsed.get("error").cloned().unwrap_or_else(|| {
+                json!({"name":"WorkerRuntimeError","message":"worker failed"})
+            });
+            dp.ok = false;
+            dp.error_name = err
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("WorkerRuntimeError")
+                .to_string();
+            self.emit(&dp);
+            Ok(json!({"t":"worker-invoke-result","id":id,"ok":false,"error":err,"ms":ms}))
+        }
+    }
+
+    /// worker-list `{id}` -> `{ok, workers:[{hash, bytes, createdMs}]}`. This session's registry
+    /// index (NOT the global R2 namespace) — reads ONLY this DO's per-session rows (isolation).
+    fn worker_list(&self, msg: &serde_json::Value) -> Result<serde_json::Value> {
+        let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        #[derive(serde::Deserialize)]
+        struct Row {
+            hash: String,
+            bytes: i64,
+            created_ms: i64,
+        }
+        let rows: Vec<Row> = self
+            .store()
+            .query_typed(
+                "SELECT hash, bytes, created_ms FROM registry_workers ORDER BY created_ms ASC;",
+                None,
+            )
+            .unwrap_or_default();
+        let workers: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|r| json!({"hash":r.hash,"bytes":r.bytes,"createdMs":r.created_ms}))
+            .collect();
+        Ok(json!({"t":"worker-list-result","id":id,"ok":true,"workers":workers}))
+    }
+
+    /// sandbox_frame: SDK `s.sandbox.*` over the kernel WS. Out-of-band (NO self.mutex, never touches
+    /// the VM heap) DO-side fetch to the engram-sandbox container worker over the SHARED R2 VFS. The
+    /// trusted KERNEL do_id is sent as `x-engram-session` (=> the sandbox mounts `fs/<doId>/` as
+    /// /session, the SAME keys host.fs / vfs-* read/write); the Bearer key is read from ENV and added
+    /// HERE — it NEVER enters the VM heap nor any frame echoed to the client. Capability-gated by
+    /// config.sandbox. URL is a FIXED trusted endpoint (no SSRF allowlist needed). Echoes `id` back.
+    async fn sandbox_frame(&self, msg: &serde_json::Value) -> Result<serde_json::Value> {
+        let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let op = msg.get("op").and_then(|v| v.as_str()).unwrap_or("");
+        // Capability gate: only sessions with config.sandbox:true get the route.
+        let cfg: serde_json::Value = serde_json::from_str(
+            &read_str(&self.store(), "config").unwrap_or_else(|| "{}".into()),
+        )
+        .unwrap_or_else(|_| json!({}));
+        let enabled = cfg.get("sandbox").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !enabled {
+            return Ok(json!({"t":"sandbox-result","id":id,"ok":false,
+                "error":"SandboxUnavailable: config.sandbox not enabled"}));
+        }
+        let url = self
+            .env
+            .var("ENGRAM_SANDBOX_URL")
+            .ok()
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let key = self
+            .env
+            .secret("ENGRAM_SANDBOX_KEY")
+            .ok()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if url.is_empty() || key.is_empty() {
+            return Ok(json!({"t":"sandbox-result","id":id,"ok":false,
+                "error":"SandboxUnavailable: sandbox endpoint/key not configured"}));
+        }
+
+        // Map the frame op -> route + HTTP method + JSON body (mutations) / query (reads). Mirrors the
+        // engram-sandbox routes (/exec /git /files /expose /mount /unmount) and the glue _doSandbox.
+        let mut method = Method::Post;
+        let route;
+        let mut body: Option<serde_json::Value> = None;
+        let mut query = String::new();
+        match op {
+            "exec" => {
+                route = "/exec";
+                let cmd = msg.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+                let mut b = json!({ "cmd": cmd });
+                if let Some(cwd) = msg.get("cwd").and_then(|v| v.as_str()) {
+                    b["cwd"] = json!(cwd);
+                }
+                body = Some(b);
+            }
+            "git" => {
+                route = "/git";
+                body = Some(json!({
+                    "op": msg.get("gitOp").and_then(|v| v.as_str())
+                        .or_else(|| msg.get("subop").and_then(|v| v.as_str()))
+                        .unwrap_or("checkout"),
+                    "repo": msg.get("repo").and_then(|v| v.as_str()),
+                    "branch": msg.get("branch").and_then(|v| v.as_str()),
+                    "dir": msg.get("dir").and_then(|v| v.as_str()),
+                }));
+            }
+            "write" | "writeFile" => {
+                route = "/files";
+                body = Some(json!({
+                    "op": "write",
+                    "path": msg.get("path").and_then(|v| v.as_str()).unwrap_or(""),
+                    "content": msg.get("content").and_then(|v| v.as_str()).unwrap_or(""),
+                }));
+            }
+            "read" | "readFile" => {
+                route = "/files";
+                method = Method::Get;
+                let path = msg.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                query = format!("op=read&path={}", urlencode(path));
+            }
+            "list" => {
+                route = "/files";
+                method = Method::Get;
+                let path = msg.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                query = format!("op=list&path={}", urlencode(path));
+            }
+            "expose" => {
+                route = "/expose";
+                let port = msg.get("port").and_then(|v| v.as_i64()).unwrap_or(0);
+                body = Some(json!({ "port": port }));
+            }
+            "mount" => {
+                route = "/mount";
+            }
+            "unmount" => {
+                route = "/unmount";
+            }
+            _ => {
+                return Ok(json!({"t":"sandbox-result","id":id,"ok":false,
+                    "error":format!("SandboxError: unknown op '{}'", op)}));
+            }
+        }
+
+        let full = if query.is_empty() {
+            format!("{}{}", url.trim_end_matches('/'), route)
+        } else {
+            format!("{}{}?{}", url.trim_end_matches('/'), route, query)
+        };
+
+        // Build the DO-side request: trusted do_id header + Bearer key (never in the VM heap).
+        let headers = Headers::new();
+        let _ = headers.set("authorization", &format!("Bearer {}", key));
+        let _ = headers.set("x-engram-session", &self.do_id);
+        let mut init = RequestInit::new();
+        init.with_method(method.clone());
+        if matches!(method, Method::Post) {
+            if let Some(b) = &body {
+                let _ = headers.set("content-type", "application/json");
+                let s = serde_json::to_string(b).unwrap_or_else(|_| "{}".into());
+                init.with_body(Some(wasm_bindgen::JsValue::from_str(&s)));
+            }
+        }
+        init.with_headers(headers);
+
+        let req = match Request::new_with_init(&full, &init) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(json!({"t":"sandbox-result","id":id,"ok":false,
+                    "error":format!("SandboxError: bad request: {}", e)}));
+            }
+        };
+        let mut resp = match Fetch::Request(req).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let mut dp = Datapoint::new("sandbox");
+                dp.ok = false;
+                dp.error_name = "fetch-failed".into();
+                self.emit(&dp);
+                return Ok(json!({"t":"sandbox-result","id":id,"ok":false,
+                    "error":format!("SandboxError: {}", e)}));
+            }
+        };
+        let status = resp.status_code();
+        let text = resp.text().await.unwrap_or_default();
+        let value: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
+        let mut dp = Datapoint::new("sandbox");
+        dp.ok = (200..300).contains(&status);
+        self.emit(&dp);
+        if (200..300).contains(&status) {
+            Ok(json!({"t":"sandbox-result","id":id,"ok":true,"value":value}))
+        } else {
+            let emsg = value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("HTTP {}", status));
+            Ok(json!({"t":"sandbox-result","id":id,"ok":false,
+                "error":format!("SandboxError: {}", emsg)}))
+        }
+    }
+
+    /// Has THIS session registered `hash`? (the invoke gate / register idempotency check.)
+    fn registry_has(&self, hash: &str) -> bool {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            #[allow(dead_code)]
+            hash: String,
+        }
+        let rows: Vec<Row> = self
+            .store()
+            .query_typed(
+                "SELECT hash FROM registry_workers WHERE hash=? LIMIT 1;",
+                Some(vec![hash.into()]),
+            )
+            .unwrap_or_default();
+        !rows.is_empty()
+    }
+
+    /// Reconcile fs_files from the live R2 fs/<doId>/ listing after a gateway-writing invoke. Pages
+    /// the R2 list, upserts a row per object (same SQL as flush_staged_fs) and deletes rows whose
+    /// body no longer exists, so the per-session SQLite namespace matches what the VfsGateway wrote.
+    /// Best-effort: any R2/list error leaves the existing namespace untouched (a later invoke / the
+    /// next reconcile re-syncs). Caller holds self.mutex.
+    async fn reconcile_fs_files(&self) {
+        let binding = self.vfs_binding();
+        let prefix = format!("fs/{}/", self.do_id);
+        let bucket = match self.env.bucket(&binding) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        // Collect the live R2 keys under the prefix (paginated via cursor).
+        let mut live: BTreeMap<String, i64> = BTreeMap::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut lb = bucket.list().prefix(prefix.clone()).limit(1000);
+            if let Some(c) = &cursor {
+                lb = lb.cursor(c.clone());
+            }
+            let listed = match lb.execute().await {
+                Ok(l) => l,
+                Err(_) => return, // list failed: leave namespace untouched (best-effort)
+            };
+            for obj in listed.objects() {
+                let k = obj.key();
+                // path = key with the fs/<doId>/ prefix stripped, normalized to a leading-slash form
+                // identical to the fs_files `path` column (norm_fs_path of the suffix).
+                if let Some(rest) = k.strip_prefix(&prefix) {
+                    if let Ok(path) = norm_fs_path(rest) {
+                        live.insert(path, obj.size() as i64);
+                    }
+                }
+            }
+            if listed.truncated() {
+                cursor = listed.cursor();
+                if cursor.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        let store = self.store();
+        let committed = self.read_fs_committed();
+        let now = now_ms();
+        // Upsert every live object (body present in R2 ⇒ row exists, the fs_files invariant).
+        let mut changed = false;
+        for (path, size) in live.iter() {
+            let key = format!("{}{}", prefix, path.trim_start_matches('/'));
+            let _ = store.exec(
+                "INSERT INTO fs_files(path,r2_key,size,cell,created_ms,origin) VALUES(?,?,?,?,?,'reconcile') \
+                 ON CONFLICT(path) DO UPDATE SET r2_key=excluded.r2_key, size=excluded.size, origin='reconcile';",
+                Some(vec![
+                    path.clone().into(),
+                    key.into(),
+                    (*size).into(),
+                    (-1i64).into(),
+                    now.into(),
+                ]),
+            );
+            changed = true;
+        }
+        // Delete rows whose body the gateway removed (committed but no longer live in R2).
+        for path in committed.keys() {
+            if !live.contains_key(path) {
+                let _ = store.exec(
+                    "DELETE FROM fs_files WHERE path=?;",
+                    Some(vec![path.clone().into()]),
+                );
+                changed = true;
+            }
+        }
+        // UNIFIED-FS MERGE: a gateway/hash-worker invoke that mutated the shared VFS bumps fsVersion
+        // and refreshes the exported manifest so cells + external readers see the reconciled index.
+        if changed {
+            bump_fs_version(&store);
+            self.export_manifest().await;
         }
     }
 
@@ -916,6 +1920,42 @@ impl KernelDO {
                 "inMemory": self.glue.borrow().is_some(),
                 "generation": self.generation,
             })),
+            // VFS-* out-of-band file I/O. Serviced DIRECTLY against the host.fs R2 store (same
+            // key scheme `fs/<doId>/<normpath>`, same SNAPSHOTS bucket, same `fs_files` meta table,
+            // same `norm_fs_path` isolation) — NEVER through the VM eval. These arms do NOT acquire
+            // `self.mutex`, so they bypass the instruction budget AND the WASM heap/mem-cap entirely.
+            // Auth + path-isolation are already enforced upstream (websocket_message auth gate +
+            // norm_fs_path below). A file uploaded here is visible to a later cell that runs with
+            // config.fs.provider=="r2" (read_fs_committed -> r2_fs_op share this exact namespace).
+            "vfs-write" => self.vfs_write(&msg).await,
+            "vfs-read" => self.vfs_read(&msg).await,
+            "vfs-ls" => self.vfs_ls(&msg),
+            "vfs-stat" => self.vfs_stat(&msg).await,
+            // VFS-SYNC — reconcile the fs_files namespace from the live R2 prefix `fs/<doId>/`.
+            // The container (engram-sandbox) writes bodies DIRECTLY to R2 via the s3fs mount, so a
+            // file it creates has NO fs_files row and is INVISIBLE to host.fs / vfs-* until this runs
+            // (same mechanism worker_invoke uses post-invoke). This makes the container->cell half of
+            // the shared-VFS round-trip explicit + on-demand. Acquires the mutex ONLY for the
+            // reconcile (so it can't interleave an eval's staged flush). Returns the reconciled file
+            // list. Auth is enforced upstream; per-session isolation is the hard-bound prefix.
+            "vfs-sync" => self.vfs_sync(&msg).await,
+            // WORKER REGISTRY — content-addressed Dynamic-Worker-Loader compute. Like the vfs-*
+            // arms: NO self.mutex (they never touch the VM heap; the mutex is acquired ONLY for the
+            // post-invoke fs_files reconcile, inside worker_invoke). Auth + per-session isolation are
+            // already enforced upstream (websocket_message auth gate + the registry_workers invoke
+            // gate + the fs/<doId>/ prefix). register = sha256(source) -> R2 `workers/<hash>.js` +
+            // per-session row; invoke = LOADER.get(hash) fresh isolate with the shared R2 VFS;
+            // list = this session's registry index.
+            "worker-register" => self.worker_register(&msg).await,
+            "worker-invoke" => self.worker_invoke(&msg).await,
+            "worker-list" => self.worker_list(&msg),
+            // SANDBOX BRIDGE (additive, SDK `s.sandbox.*` surface). Like the vfs-* / worker-* arms:
+            // serviced DIRECTLY (NO self.mutex — it never touches the VM heap) by a DO-side fetch to
+            // the engram-sandbox container worker, passing the trusted KERNEL do_id (=> the R2 prefix
+            // `fs/<doId>/` the sandbox mounts as /workspace) + the Bearer key read from ENV. Auth on the
+            // kernel WS is already enforced upstream (websocket_message gate); capability-gated by
+            // config.sandbox. The key NEVER enters the VM heap nor any client frame.
+            "sandbox" => self.sandbox_frame(&msg).await,
             "create" => {
                 let release = JsFuture::from(self.mutex.acquire()).await.map_err(to_err)?;
                 let res = self.create_critical(&msg).await;
@@ -1154,6 +2194,41 @@ impl KernelDO {
             let cell_now = read_int(&self.store(), "committedCell", -1) + 1;
             let glue = clone_glue(self.glue.borrow().as_ref().unwrap());
             glue.set_fence_context(&self.do_id, cell_now as f64);
+        }
+
+        // SANDBOX BRIDGE (additive): install the engram-sandbox endpoint + Bearer key (from ENV) +
+        // the trusted KERNEL do_id + the capability flag (config.sandbox) so the in-cell
+        // `host.sandbox.*` effect can DO-side fetch the container worker over the shared R2 VFS. The
+        // KEY is read from env.secret here and handed to the glue closure ONLY; it NEVER enters the VM
+        // heap (the cell sees only the host.sandbox.* effect name). Cleared/disabled when config.sandbox
+        // is falsey or the env bindings are absent -> SandboxUnavailable. Pass self.do_id (trusted
+        // 64-hex KERNEL DO id == the R2 prefix the sandbox mounts), NEVER a user-chosen value.
+        {
+            let cfg: serde_json::Value = serde_json::from_str(
+                &read_str(&self.store(), "config").unwrap_or_else(|| "{}".into()),
+            )
+            .unwrap_or_else(|_| json!({}));
+            let enabled = cfg
+                .get("sandbox")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let url = self
+                .env
+                .var("ENGRAM_SANDBOX_URL")
+                .ok()
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let key = self
+                .env
+                .secret("ENGRAM_SANDBOX_KEY")
+                .ok()
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let glue = clone_glue(self.glue.borrow().as_ref().unwrap());
+            // Only enable when the capability flag is set AND both bindings are present; the glue also
+            // re-checks and returns SandboxUnavailable on a missing url/key.
+            let on = enabled && !url.is_empty() && !key.is_empty();
+            glue.set_sandbox_config(&url, &key, &self.do_id, on);
         }
 
         // eval (async; cell may await host.fetch OR a client host-callback). Returns rich
@@ -1601,6 +2676,9 @@ impl KernelDO {
             // `fs_files` meta rows land in the SAME coalesced SQLite flush as the manifest txn below.
             self.flush_staged_fs(&store, cell).await;
             txn()?;
+            // UNIFIED-FS MERGE: refresh the external manifest export AFTER the fs_files rows + heap
+            // manifest are committed (best-effort; never fails the checkpoint).
+            self.export_manifest().await;
             // W4 commit-ordering: the delta row is now the committed chain tail — promote the staged
             // candidate to the live delta base so the NEXT diff is against exactly this image.
             glue.commit_dump();
@@ -1688,6 +2766,8 @@ impl KernelDO {
         // `fs_files` meta rows land in the SAME coalesced SQLite flush as the manifest txn.
         self.flush_staged_fs(&kstore, cell).await;
         let n_chunks = txn()?;
+        // UNIFIED-FS MERGE: refresh the external manifest export AFTER the commit (best-effort).
+        self.export_manifest().await;
         // W4 commit-ordering: the full base is committed — promote the staged image to the live base.
         glue.commit_dump();
 
@@ -2274,6 +3354,22 @@ fn write_meta<S: KernelStore>(store: &S, k: &str, v: &str) {
         .expect("write meta");
 }
 
+/// UNIFIED-FS MERGE: the session-monotonic `fsVersion` counter (the Rust twin of @engram/fs's
+/// ManifestStore.bumpVersion). Bumped on EVERY durable fs mutation (cell flush, vfs-write, reconcile)
+/// so an external reader / the exported manifest can detect a stale view. Stored as a plain `meta`
+/// row — when called inside flush_staged_fs it lands in the SAME coalesced SQLite flush as the heap
+/// manifest, preserving the staged-commit coherence invariant. Returns the new value. Best-effort:
+/// a read failure restarts the counter from 0 (the counter is advisory, never a coherence authority).
+fn bump_fs_version<S: KernelStore>(store: &S) -> i64 {
+    let next = read_int(store, "fsVersion", 0) + 1;
+    write_meta(store, "fsVersion", &next.to_string());
+    next
+}
+
+fn read_fs_version<S: KernelStore>(store: &S) -> i64 {
+    read_int(store, "fsVersion", 0)
+}
+
 // ── R2 RESTORE RESILIENCE (issue #10: transient R2 hiccup on the >SQLITE_HOT_MAX overflow
 //    restore path used to bubble a 500 → client reconnect+{t:create} → fresh-over-durable WIPE).
 //    Constants govern the retry/timeout/circuit-breaker wrapped around the single R2 GET. ───────
@@ -2359,25 +3455,238 @@ fn to_err(e: JsValue) -> worker::Error {
     worker::Error::RustError(format!("{:?}", e))
 }
 
-/// Normalize a guest fs path to a session-rooted POSIX path, defense-in-depth against traversal.
-/// Collapses `.`/`..` against a virtual `/` root (a leading `..` cannot escape — it is dropped),
-/// rejects a NUL byte. The returned path is always absolute and `..`-free; combined with the
-/// DO-id-bound key prefix in r2_fs_op, a guest can never address another session's namespace.
-fn norm_fs_path(p: &str) -> std::result::Result<String, JsValue> {
+/// Extract `(name, message)` from a JsValue error thrown by the registry glue. A thrown JS Error
+/// carries `.name`/`.message`; anything else stringifies. Used to surface a typed worker-invoke
+/// error (e.g. RegistryUnavailableError) without leaking a stack beyond the message.
+fn js_error_parts(e: &JsValue) -> (String, String) {
+    let name = Reflect::get(e, &JsValue::from_str("name"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "WorkerRuntimeError".to_string());
+    let message = Reflect::get(e, &JsValue::from_str("message"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| e.as_string())
+        .unwrap_or_else(|| "registry invoke failed".to_string());
+    (name, message)
+}
+
+// ── SHA-256 (pure Rust, wasm32-safe, sync; no crate dep) ────────────────────────────────────────
+// Used to content-address a registered worker source: hash = lowercase-hex sha256(source). The
+// hash is immutable (same source = same hash), drives the R2 `workers/<hash>.js` key, and is the
+// Worker-Loader warm-cache discriminant. FIPS-180-4 reference implementation.
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+fn sha256_hex(data: &[u8]) -> String {
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    // Pre-process: append 0x80, pad to 56 mod 64, append the 64-bit big-endian bit length.
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    let mut w = [0u32; 64];
+    for block in msg.chunks_exact(64) {
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                block[i * 4],
+                block[i * 4 + 1],
+                block[i * 4 + 2],
+                block[i * 4 + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(SHA256_K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+
+    let mut out = String::with_capacity(64);
+    for word in h.iter() {
+        out.push_str(&format!("{:08x}", word));
+    }
+    out
+}
+
+/// Standard base64 alphabet for the vfs-* wire (dataB64). Self-contained (no base64 crate dep) —
+/// the host.fs glue uses btoa/atob at the engine edge; vfs-* crosses bytes the same way DO-side.
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Encode raw bytes to a standard (padded) base64 string.
+fn b64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(B64_ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(B64_ALPHABET[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            B64_ALPHABET[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64_ALPHABET[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Decode a standard base64 string (padding optional; whitespace ignored). Returns None on a
+/// non-base64 byte so a malformed upload is a clean typed error, never a panic/garbage write.
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    let dec = |c: u8| -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    };
+    let mut acc: u32 = 0;
+    let mut nbits: u32 = 0;
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    for &c in s.as_bytes() {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue;
+        }
+        let v = dec(c)? as u32;
+        acc = (acc << 6) | v;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((acc >> nbits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// THE /workspace CANONICAL ROOT — the ONE filesystem root every path resolves under (owner's
+/// invariant; mirrors @engram/fs WORKSPACE_ROOT). A bare-absolute "/x" is ROOT-relative ("/x" ->
+/// /workspace/x), a "/workspace/x" re-roots at /workspace, a relative "x" resolves against the CWD.
+const WORKSPACE_ROOT: &str = "/workspace";
+
+/// Normalize a guest fs path to a /workspace-rooted R2-RELATIVE path (leading-slash `<rel>` form,
+/// e.g. "/a/b"), honoring the session `cwd` (default /workspace) for relative paths. THE RULE:
+///   - "/workspace/a/b" / "/a/b" -> ROOT-relative -> rel "/a/b"   (back-compat: bare-/ unchanged)
+///   - "a/b" / "./a" / "../a"    -> CWD-relative  -> join(cwd, p), then normalize
+/// `.`/`..` are normalized and CLAMPED under /workspace; a `..` that escapes /workspace throws
+/// EACCES (parity with @engram/fs). NUL throws EINVAL. The returned LEADING-slash form keeps the
+/// existing key derivation (`format!("{}{}", prefix, path.trim_start_matches('/'))`) UNCHANGED, so
+/// every previously-written fs/<doId>/a/b key stays reachable — NO data migration.
+fn norm_fs_path_cwd(p: &str, cwd: &str) -> std::result::Result<String, JsValue> {
     if p.contains('\u{0}') {
         return Err(JsValue::from_str("EINVAL: path contains NUL byte"));
     }
+    if cwd.contains('\u{0}') {
+        return Err(JsValue::from_str("EINVAL: cwd contains NUL byte"));
+    }
+    // Strip ONE leading "/workspace" so a "/workspace/..."-form input/cwd re-roots at /workspace.
+    let strip_ws = |s: &str| -> String {
+        if s == WORKSPACE_ROOT {
+            String::new()
+        } else if let Some(rest) = s.strip_prefix(&format!("{}/", WORKSPACE_ROOT)) {
+            format!("/{}", rest)
+        } else {
+            s.to_string()
+        }
+    };
+    // Build the raw segment chain rooted under /workspace (carry the literal "workspace" floor).
+    let ws_floor = 1usize; // ["workspace"]
+    let mut chain: Vec<String> = vec!["workspace".to_string()];
+    if p.starts_with('/') {
+        // ROOT-relative (ignores cwd).
+        let rooted = strip_ws(p);
+        chain.extend(rooted.split('/').map(|s| s.to_string()));
+    } else {
+        // CWD-relative: normalize cwd (root-relative under /workspace) then append p.
+        let cwd_norm = strip_ws(cwd);
+        for seg in cwd_norm.split('/') {
+            chain.push(seg.to_string());
+        }
+        for seg in p.split('/') {
+            chain.push(seg.to_string());
+        }
+    }
+    // Normalize ./.. with a clamp at the /workspace floor (escape -> EACCES).
     let mut out: Vec<&str> = Vec::new();
-    for seg in p.split('/') {
-        match seg {
+    for seg in chain.iter() {
+        match seg.as_str() {
             "" | "." => continue,
             ".." => {
+                if out.len() <= ws_floor {
+                    return Err(JsValue::from_str("EACCES: path escapes /workspace"));
+                }
                 out.pop();
             }
             s => out.push(s),
         }
     }
-    Ok(format!("/{}", out.join("/")))
+    // Strip the /workspace floor -> leading-slash <rel> form ("/a/b"; root -> "/").
+    Ok(format!("/{}", out[ws_floor..].join("/")))
+}
+
+/// Back-compat shim: resolve a path against the DEFAULT /workspace CWD. Used by the out-of-band
+/// vfs-*/reconcile paths (a hash-worker/container invocation's CWD defaults to /workspace).
+fn norm_fs_path(p: &str) -> std::result::Result<String, JsValue> {
+    norm_fs_path_cwd(p, WORKSPACE_ROOT)
 }
 
 /// DO-side R2 servicer for the in-VM `fs` host-backed provider (config.fs.provider == "r2").
@@ -2468,7 +3777,61 @@ async fn r2_fs_op(
                 _ => {
                     // not staged: read committed body from R2 (ranged when off/len given).
                     match committed.get(&path) {
-                        None => set("error", &JsValue::from_str(&enoent(&raw_path))),
+                        // No committed fs_files row. The engram-sandbox CONTAINER writes bodies
+                        // DIRECTLY to R2 (s3fs mount) at the identical canonical key fs/<doId>/<rel>
+                        // WITHOUT a committed meta row — so a container-written file is invisible to
+                        // committed.get(). Fall back to a direct R2 GET at the same key: this is the
+                        // transparent container->cell half of the shared VFS (a cell's
+                        // fs.promises.readFile('/workspace/x') reads the SAME bytes the container
+                        // wrote at /workspace/x). The TOTAL size comes from the R2 object itself; a
+                        // genuinely-absent key still yields ENOENT. Reads only this session's
+                        // DO-id-bound prefix, so isolation is preserved.
+                        None => {
+                            let bucket = env.bucket(binding).map_err(|e| {
+                                JsValue::from_str(&format!("FsError: bucket '{}' — {e}", binding))
+                            })?;
+                            // HEAD first for the authoritative total size, then a ranged/whole GET.
+                            let total_size: Option<u64> = match bucket.head(&key).await {
+                                Ok(Some(obj)) => Some(obj.size() as u64),
+                                _ => None,
+                            };
+                            match total_size {
+                                None => set("error", &JsValue::from_str(&enoent(&raw_path))),
+                                Some(total) => {
+                                    let mut gb = bucket.get(&key);
+                                    if off > 0 || len.is_some() {
+                                        let length = len
+                                            .map(|l| l as u64)
+                                            .unwrap_or(total.saturating_sub(off as u64));
+                                        gb = gb.range(worker::Range::OffsetWithLength {
+                                            offset: off as u64,
+                                            length,
+                                        });
+                                    }
+                                    match gb.execute().await {
+                                        Ok(Some(obj)) => {
+                                            let body = obj.body().ok_or_else(|| {
+                                                JsValue::from_str("FsError: empty body")
+                                            })?;
+                                            let bytes = body
+                                                .bytes()
+                                                .await
+                                                .map_err(|e| JsValue::from_str(&format!("{e}")))?;
+                                            let arr = Uint8Array::new_with_length(bytes.len() as u32);
+                                            arr.copy_from(&bytes);
+                                            set("ok", &JsValue::TRUE);
+                                            set("size", &JsValue::from_f64(total as f64));
+                                            set("bytes", &arr.into());
+                                        }
+                                        // Raced delete between HEAD and GET => treat as absent.
+                                        _ => set(
+                                            "error",
+                                            &JsValue::from_str(&enoent(&raw_path)),
+                                        ),
+                                    }
+                                }
+                            }
+                        }
                         Some(meta) => {
                             let bucket = env.bucket(binding).map_err(|e| {
                                 JsValue::from_str(&format!("FsError: bucket '{}' — {e}", binding))

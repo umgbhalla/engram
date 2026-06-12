@@ -1,0 +1,24 @@
+{
+  "name": "@engram/sandbox-app",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "engram-sandbox — standalone Tier-2 container muscle (real Linux container fronted by a Sandbox DO; mounts the session R2 prefix fs/<doId>/ as the live workspace).",
+  "exports": {
+    "./client": "./src/client.mjs"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "@cloudflare/sandbox": "0.12.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260603.1",
+    "typescript": "^6.0.3",
+    "wrangler": "^4.86.0"
+  }
+}

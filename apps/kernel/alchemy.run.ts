@@ -24,7 +24,7 @@
  * `alchemy deploy` against a non-prod account/name before retiring `wrangler deploy`.
  */
 import alchemy from "alchemy";
-import { AnalyticsEngineDataset, DurableObjectNamespace, R2Bucket, Worker } from "alchemy/cloudflare";
+import { AnalyticsEngineDataset, DurableObjectNamespace, R2Bucket, Worker, WorkerLoader } from "alchemy/cloudflare";
 import { R2RestStateStore } from "alchemy/state";
 
 const app = await alchemy("engram-kernel", {
@@ -64,7 +64,11 @@ export const worker = await Worker("engram-kernel", {
   // Requires the API token to have Workers Routes + Zone DNS edit on the umgbhalla.xyz zone.
   domains: ["engram.umgbhalla.xyz"],
   compatibilityDate: "2025-05-01",
-  compatibilityFlags: ["nodejs_compat"],
+  // enable_ctx_exports exposes ctx.exports so the KernelDO can mint its own VfsGateway
+  // WorkerEntrypoint (ctx.exports.VfsGateway({props:{doId}})) and pass it to each registry
+  // worker as its session-scoped, prefix-enforcing VFS — the only I/O channel a hash-worker
+  // gets (globalOutbound:null otherwise). Must mirror wrangler.jsonc compatibility_flags.
+  compatibilityFlags: ["nodejs_compat", "enable_ctx_exports"],
   observability: { enabled: true },
   bundle: {
     // entry.ts imports stdlib.bundle.txt as a Text module (string default export); map .txt
@@ -82,6 +86,10 @@ export const worker = await Worker("engram-kernel", {
     KERNEL_DO: kernelDo,
     SNAPSHOTS: snapshots,
     AE: ae,
+    // Worker Loader: content-addressed registry. The registry glue calls env.LOADER.get(codeId, cb)
+    // (warm-cached by codeId so the sha256 source hash drives dedup + warm reuse). Emits the
+    // worker_loaders binding { binding: "LOADER" } — mirrors wrangler.jsonc. Workers Paid required.
+    LOADER: WorkerLoader(),
     // AUTH (Phase 1 shared bearer key). ENGRAM_KERNEL_KEY is a comma-split list of valid keys
     // (rotation: "ek_new,ek_old"). Read in Rust via env.secret(); NEVER enters the heap snapshot.
     // NOTE: set ALCHEMY_PASSWORD in the deploy env for strong at-rest encryption of this secret in
@@ -91,6 +99,14 @@ export const worker = await Worker("engram-kernel", {
     // boots CLOSED whenever a key is configured. Only an explicit ENGRAM_AUTH_ENFORCE="0"
     // downgrades to log-only (serve + emit AE errorName=unauthorized).
     ENGRAM_AUTH_ENFORCE: process.env.ENGRAM_AUTH_ENFORCE ?? "1",
+    // SANDBOX BRIDGE (additive). The kernel reaches OUT to the engram-sandbox container worker over
+    // the shared R2 VFS. ENGRAM_SANDBOX_URL is a plain var (the fixed trusted endpoint);
+    // ENGRAM_SANDBOX_KEY is the SHARED bearer secret (same value set on engram-sandbox) — read in
+    // Rust via env.secret(), added DO-side to the kernel->sandbox fetch, NEVER persisted/snapshotted
+    // and NEVER visible to the VM/cell. Capability-gated by config.sandbox per session.
+    ENGRAM_SANDBOX_URL:
+      process.env.ENGRAM_SANDBOX_URL ?? "https://engram-sandbox.umg-bhalla88.workers.dev",
+    ENGRAM_SANDBOX_KEY: alchemy.secret(process.env.ENGRAM_SANDBOX_KEY!),
   },
 });
 

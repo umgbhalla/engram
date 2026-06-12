@@ -1931,9 +1931,21 @@ static int init_class_range(JSRuntime *rt, JSClassShortDef const *tab,
 }
 
 /* Uses code from LLVM project. */
-static inline uintptr_t js_get_stack_pointer(void)
+static no_inline uintptr_t js_get_stack_pointer(void)
 {
-#if defined(__clang__) || defined(__GNUC__)
+#if defined(__wasi__)
+    /* Engram patch: on wasm32 the C "stack" is the shadow stack tracked by the
+     * __stack_pointer global; __builtin_frame_address(0) is unreliable here (clang can
+     * constant-fold / hoist it so the stack-overflow guard never trips and deep sync
+     * recursion overruns the native stack into an uncatchable trap). Take the address of
+     * a volatile local in a NON-INLINED function: that forces a real shadow-stack frame
+     * whose address decreases monotonically with recursion depth — a faithful, if
+     * conservative, SP read that lets js_check_stack_overflow fire a CATCHABLE
+     * RangeError before the native stack overflows. */
+    char CharOnStack = 0;
+    char *volatile Ptr = &CharOnStack;
+    return (uintptr_t) Ptr;
+#elif defined(__clang__) || defined(__GNUC__)
     return (uintptr_t)__builtin_frame_address(0);
 #elif defined(_MSC_VER)
     return (uintptr_t)_AddressOfReturnAddress();
@@ -2758,15 +2770,23 @@ JSRuntime *JS_GetRuntime(JSContext *ctx)
 
 static void update_stack_limit(JSRuntime *rt)
 {
-#if defined(__wasi__)
-    rt->stack_limit = 0; /* no limit */
-#else
+    /* Engram patch: upstream disables the JS stack-overflow guard entirely under
+     * __wasi__ (stack_limit = 0 / no limit), which makes JS_SetMaxStackSize a no-op
+     * and lets deep sync recursion overrun the native wasm linear stack into an
+     * UNCATCHABLE `unreachable` trap that corrupts the whole instance. Under
+     * clang-wasm, __builtin_frame_address(0) (js_get_stack_pointer) returns a valid,
+     * monotonically-decreasing linear-memory address and JS_UpdateStackTop captures a
+     * real stack_top at runtime init, so the guard works correctly here. We therefore
+     * HONOR an explicitly-configured stack_size even on wasi (default stack_size stays
+     * 0 = no limit, so behavior is unchanged unless JS_SetMaxStackSize is called). The
+     * engine sets rt.set_max_stack_size(256KB) so QuickJS now throws a CATCHABLE
+     * RangeError before the native 8MB linker stack can overflow — no instance
+     * corruption (see the sizing rationale in engine/src/lib.rs build_runtime). */
     if (rt->stack_size == 0) {
         rt->stack_limit = 0; /* no limit */
     } else {
         rt->stack_limit = rt->stack_top - rt->stack_size;
     }
-#endif
 }
 
 void JS_SetMaxStackSize(JSRuntime *rt, size_t stack_size)

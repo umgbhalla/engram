@@ -18,203 +18,37 @@
 // The engine ABI (C exports) is documented in engine/src/lib.rs.
 
 import { transformCell, wrapAsyncCompletion } from "./repl-transform.js";
+// sucrase: a fast, pure-JS TypeScript -> JavaScript transformer. esbuild (build-ts) INLINES this
+// devDependency into kernel-glue.mjs (it is pure JS, runs inside workerd). We use it as the TS
+// type eraser for REPL cells (replacing the hand-rolled regex eraser): it strips all TS type
+// syntax (annotations / generics / interfaces / `as` / `satisfies`) AND transforms enum -> IIFE,
+// while `disableESTransforms:true` leaves ES module / async / spread syntax untouched so the engine
+// (which targets a modern ES2022 VM) still receives valid modern JS. The downstream transformCell
+// re-tokenizes its input, so sucrase's non-length-preserving output is fine here.
+import { transform as sucraseTransform } from "sucrase";
+// Outbound TCP/TLS host provider (cloudflare:sockets). JS module; cloudflare:sockets is kept
+// EXTERNAL by build-ts and resolved by workerd at runtime. Backs the VM-side net/tls shims.
+// @ts-ignore — JS sibling module, no .d.ts; typed `any` here.
+import { makeSocketHost } from "./host-sockets.mjs";
 
-// stripTypes: erase common TS type syntax to whitespace (length-preserving, no codegen) so the
-// downstream depth-0 declaration tokenizer in repl-transform.ts still sees the same offsets.
-// This intentionally avoids bundling the full TypeScript compiler into kernel-glue.mjs: wasm-bindgen
-// embeds this module as a JS snippet during the Rust worker-shell build, and a huge glue file makes
-// rustc's const evaluation peg a core for minutes. The eraser is deliberately conservative; if it
-// sees syntax that needs runtime codegen, it rejects before eval with a typed TypeScriptError.
+// stripTypes: erase TypeScript type syntax via sucrase (a fast, pure-JS TS->JS transformer that is
+// inlined into kernel-glue.mjs by esbuild and runs inside workerd). Replaces the former hand-rolled
+// regex eraser. `transforms:['typescript']` strips all type-only syntax (annotations, generics,
+// interfaces, type aliases, `as`/`satisfies`, declare) AND lowers `enum` -> an IIFE (the hand-rolled
+// eraser rejected enum); `disableESTransforms:true` leaves ES module / async / spread untouched so
+// the modern-ES2022 VM still receives valid modern JS. On genuinely-broken TS, sucrase throws a parse
+// error -> we re-tag it as a typed TypeScriptError so the cell rejects cleanly (socket alive, mutex
+// released, next eval works) instead of crashing. Output is NOT length-preserving, but the downstream
+// transformCell re-tokenizes its input, so offsets do not need to be stable. Disabled when config
+// {typescript:false}.
 function stripTypes(src: string): string {
-  if (!/[<:>]|\b(?:type|interface|declare|abstract|enum|namespace|module|as|satisfies)\b/.test(src)) return src;
-
-  const masked = maskNonCode(src);
-  const reject = (message: string): never => {
-    const e = new Error(message);
-    (e as Error & { name: string }).name = "TypeScriptError";
-    throw e;
-  };
-  if (/\b(?:const\s+)?enum\s+[A-Za-z_$]/.test(masked)) {
-    reject("un-erasable TypeScript construct: enum is not supported");
-  }
-  if (/\b(?:namespace|module)\s+[A-Za-z_$][\w$]*\s*\{/.test(masked)) {
-    reject("un-erasable TypeScript construct: namespace/module is not supported");
-  }
-  if (/\bconstructor\s*\([^)]*\b(?:public|private|protected|readonly)\b/.test(masked)) {
-    reject("un-erasable TypeScript construct: parameter properties are not supported");
-  }
-
-  const out = src.split("");
-  const blank = (start: number, end: number) => {
-    for (let i = Math.max(0, start); i < Math.min(out.length, end); i++) {
-      if (out[i] !== "\n" && out[i] !== "\r") out[i] = " ";
-    }
-  };
-
-  for (const m of masked.matchAll(/\binterface\s+[A-Za-z_$][\w$]*/g)) {
-    const start = m.index || 0;
-    const brace = masked.indexOf("{", start + m[0].length);
-    if (brace < 0) reject("invalid TypeScript interface declaration");
-    const endBrace = findMatching(masked, brace, "{", "}");
-    if (endBrace < 0) reject("invalid TypeScript interface declaration");
-    let end = endBrace + 1;
-    while (/\s/.test(masked[end] || "")) end++;
-    if (masked[end] === ";") end++;
-    blank(start, end);
-  }
-
-  for (const m of masked.matchAll(/\btype\s+[A-Za-z_$][\w$]*\b/g)) {
-    const start = m.index || 0;
-    const eq = masked.indexOf("=", start + m[0].length);
-    if (eq < 0) continue;
-    blank(start, findStatementEnd(masked, eq + 1));
-  }
-
-  for (const m of masked.matchAll(/\bdeclare\b/g)) {
-    const start = m.index || 0;
-    let end = findStatementEnd(masked, start + m[0].length);
-    const brace = masked.indexOf("{", start + m[0].length);
-    if (brace >= 0 && brace < end) {
-      const endBrace = findMatching(masked, brace, "{", "}");
-      if (endBrace >= 0) end = endBrace + 1;
-    }
-    blank(start, end);
-  }
-
-  for (const m of masked.matchAll(/\babstract\b/g)) blank(m.index || 0, (m.index || 0) + m[0].length);
-
-  for (let i = 0; i < masked.length; i++) {
-    if (masked[i] !== "<") continue;
-    const end = findMatching(masked, i, "<", ">");
-    if (end < 0) continue;
-    const body = masked.slice(i + 1, end);
-    const next = nextNonSpace(masked, end + 1);
-    const prev = prevNonSpace(masked, i - 1);
-    if (
-      next >= 0 && masked[next] === "(" &&
-      /^[\sA-Za-z_$][\w$\s,=.\[\]|&?]*(?:extends\s+[\w$\s.\[\]|&?]+)?[,]?\s*$/.test(body) &&
-      (prev < 0 || /[=,(]|[A-Za-z_$0-9]/.test(masked[prev]))
-    ) {
-      blank(i, end + 1);
-      i = end;
-    }
-  }
-
-  eraseTypeAnnotations(masked, blank);
-  eraseAssertionLike(masked, /\bas\b/g, blank);
-  eraseAssertionLike(masked, /\bsatisfies\b/g, blank);
-
-  return out.join("");
-}
-
-function maskNonCode(src: string): string {
-  const out = src.split("");
-  for (let i = 0; i < out.length; i++) {
-    const ch = out[i], n = out[i + 1];
-    if (ch === "/" && n === "/") {
-      for (let j = i; j < out.length && out[j] !== "\n"; j++) out[j] = " ";
-    } else if (ch === "/" && n === "*") {
-      out[i] = out[i + 1] = " ";
-      for (let j = i + 2; j < out.length; j++) {
-        const end = out[j] === "*" && out[j + 1] === "/";
-        if (out[j] !== "\n" && out[j] !== "\r") out[j] = " ";
-        if (end) { if (out[j + 1] !== "\n" && out[j + 1] !== "\r") out[j + 1] = " "; i = j + 1; break; }
-      }
-    } else if (ch === '"' || ch === "'" || ch.charCodeAt(0) === 96) {
-      const quote = ch;
-      out[i] = " ";
-      for (let j = i + 1; j < out.length; j++) {
-        const c = out[j];
-        if (c === "\\") {
-          if (out[j] !== "\n" && out[j] !== "\r") out[j] = " ";
-          if (out[j + 1] !== "\n" && out[j + 1] !== "\r") out[j + 1] = " ";
-          j++;
-          continue;
-        }
-        if (c !== "\n" && c !== "\r") out[j] = " ";
-        if (c === quote) { i = j; break; }
-      }
-    }
-  }
-  return out.join("");
-}
-
-function findMatching(src: string, start: number, open: string, close: string): number {
-  let depth = 0;
-  for (let i = start; i < src.length; i++) {
-    if (src[i] === open) depth++;
-    else if (src[i] === close && --depth === 0) return i;
-  }
-  return -1;
-}
-
-function findStatementEnd(src: string, start: number): number {
-  let paren = 0, brace = 0, bracket = 0;
-  for (let i = start; i < src.length; i++) {
-    const ch = src[i];
-    if (ch === "(") paren++;
-    else if (ch === ")") paren = Math.max(0, paren - 1);
-    else if (ch === "{") brace++;
-    else if (ch === "}") brace = Math.max(0, brace - 1);
-    else if (ch === "[") bracket++;
-    else if (ch === "]") bracket = Math.max(0, bracket - 1);
-    else if (ch === ";" && paren === 0 && brace === 0 && bracket === 0) return i + 1;
-  }
-  return src.length;
-}
-
-function nextNonSpace(src: string, i: number): number {
-  while (i < src.length && /\s/.test(src[i])) i++;
-  return i < src.length ? i : -1;
-}
-
-function prevNonSpace(src: string, i: number): number {
-  while (i >= 0 && /\s/.test(src[i])) i--;
-  return i;
-}
-
-function eraseTypeAnnotations(src: string, blank: (start: number, end: number) => void): void {
-  let paren = 0, brace = 0, bracket = 0;
-  for (let i = 0; i < src.length; i++) {
-    const ch = src[i];
-    if (ch === "(") paren++;
-    else if (ch === ")") paren = Math.max(0, paren - 1);
-    else if (ch === "{") brace++;
-    else if (ch === "}") brace = Math.max(0, brace - 1);
-    else if (ch === "[") bracket++;
-    else if (ch === "]") bracket = Math.max(0, bracket - 1);
-    if (ch !== ":" || brace > 0 || bracket > 0) continue;
-    const prev = prevNonSpace(src, i - 1);
-    const next = nextNonSpace(src, i + 1);
-    if (prev < 0 || next < 0 || !/[A-Za-z_$)\]}]/.test(src[prev]) || !/[A-Za-z_$\[{]/.test(src[next])) continue;
-    const end = findTypeEnd(src, i + 1);
-    if (end > i + 1) blank(i, end);
-  }
-}
-
-function findTypeEnd(src: string, start: number): number {
-  let angle = 0, paren = 0, bracket = 0, brace = 0;
-  for (let i = start; i < src.length; i++) {
-    const ch = src[i], n = src[i + 1];
-    if (ch === "<") angle++;
-    else if (ch === ">" && angle > 0) angle--;
-    else if (ch === "(") paren++;
-    else if (ch === ")" && paren > 0) paren--;
-    else if (ch === "[") bracket++;
-    else if (ch === "]" && bracket > 0) bracket--;
-    else if (ch === "{") brace++;
-    else if (ch === "}" && brace > 0) brace--;
-    if (angle || paren || bracket || brace) continue;
-    if (ch === "=" && n === ">") return i;
-    if (/[=,);{}]/.test(ch)) return i;
-  }
-  return src.length;
-}
-
-function eraseAssertionLike(src: string, re: RegExp, blank: (start: number, end: number) => void): void {
-  for (const m of src.matchAll(re)) {
-    const start = m.index || 0;
-    blank(start, findTypeEnd(src, start + m[0].length));
+  try {
+    return sucraseTransform(src, { transforms: ["typescript"], disableESTransforms: true }).code;
+  } catch (e) {
+    const msg = (e as { message?: string })?.message || String(e);
+    const err = new Error(`TypeScript transform failed: ${msg}`);
+    (err as Error & { name: string }).name = "TypeScriptError";
+    throw err;
   }
 }
 
@@ -225,6 +59,8 @@ interface EngineExports {
   create(clockSeed: bigint, rngSeed: bigint): void;
   reattach(): number;
   set_counters(clockCalls: bigint, rngCalls: bigint): void;
+  // set the in-VM monotonic CLOCK directly (next __now = 1.7e12 + CLOCK). clock:real re-anchor only.
+  set_clock(clock: bigint): void;
   clock_calls(): number | bigint;
   rng_calls(): number | bigint;
   buffer_bytes(): number | bigint;
@@ -266,6 +102,11 @@ type HostResult =
   | { ok: false; error: string };
 interface KernelConfig {
   rngSeed?: number;
+  // clock mode. UNSET / anything but "real" ⇒ SEEDED (deterministic): the in-VM clock starts at the
+  // 1.7e12 epoch (Nov 2023), +1ms/call, byte-identical across restore. "real" ⇒ seed the in-VM clock
+  // from the DO's real host-side wall clock at create so Date/now() reflect the real year/time (still
+  // frozen-in-turn + deterministic +1ms/call from a real base). Persisted across cold restore.
+  clock?: "real" | "seeded" | string;
   typescript?: boolean;
   // egress allowlist. UNSET ⇒ ALLOW-ALL egress (default); false ⇒ block all; [hosts] ⇒ hostname
   // allowlist. A blocked host rejects with FetchBlockedError (socket stays alive).
@@ -534,6 +375,178 @@ export function resolveHostCall(id: string, ok: boolean, valueJson: string, erro
   }
 }
 
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// WORKER REGISTRY — content-addressed Dynamic-Worker-Loader compute (lib.rs routes the worker-*
+// frames here; the Rust DO never calls env.LOADER itself because LOADER is JS-shaped).
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+// Harness/ABI version. BUMP whenever HARNESS_SRC or the env shape (VfsGateway props / module dict)
+// changes — the Worker-Loader docs REQUIRE that the loader callback returns IDENTICAL content for a
+// given codeId, and the warm cache keys on the codeId ONLY. Bumping the prefix invalidates stale
+// warm isolates so an old harness can never serve a new env shape.
+const REGISTRY_ABI = "wkr1";
+// Match the kernel's wrangler compatibility_date so the loaded isolate's runtime semantics line up.
+const REGISTRY_COMPAT_DATE = "2025-05-01";
+// Per-invoke caps surfaced to the dynamic worker. cpuMs is the WorkerCode limit (exceeding it
+// "immediately throws"); the DO also races a wall timeout in lib.rs.
+const REGISTRY_DEFAULT_CPU_MS = 5000;
+
+// The registry-owned adapter (mainModule). CONSTANT — versioned via REGISTRY_ABI, never perturbing
+// user source hashes (the hash covers ONLY user.js). It imports the registered user source and
+// adapts BOTH supported contracts:
+//   A. export async function run(input, env) { ...; return jsonable }   (also export default {run})
+//   B. export default { async fetch(req, env) { ... } }                 (raw/streaming escape hatch)
+// Input crosses as the POST body (JSON); output crosses back as the {ok, output|error} envelope.
+// env.VFS is the session-scoped, prefix-isolated VFS gateway; globalOutbound:null = no egress.
+const HARNESS_SRC = `import * as user from "./user.js";
+export default {
+  async fetch(req, env) {
+    // Read the inbound body EXACTLY ONCE. The input crosses the Worker-Loader
+    // entrypoint boundary as the request body (a fresh ArrayBuffer constructed
+    // DO-side, never a re-forwarded already-disturbed stream). req.text() drains
+    // the stream a single time; we keep the raw text so the run() path JSON-parses
+    // it AND the raw-fetch escape hatch can reconstruct a FRESH unconsumed Request
+    // (the original req's body is spent after this single read). An empty body =>
+    // null input.
+    let rawBody = "";
+    try { rawBody = await req.text(); } catch (_) { rawBody = ""; }
+    let input = null;
+    try { input = rawBody ? JSON.parse(rawBody) : null; } catch (_) { input = null; }
+    const run = (typeof user.run === "function" && user.run)
+      || (user.default && typeof user.default.run === "function" && user.default.run);
+    if (run) {
+      try {
+        const output = await run(input, env);
+        return Response.json({ ok: true, output: output === undefined ? null : output });
+      } catch (e) {
+        return Response.json({ ok: false, error: { name: (e && e.name) || "WorkerRuntimeError", message: String((e && e.message) || e) } });
+      }
+    }
+    if (user.default && typeof user.default.fetch === "function") {
+      // Hand the raw-fetch worker a FRESH Request with an UNCONSUMED body (req's
+      // body was already drained above to extract input).
+      const fresh = new Request(req.url, { method: req.method, headers: req.headers, body: rawBody || undefined });
+      return user.default.fetch(fresh, env);
+    }
+    return Response.json({ ok: false, error: { name: "ContractError", message: "export run(input, env) or default {fetch}" } });
+  }
+};
+`;
+
+// Normalize a VFS path EXACTLY as lib.rs norm_fs_path does: strip leading '/', collapse empty/'.'
+// segments, resolve '..' by popping, REJECT a NUL byte. Returns a leading-slash path. The VfsGateway
+// (entry.ts) MUST use this same helper so its fs/<doId>/<normpath> key byte-for-byte matches the
+// kernel + vfs-* key scheme — any drift is a sandbox-escape / coherence bug. Kept here so lib.rs's
+// trusted do_id + this normalization are the only inputs to the dynamic worker's R2 reach.
+export function normFsPath(p: string): string {
+  if (p.indexOf(" ") >= 0) throw new Error("EINVAL: path contains NUL byte");
+  const out: string[] = [];
+  for (const seg of String(p).split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") { out.pop(); continue; }
+    out.push(seg);
+  }
+  return "/" + out.join("/");
+}
+
+// Minimal shape of the bits of env/ctx the registry needs (env/ctx arrive as raw JsValue from
+// lib.rs — typed loosely to avoid coupling to the worker-rs Env type).
+interface LoaderEnv {
+  LOADER?: {
+    get(codeId: string, cb: () => unknown): { getEntrypoint(name: string | null, opts?: unknown): { fetch(req: Request): Promise<Response> } };
+  };
+}
+interface CtxExports {
+  exports?: { VfsGateway?: (opts: { props: { doId: string } }) => unknown };
+}
+
+// worker-invoke entry: load the registered source into a FRESH Worker-Loader isolate keyed on the
+// content hash (warm-cache dedup), hand it the prefix-isolated VFS gateway, run it via fetch(POST
+// input), return the harness envelope string verbatim. lib.rs wraps the string into the
+// worker-invoke-result frame. THROWS a typed Error (RegistryUnavailableError) when the loader or
+// ctx.exports.VfsGateway is unavailable — NEVER falls back to passing the raw bucket (the leak).
+export async function registryInvoke(
+  env: unknown,
+  ctx: unknown,
+  doId: string,
+  hash: string,
+  source: string,
+  inputJson: string,
+  optsJson: string,
+): Promise<string> {
+  const e = env as LoaderEnv;
+  if (!e || !e.LOADER || typeof e.LOADER.get !== "function") {
+    const err = new Error("env.LOADER unavailable (Worker Loader binding missing; needs Workers Paid + the LOADER binding)");
+    err.name = "RegistryUnavailableError";
+    throw err;
+  }
+  let opts: { timeoutMs?: number; cpuMs?: number } = {};
+  try { opts = JSON.parse(optsJson) || {}; } catch (_) { /* defaults */ }
+  const cpuMs = typeof opts.cpuMs === "number" && opts.cpuMs > 0 ? opts.cpuMs : REGISTRY_DEFAULT_CPU_MS;
+
+  // VFS gateway: a loopback WorkerEntrypoint instance bound to the TRUSTED doId (props.doId is
+  // injected here from lib.rs's state.id(), NEVER chosen by the dynamic worker). FAIL CLOSED if
+  // ctx.exports.VfsGateway is unavailable — do not hand the worker any bucket.
+  // ctx arrives NULL from lib.rs (worker-rs keeps the DO ctx JsValue private across the
+  // wasm-bindgen boundary). entry.ts captures the DO ctx — which carries `.exports` under the
+  // enable_ctx_exports flag — into globalThis.__ENGRAM_DO_CTX keyed by the TRUSTED lowercase-hex
+  // doId. Resolve it here so ctx.exports.VfsGateway is available. The doId is still the trusted
+  // value lib.rs passed (state.id()), so prefix isolation is unchanged.
+  let c = ctx as CtxExports;
+  if (!c || !c.exports || typeof c.exports.VfsGateway !== "function") {
+    const map = (globalThis as { __ENGRAM_DO_CTX?: Map<string, unknown> }).__ENGRAM_DO_CTX;
+    const captured = map && map.get(String(doId).toLowerCase());
+    if (captured) c = captured as CtxExports;
+  }
+  const vfsExport = c && c.exports && c.exports.VfsGateway;
+  if (typeof vfsExport !== "function") {
+    const err = new Error(
+      "ctx.exports.VfsGateway unavailable — registry compute requires the enable_ctx_exports compat flag + the VfsGateway top-level export (fail-closed: never hand the dynamic worker the raw bucket)",
+    );
+    err.name = "RegistryUnavailableError";
+    throw err;
+  }
+  const vfsStub = vfsExport({ props: { doId: String(doId) } });
+
+  // doIdShort: first 16 hex of the DO id. MANDATORY in the codeId so two sessions sharing a hash
+  // get SEPARATE warm isolates with SEPARATE VFS env (the warm cache keys on the codeId only — a
+  // hash-only codeId would let session B's invoke hit session A's warm isolate and write fs/<A>/).
+  const doIdShort = String(doId).replace(/[^0-9a-f]/gi, "").slice(0, 16) || "0";
+  const codeId = `${REGISTRY_ABI}:${doIdShort}:${hash}`;
+
+  const stub = e.LOADER.get(codeId, () => ({
+    compatibilityDate: REGISTRY_COMPAT_DATE,
+    mainModule: "harness.js",
+    modules: {
+      "harness.js": HARNESS_SRC,   // registry-owned adapter (constant, versioned via REGISTRY_ABI)
+      "user.js": source,            // the registered, hash-identified source (plain string = ESM)
+    },
+    env: { VFS: vfsStub },          // session-scoped, prefix-isolated VFS gateway — the ONLY I/O
+    globalOutbound: null,           // deny ALL egress: fetch()/connect() throw inside the worker
+    limits: { cpuMs },              // WorkerCode-level CPU cap (isolate startup counts)
+  }));
+
+  const ep = stub.getEntrypoint(null, { limits: { cpuMs } });
+  // Pass the input as the request body. CRITICAL: encode it to a FRESH Uint8Array
+  // (ArrayBuffer-backed) body, NOT a string. A string body is a lazily-realized
+  // ReadableStream whose single read is consumed by the Worker-Loader entrypoint
+  // dispatch (transfer across the loaded-isolate boundary), so the harness's own
+  // body read then throws "Body has already been used. It can only be used once."
+  // An ArrayBuffer body is materialized up-front and is delivered to the loaded
+  // worker intact + unconsumed, so the harness reads it exactly once. (`inputJson`
+  // is a plain JSON string here — produced DO-side in lib.rs::worker_invoke — never
+  // an already-disturbed inbound stream.)
+  const inputBytes = TEXT_ENC.encode(inputJson);
+  const res = await ep.fetch(
+    new Request("https://invoke/", {
+      method: "POST",
+      body: inputBytes,
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  return await res.text();
+}
+
 // ---- the GlueKernel the Rust DO drives ----
 export function newGlueKernel(): GlueKernel {
   return new GlueKernel();
@@ -596,6 +609,12 @@ const EXT_MAX_RESULT_BYTES = 65536;
 // Idle deadline for a parked recv(): if no frame arrives within this window the recv resolves
 // {type:"idle"} so the cell ends and the eval mutex turns over (never hold it forever).
 const WS_RECV_IDLE_MS = 25000;
+// (#5) Polling cadence WITHIN a parked recv. A parked recv re-checks its inbound queue every
+// WS_RECV_POLL_MS via setTimeout — each tick is a fresh workerd I/O turn that lets the outbound
+// socket's `message` listener run (enqueueing the frame), guaranteeing same-cell echo delivery
+// (the cross-cell-works/same-cell-fails bug). Small enough for low echo latency, large enough that
+// the poll loop adds negligible overhead vs a single long park. The direct waiter still wins races.
+const WS_RECV_POLL_MS = 15;
 // Bounded inbound queue per handle (backpressure between pump cells). Over this, drop-oldest and
 // surface a typed {type:"overflow"} marker so loss is visible + deterministic-on-record.
 const WS_QUEUE_MAX_FRAMES = 1024;
@@ -856,6 +875,10 @@ function b64ToBytes(b64: string): Uint8Array {
 // cap untouched, per the task). The W4 delta path is preserved for all buffer sizes (resetting it to
 // full would also reset the engine-migration oplog tail — see lib.rs checkpoint full path).
 const SCRATCH_DELTA_BYTES = 31 * 1024 * 1024;       // 32MB scratch - the old 1MB it replaced
+// In-VM clock epoch base: the engine's __now adds this (1.7e12 = Nov 2023) to clock_seed+tick.
+// MUST stay in lockstep with engine/src/lib.rs (1_700_000_000_000.0 in inject_host_fns __now).
+// config.clock==='real' seeds clock_seed = realEpochMs - CLOCK_EPOCH_BASE_MS so the VM clock reads real.
+const CLOCK_EPOCH_BASE_MS = 1_700_000_000_000;
 const MAX_USED_BYTES = 50 * 1024 * 1024;            // refuse snapshot above ~50MB live used heap
 const MAX_RESTORE_USED_BYTES = 50 * 1024 * 1024;    // refuse restore above ~50MB recorded used heap
 const SAFE_SERIALIZE_BUFFER_BYTES = 45 * 1024 * 1024 + SCRATCH_DELTA_BYTES; // 76MB raw-image cap (+31MB resident scratch)
@@ -964,6 +987,10 @@ class GlueKernel {
   // instance), NEVER in the heap blit — so it dies with the isolate at eviction, which IS the
   // StreamExpired-on-wake semantic. streamRead pulls one upstream chunk per call (backpressure).
   _streams?: Map<string, StreamState>;
+  // OUTBOUND TCP/TLS (cloudflare:sockets): the live socket provider holds its Socket Map in
+  // DO-instance memory (never snapshotted) — dies on eviction; the VM heap keeps only the integer
+  // handleId token, which reads as ECONNRESET after a cold restore. Lazily constructed.
+  _sockets?: ReturnType<typeof makeSocketHost>;
   // WEBSOCKET-CLIENT-IN-VM (#12): DO-side registry of live outbound WebSockets, keyed by a
   // deterministic handleId (`ws:${doId}:${cell}:${ordinal}`). Lives in DO memory (GlueKernel
   // instance), NEVER in the heap blit — so it dies with the isolate at eviction, which IS the
@@ -980,6 +1007,18 @@ class GlueKernel {
   _extTools?: Map<string, { ext: string; callsPerCell: number; maxResultBytes: number }>;
   _extOps?: Map<string, number>;
   _aeExt?: (op: string) => void;
+
+  // SANDBOX BRIDGE (additive host effect): config the DO installs per-eval (setSandboxConfig) so the
+  // in-cell `host.sandbox.*` effect can DO-side fetch the engram-sandbox container worker. The URL +
+  // Bearer key are read from the kernel ENV by lib.rs and NEVER cross into the VM heap — the cell only
+  // ever sees the effect NAME (host.sandbox.exec); the key lives in DO-instance memory. _sandboxDoId is
+  // the trusted KERNEL DO id (the R2 prefix `fs/<doId>/` the sandbox mounts as /session). Capability-
+  // gated: _sandboxEnabled mirrors config.sandbox — without it every sandbox.* call returns
+  // SandboxUnavailable.
+  _sandboxUrl?: string | null;
+  _sandboxKey?: string | null;
+  _sandboxDoId?: string;
+  _sandboxEnabled?: boolean;
 
   constructor() {
     this.inst = null;
@@ -1023,6 +1062,18 @@ class GlueKernel {
   // `null` clears it (facet/HTTP path or no AE binding).
   setExtAeSink(sink: ((op: string) => void) | null): void {
     this._aeExt = typeof sink === "function" ? sink : undefined;
+  }
+
+  // setSandboxConfig: the DO (lib.rs) installs (per eval) the engram-sandbox endpoint + Bearer key
+  // (read from kernel ENV: ENGRAM_SANDBOX_URL / ENGRAM_SANDBOX_KEY) + the trusted KERNEL do_id + the
+  // capability flag (config.sandbox). The VM NEVER sees the key — only the host.sandbox.* effect names
+  // cross the engine boundary; the key is added DO-side in _doSandbox. Pass enabled=false (or url/key
+  // null) to gate the route off (SandboxUnavailable). Mirrors setFsHandler / setFenceContext.
+  setSandboxConfig(url: string | null, key: string | null, doId: string, enabled: boolean): void {
+    this._sandboxUrl = url || null;
+    this._sandboxKey = key || null;
+    this._sandboxDoId = doId || "";
+    this._sandboxEnabled = !!enabled;
   }
 
   // _seedExtMeta: EXTENSIBILITY API — REDUCED Phase 1 (#32) discoverability WITHOUT an engine edit.
@@ -1157,8 +1208,22 @@ class GlueKernel {
     } catch { /* keep empty */ }
     this.config = cfg;
     this.rngSeed = ((cfg.rngSeed ?? 0) >>> 0) || 42;
-    // clock seed: seeded sessions start at 0 tick (engine adds the 1.7e12 epoch).
-    this.clockSeed = 0;
+    // clock seed: the engine's in-VM millisecond clock returns (CLOCK_EPOCH_BASE_MS + clockSeed +
+    // tick). Seeded sessions (the default) use clockSeed=0 → epoch starts at 1.7e12 (Nov 2023),
+    // +1ms/call, byte-identical across restore. config.clock==='real' seeds clockSeed from the DO's
+    // REAL host-side wall clock at create so the in-VM Date/now() reflects the real year/time. It is
+    // STILL frozen-in-turn (workerd freezes wall time within a turn) and ticks +1ms/call determinist-
+    // ically — acceptable: the clock advances monotonically from a real base, not from 2023. Persisted
+    // via configJson across cold restore (same path as rngSeed); the live clock value is also blitted
+    // in the heap so a restore continues from where it was, and a re-create (replayJournal) re-seeds
+    // from the then-current real epoch.
+    if (cfg.clock === "real") {
+      const realOffset = Date.now() - CLOCK_EPOCH_BASE_MS;
+      // clamp to non-negative (engine clock_seed is u64); real epoch is always > base, but guard.
+      this.clockSeed = realOffset > 0 ? realOffset : 0;
+    } else {
+      this.clockSeed = 0;
+    }
     // TypeScript strip: default TRUE (stripping valid JS is a safe near no-op); {typescript:false}
     // disables. Persisted via configJson across cold restore (same path as clock/rngSeed).
     this.tsEnabled = cfg.typescript !== false;
@@ -1468,6 +1533,31 @@ class GlueKernel {
     }
     try {
       const ex = this._ex();
+      // CLOCK:REAL RE-ANCHOR (#7) — at the START of each eval, in clock:real mode ONLY, re-seed the
+      // in-VM monotonic CLOCK to the DO's REAL wall-clock so Date.now() reflects real inter-cell
+      // elapsed time (not just +1ms per call). The engine's __now returns 1.7e12 + CLOCK, so set
+      // CLOCK = realNow - 1.7e12. workerd freezes the clock IN-turn, so within a cell the clock keeps
+      // its +1ms-per-call monotonic step (unavoidable). We NEVER move the clock backwards: if real
+      // wall time somehow reads below the current VM clock (clock skew / replay), keep the higher VM
+      // value (monotonic guarantee preserved). SEEDED (default) mode is untouched -> still byte-
+      // identical/deterministic across restore. DETERMINISM BREAK is intentional + documented for
+      // clock:real: a real wall-clock base is, by definition, non-reproducible across runs.
+      if (this.config.clock === "real") {
+        try {
+          const realNow = Date.now();
+          const target = realNow - CLOCK_EPOCH_BASE_MS;             // desired CLOCK so next __now == realNow
+          // current VM clock value = base offset + ticks-so-far; clock_calls() == number of +1ms steps.
+          const curClock = this.clockSeed + Number(ex.clock_calls());
+          // monotonic: only advance. If real time is behind the VM clock, hold the VM clock.
+          const next = target > curClock ? target : curClock;
+          if (next >= 0) {
+            ex.set_clock(BigInt(next));
+            // keep this.clockSeed coherent so a subsequent within-process read (and the snapshot's
+            // recorded seed) reflects the re-anchored base: seed = CLOCK - ticks-so-far.
+            this.clockSeed = next - Number(ex.clock_calls());
+          }
+        } catch { /* engine lacks set_clock (older build) -> leave clock as-is */ }
+      }
       // REPL-persistence transform: rewrite top-level let/const/function/class declarations into
       // global assignments so they persist across cells (Node-REPL semantics), preserving the
       // completion value. Pure deterministic pre-eval source rewrite; falls back to the ORIGINAL
@@ -1508,7 +1598,28 @@ class GlueKernel {
       // cell (e.g. fetching + writing a 2.2MB PDF) could finish (~150k ticks observed for 2.2MB).
       // Memory bombs are still caught by the grow-cap tripwire + rquickjs heap limit; the platform
       // also bounds wall-clock CPU. Overridable per-session via config.cellBudgetTicks.
-      const budget = BigInt((this.config.cellBudgetTicks ?? 0) || 500000);
+      // ENFORCEABILITY NOTE (config.cellBudgetTicks, the TIMEOUT fence): the budget counts
+      // INTERRUPT-HANDLER invocations, which QuickJS fires every ~Nk bytecodes. workerd THROTTLES the
+      // host interrupt callback after ~1.6k invocations PER TURN, so the tick budget can only reliably
+      // fence a cell that keeps STEPPING BYTECODE past that floor — i.e. the budget reliably trips
+      // bytecode-heavy work (a big base64 decode of a fetch body burns ~150k ticks for 2.2MB, which is
+      // exactly why the default is 500000, NOT ~1500). A truly TIGHT CPU loop (e.g. `for(;;)x+=i`)
+      // outruns the throttled callback and is NOT killed by this budget — it falls to the platform 30s
+      // CPU limit and ends with a WS-1006 (recover via reconnect or .reset). We do NOT lower the default
+      // (that would false-trip legitimate big-payload cells, reopening the big-payload regression that
+      // motivated 1200->500000). We DO clamp the configured value to a sane bounded range so a
+      // negative/NaN/absurd config can't disable the fence or overflow. A deeper fix (a real CPU-time
+      // deadline) is moot here: workerd freezes the wall clock in-turn, so there is no in-turn clock to
+      // deadline against. See docs/results/v0.2.md (infinite-loop hole) + the v0.8 mid-cell tripwire.
+      const CELL_BUDGET_TICKS_MIN = 1;
+      const CELL_BUDGET_TICKS_DEFAULT = 500000;
+      const CELL_BUDGET_TICKS_MAX = 5_000_000; // documented ceiling: above this the budget adds no real
+      // fence (the workerd interrupt throttle dominates) and only delays a clean reject; bound it.
+      const rawBudget = this.config.cellBudgetTicks;
+      const budgetN = Number.isFinite(rawBudget) && (rawBudget as number) > 0
+        ? Math.min(Math.max(Math.floor(rawBudget as number), CELL_BUDGET_TICKS_MIN), CELL_BUDGET_TICKS_MAX)
+        : CELL_BUDGET_TICKS_DEFAULT;
+      const budget = BigInt(budgetN);
       // Per-cell linear-memory growth cap (pages, 64KB each). Default raised 128p/8MB -> 1024p/64MB:
       // a single cell may legitimately pull in a fetch body up to FETCH_MAX_BODY_BYTES (32MB) and
       // then hold a working copy or two (decoded bytes, an fs write) while it runs — the old 8MB cap
@@ -1543,7 +1654,9 @@ class GlueKernel {
       this._extOps = new Map<string, number>();
       while (status === STATUS_HOST_CALL && guard <= maxHostCalls && streamOps <= maxStreamOps && wsOps <= maxWsOps && fsOps <= maxFsOps) {
         const req = this._readHostCall();
-        const isStreamOp = req.name === "streamRead" || req.name === "streamWrite";
+        // socket.read/write are the per-chunk TCP pump ops; budget them with streams so a long
+        // socket transfer is not capped by the 64 host-call guard (open/startTls/close stay guarded).
+        const isStreamOp = req.name === "streamRead" || req.name === "streamWrite" || req.name === "socket.read" || req.name === "socket.write";
         const isWsOp = req.name === "ws.recv" || req.name === "ws.poll" || req.name === "ws.send";
         const isFsOp = req.name === "__fs";
         if (isStreamOp) streamOps++; else if (isWsOp) wsOps++; else if (isFsOp) fsOps++; else guard++;
@@ -1596,6 +1709,48 @@ class GlueKernel {
 
   // host effects the ENGINE cannot do from wasip1: fetch (allowlisted). The RLM surface
   // (host.subLM / host.ctx.* / host.final / host.finalVar) and host.kv were removed.
+  // Lazily construct the outbound TCP/TLS provider (one per DO instance; holds live Sockets in
+  // memory, never snapshotted).
+  _sock(): ReturnType<typeof makeSocketHost> {
+    return (this._sockets ||= makeSocketHost());
+  }
+  // Soft-wrap a socket provider call: the provider returns {ok:true,value}/{ok:false,error,code};
+  // the engine rejects the VM promise on ok:false, but the VM net.js shim expects a RESOLVED value
+  // carrying `.error`. So always resolve ok:true, surfacing failures as inner {error,code}.
+  async _socketCall(p: Promise<{ ok: boolean; value?: unknown; error?: string; code?: string }>): Promise<HostResult> {
+    const r = await p;
+    if (r && r.ok) return { ok: true, value: r.value };
+    return { ok: true, value: { error: (r && r.error) || "socket error", code: r && r.code } };
+  }
+  // Extract the destination hostname from the many shapes net/tls pass: "host:port",
+  // "tcp://host:port", "[ipv6]:port", or { host|hostname, port }. Empty string if undeterminable.
+  _socketHostOf(addr: unknown, opts: unknown): string {
+    const o = opts as { host?: string; hostname?: string } | undefined;
+    if (o && (o.host || o.hostname)) return String(o.host || o.hostname);
+    if (addr && typeof addr === "object") {
+      const a = addr as { host?: string; hostname?: string };
+      if (a.host || a.hostname) return String(a.host || a.hostname);
+    }
+    if (typeof addr === "string") {
+      const s = addr;
+      if (s.includes("://")) { try { return new URL(s).hostname; } catch { return ""; } }
+      if (s.startsWith("[")) { const e = s.indexOf("]"); return e > 0 ? s.slice(1, e) : ""; }
+      return s.split(":")[0];
+    }
+    return "";
+  }
+  // socket.open with the SAME egress posture as fetch/ws: SSRF block (private/internal/metadata)
+  // + config.fetch allowlist. A blocked host resolves as a soft {error} (net.js emits ECONNREFUSED-
+  // shaped 'error', socket stays alive) — never a silent raw-TCP escape to internal addresses.
+  async _socketOpen(addr: unknown, opts: unknown): Promise<HostResult> {
+    const host = this._socketHostOf(addr, opts);
+    if (!host) return { ok: true, value: { error: "SocketError: could not determine destination host", code: "EINVAL" } };
+    if (isBlockedSsrfHost(host)) return { ok: true, value: { error: "FetchBlockedError: " + host + " is a blocked private/internal address", code: "EACCES" } };
+    const allow = this._fetchAllow;
+    const permitted = allow === true ? true : allow === false ? false : Array.isArray(allow) ? allow.includes(host) : false;
+    if (!permitted) return { ok: true, value: { error: "FetchBlockedError: " + host + " not allowed", code: "EACCES" } };
+    return this._socketCall(this._sock().open(addr, opts));
+  }
   async _serviceHostCall(req: HostCall): Promise<HostResult> {
     const name = req.name;
     const args = req.args || [];
@@ -1613,6 +1768,20 @@ class GlueKernel {
     if (name === "ws.recv") return this._wsRecv(args[0] as string, (args[1] as number) | 0, args[2] as number | undefined);
     if (name === "ws.poll") return this._wsPoll(args[0] as string, (args[1] as number) | 0);
     if (name === "ws.close") return this._wsClose(args[0] as string, args[1] as number | undefined, args[2] as string | undefined);
+    // OUTBOUND TCP/TLS (cloudflare:sockets): the VM-side net/tls shims PULL bytes over these five
+    // effects; the live Socket is DO-memory only (never snapshotted). The host provider returns its
+    // own {ok,value}/{ok:false,error} envelope; the engine resolves p.value on ok and REJECTS the VM
+    // promise on !ok — but the net.js shim checks `r.error` on a RESOLVED value, so we soft-wrap:
+    // every socket.* failure resolves as inner {error,code} (engine sees ok:true, VM sees r.error).
+    if (name === "socket.open") return this._socketOpen(args[0], args[1]);
+    if (name === "socket.write") return this._socketCall(this._sock().write(args[0], args[1] as string, !!args[2]));
+    if (name === "socket.read") return this._socketCall(this._sock().read(args[0]));
+    if (name === "socket.startTls") return this._socketCall(this._sock().startTls(args[0]));
+    if (name === "socket.close") return this._socketCall(this._sock().close(args[0]));
+    // SANDBOX BRIDGE (additive): `host.sandbox.*` is a DO-side host effect (like fetch) that proxies
+    // to the engram-sandbox container worker over the SHARED R2 VFS (the sandbox mounts `fs/<doId>/`
+    // as /session). Capability-gated by config.sandbox; the Bearer key is added DO-side, never in-VM.
+    if (name === "sandbox.exec" || name.startsWith("sandbox.")) return this._doSandbox(name, args);
     // host-backed fs (config.fs.provider != vfs): serviced DO-side via the installed _fsHandler.
 
     if (name === "__fs") return this._serviceFs(args[0] as Record<string, unknown>);
@@ -1643,6 +1812,122 @@ class GlueKernel {
       return res;
     }
     return this._clientHostCall(name, args);
+  }
+
+  // _doSandbox: DO-side host effect for the in-cell `host.sandbox.*` surface. Proxies to the
+  // engram-sandbox container worker (FIXED trusted URL -> no SSRF allowlist needed) carrying the
+  // trusted KERNEL do_id (x-engram-session => the R2 prefix `fs/<doId>/` the sandbox mounts as
+  // /session) + the Bearer key (added HERE, never visible to the VM). Capability-gated by
+  // config.sandbox: without it (or without a configured url/key) -> SandboxUnavailable. Returns
+  // {ok:true,value:json} on a 2xx, {ok:false,error} otherwise. Mirrors _doFetch's posture; the key
+  // and url live in DO-instance memory only (never in the heap blit, never in any client frame).
+  async _doSandbox(name: string, args: unknown[]): Promise<HostResult> {
+    if (!this._sandboxEnabled) {
+      return { ok: false, error: "SandboxUnavailable: config.sandbox not enabled" };
+    }
+    const url = this._sandboxUrl;
+    const key = this._sandboxKey;
+    if (!url || !key) {
+      return { ok: false, error: "SandboxUnavailable: sandbox endpoint/key not configured" };
+    }
+    const op = name.slice("sandbox.".length); // exec | git | writeFile | readFile | list | expose
+    const a0 = (args && args[0]) as Record<string, unknown> | string | number | undefined;
+    const a1 = (args && args[1]) as Record<string, unknown> | string | undefined;
+    // Route + method + body per op. Reads are GET with query params; mutations are POST JSON.
+    let route = "";
+    let method = "POST";
+    let body: Record<string, unknown> | undefined;
+    const qp = new URLSearchParams();
+    switch (op) {
+      case "exec": {
+        // host.sandbox.exec(cmd, {cwd?})
+        const cmd = typeof a0 === "string" ? a0 : (a0 as { cmd?: string } | undefined)?.cmd;
+        const cwd = (a1 as { cwd?: string } | undefined)?.cwd ?? (a0 as { cwd?: string } | undefined)?.cwd;
+        route = "/exec";
+        body = { cmd, ...(cwd != null ? { cwd } : {}) };
+        break;
+      }
+      case "git": {
+        // host.sandbox.git({op:"checkout", repo, branch?, dir?}) | host.sandbox.git("checkout", {...})
+        const g = (typeof a0 === "object" && a0 ? a0 : (a1 as Record<string, unknown>)) as Record<string, unknown>;
+        route = "/git";
+        body = { op: (g && g.op) || (typeof a0 === "string" ? a0 : "checkout"), repo: g && g.repo, branch: g && g.branch, dir: g && g.dir };
+        break;
+      }
+      case "writeFile": {
+        // host.sandbox.writeFile(path, content)
+        const path = typeof a0 === "string" ? a0 : (a0 as { path?: string } | undefined)?.path;
+        const content = typeof a1 === "string" ? a1 : (a0 as { content?: string } | undefined)?.content;
+        route = "/files";
+        body = { op: "write", path, content: content ?? "" };
+        break;
+      }
+      case "readFile": {
+        // host.sandbox.readFile(path) -> GET /files?path=&op=read
+        const path = typeof a0 === "string" ? a0 : (a0 as { path?: string } | undefined)?.path;
+        method = "GET";
+        route = "/files";
+        qp.set("op", "read");
+        if (path != null) qp.set("path", String(path));
+        break;
+      }
+      case "list": {
+        const path = typeof a0 === "string" ? a0 : (a0 as { path?: string } | undefined)?.path;
+        method = "GET";
+        route = "/files";
+        qp.set("op", "list");
+        if (path != null) qp.set("path", String(path));
+        break;
+      }
+      case "expose": {
+        // host.sandbox.expose(port) -> {url}
+        const port = typeof a0 === "number" ? a0 : Number((a0 as { port?: unknown } | undefined)?.port);
+        route = "/expose";
+        body = { port };
+        break;
+      }
+      case "mount": {
+        route = "/mount";
+        break;
+      }
+      case "unmount": {
+        route = "/unmount";
+        break;
+      }
+      default:
+        return { ok: false, error: "SandboxError: unknown op '" + op + "'" };
+    }
+    try {
+      const headers: Record<string, string> = {
+        authorization: "Bearer " + key,
+        "x-engram-session": this._sandboxDoId || "",
+      };
+      const init: RequestInit = { method, headers };
+      if (method !== "GET" && body !== undefined) {
+        headers["content-type"] = "application/json";
+        init.body = JSON.stringify(body);
+      }
+      const q = qp.toString();
+      const full = url.replace(/\/$/, "") + route + (q ? "?" + q : "");
+      const r = await fetch(full, init);
+      // Cap the response body like _doFetch (the container can return large dir listings / stdout).
+      const ab = await r.arrayBuffer();
+      let bytes = new Uint8Array(ab);
+      if (bytes.length > FETCH_MAX_BODY_BYTES) bytes = bytes.subarray(0, FETCH_MAX_BODY_BYTES);
+      const text = TEXT_DEC.decode(bytes);
+      let value: unknown;
+      try { value = JSON.parse(text); } catch { value = { raw: text }; }
+      if (!r.ok) {
+        const errMsg = (value && typeof value === "object" && (value as { error?: unknown }).error)
+          ? String((value as { error: unknown }).error)
+          : "HTTP " + r.status;
+        return { ok: false, error: "SandboxError: " + errMsg };
+      }
+      return { ok: true, value };
+    } catch (e) {
+      const err = e as { message?: string };
+      return { ok: false, error: "SandboxError: " + String((err && err.message) || e) };
+    }
   }
 
   // _serviceFs: bridge the engine's `host.__fs({op,path,data?})` to the DO-side R2/S3 handler.
@@ -2074,6 +2359,19 @@ class GlueKernel {
     }
     const st: WsState = { socket, url, queue: [], seq: 0, waiters: [], severed: false, closed: false, droppedThrough: 0 };
     this._ws.set(handleId, st);
+    // (#5) accept() is MANDATORY for a fetch()+Upgrade outbound socket: until accept() is called,
+    // workerd does NOT pump the socket's readable side, so the "message" listener never fires and the
+    // VM's onmessage stays at 0 frames (the reported bug). The earlier optional-chained `accept?.()`
+    // silently no-op'd if the property read threw. We call it explicitly BEFORE attaching listeners is
+    // not required (workerd buffers until accept), but we MUST guarantee it runs. If accept() is
+    // genuinely absent we surface a typed WsError rather than connecting a dead socket.
+    const acc = (socket as { accept?: () => void }).accept;
+    if (typeof acc !== "function") {
+      this._ws.delete(handleId);
+      return { ok: false, error: "WsError: outbound socket is not acceptable (no accept())" };
+    }
+    // set binaryType so binary frames arrive as ArrayBuffer (our message listener base64-encodes them).
+    try { (socket as { binaryType?: string }).binaryType = "arraybuffer"; } catch { /* not settable */ }
     // attach listeners BEFORE accept() so no frame is missed, then accept to start delivery.
     socket.addEventListener("message", (ev: MessageEvent) => {
       const d = ev.data;
@@ -2102,7 +2400,7 @@ class GlueKernel {
     // accept() starts frame delivery on the workerd-side accepted socket. The fetch-Upgrade socket
     // is already connected when fetch() resolved, so there is no async "open" event — synthesize one
     // so the VM shim's onopen fires and recv() sees an `open` frame first.
-    try { (socket as { accept?: () => void }).accept?.(); } catch { /* some impls auto-accept */ }
+    try { acc.call(socket); } catch { /* some impls auto-accept */ }
     this._wsEnqueue(st, { type: "open" });
     const readyState = (socket as { readyState?: number }).readyState ?? 1;
     return { ok: true, value: { handleId, url, readyState } };
@@ -2125,9 +2423,20 @@ class GlueKernel {
   }
 
   // _wsRecv: THE pull primitive. Return a queued frame with seq >= sinceSeq immediately; else PARK
-  // (a Promise pushed to st.waiters, resolved by the socket listener) with an idle deadline that
-  // resolves {type:"idle"} so the cell ends and the mutex turns over. A severed/missing handle (cold
-  // wake) resolves a typed severed close. Every result is a recorded host effect (oplog) like fetch.
+  // until the next frame arrives or the idle deadline fires. A severed/missing handle (cold wake)
+  // resolves a typed severed close. Every result is a recorded host effect (oplog) like fetch.
+  //
+  // (#5) SAME-CELL DELIVERY FIX. The outbound socket's `message` event listener (which enqueues
+  // inbound frames via _wsEnqueue) only fires when workerd delivers the read to THIS I/O context.
+  // While a single eval cell is parked here, the eval Promise has not settled, and a SINGLE long
+  // `setTimeout(deadline)` park does not give workerd the repeated macrotask turns it needs to
+  // deliver the buffered socket read into our listener — so the echo sat undelivered until the
+  // cell ended (it surfaced only on the NEXT cell, the observed cross-cell-works/same-cell-fails
+  // bug). The fix is to actively re-check the queue across MANY short `setTimeout` macrotask turns:
+  // each tick is a fresh I/O turn that lets workerd run the socket `message` listener (enqueueing
+  // the frame), and the very next tick observes it. We STILL register a waiter so a frame that the
+  // listener enqueues mid-tick wakes us immediately (fast path); the polling loop is the safety net
+  // that guarantees delivery within a single cell regardless of workerd's event-batching.
   async _wsRecv(handleId: string, sinceSeq: number, timeoutMs?: number): Promise<HostResult> {
     const st = this._ws && this._ws.get(handleId);
     if (!st) {
@@ -2148,20 +2457,45 @@ class GlueKernel {
     const deadline = (typeof timeoutMs === "number" && timeoutMs > 0) ? timeoutMs : WS_RECV_IDLE_MS;
     return new Promise<HostResult>((resolve) => {
       let done = false;
-      const timer = setTimeout(() => {
+      const start = Date.now();
+      let pollTimer: ReturnType<typeof setTimeout> | undefined;
+
+      const settle = (value: WsFrame | { type: string; [k: string]: unknown }): void => {
         if (done) return;
         done = true;
+        if (pollTimer) clearTimeout(pollTimer);
         const i = st.waiters.indexOf(waiter);
         if (i >= 0) st.waiters.splice(i, 1);
-        resolve({ ok: true, value: { type: "idle", seq: sinceSeq } });
-      }, deadline);
-      const waiter = (f: WsFrame) => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        resolve({ ok: true, value: f });
+        resolve({ ok: true, value });
       };
+
+      // The waiter is woken DIRECTLY by _wsEnqueue when the socket listener fires while we are parked.
+      const waiter = (f: WsFrame) => { settle(f); };
+
+      // poll(): one short macrotask turn. Re-checks the queue (a frame the listener enqueued during
+      // the PREVIOUS turn is now visible), honors close, then re-arms until the idle deadline. Each
+      // `setTimeout(WS_RECV_POLL_MS)` returns control to workerd's event loop so it can deliver the
+      // buffered socket read into our `message` listener — the crux of same-cell delivery.
+      const poll = (): void => {
+        if (done) return;
+        const f = st.queue.find((fr) => fr.seq >= sinceSeq);
+        if (f) { settle(f); return; }
+        if (st.closed) { settle({ type: "close", code: 1006, severed: false, seq: st.seq }); return; }
+        if (Date.now() - start >= deadline) {
+          settle({ type: "idle", seq: sinceSeq });
+          return;
+        }
+        pollTimer = setTimeout(poll, WS_RECV_POLL_MS);
+      };
+
       st.waiters.push(waiter);
+      // RACE GUARD: a frame may have been enqueued AFTER our synchronous `find` above but BEFORE the
+      // waiter was registered (no waiter was present, so _wsEnqueue could not wake us). Re-check now
+      // that the waiter is in place and serve it immediately so we never park on an already-queued frame.
+      const raced = st.queue.find((fr) => fr.seq >= sinceSeq);
+      if (raced) { settle(raced); return; }
+      // kick the polling loop (first tick yields a fresh I/O turn for socket delivery).
+      pollTimer = setTimeout(poll, WS_RECV_POLL_MS);
     });
   }
 

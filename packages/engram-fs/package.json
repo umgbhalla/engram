@@ -1,0 +1,17 @@
+{
+  "name": "@engram/fs",
+  "version": "0.0.1",
+  "description": "Engram unified filesystem substrate: R2 = bytes, manifest = truth. Prefix-isolated, content-addressed, txn/direct coherence. Extraction-ready (own repo later).",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "files": ["src", "README.md"],
+  "license": "UNLICENSED",
+  "private": true
+}

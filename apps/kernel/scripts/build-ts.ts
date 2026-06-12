@@ -44,6 +44,9 @@ await build({
   ...COMMON,
   entryPoints: [resolve(root, "src/kernel-glue.ts")],
   outfile: resolve(root, "src/kernel-glue.mjs"),
+  // cloudflare:sockets (outbound TCP/TLS, used by host-sockets.mjs) is a workerd built-in — keep it
+  // external so wrangler/worker-build resolves it at the runtime layer (like *.wasm / *.txt).
+  external: ["cloudflare:sockets"],
 });
 console.log("[build-ts] src/kernel-glue.ts -> src/kernel-glue.mjs");
 
@@ -52,6 +55,6 @@ await build({
   ...COMMON,
   entryPoints: [resolve(root, "entry.ts")],
   outfile: resolve(root, "entry.mjs"),
-  external: ["*.wasm", "*.txt", "./build/worker/shim.mjs", "./src/engine-hash.js"],
+  external: ["*.wasm", "*.txt", "./build/worker/shim.mjs", "./src/engine-hash.js", "cloudflare:workers"],
 });
 console.log("[build-ts] entry.ts -> entry.mjs");

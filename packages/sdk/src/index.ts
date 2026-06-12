@@ -52,6 +52,56 @@ export interface Checkpoint {
   usedHeap?: number;
 }
 
+/** A directory entry returned by {@link EngramSession.ls} (host.fs R2 store). */
+export interface VfsEntry {
+  /** The immediate child name (not the full path). */
+  name: string;
+  /** File size in bytes (0 for directories). */
+  size: number;
+  /** `true` if this entry is a directory. */
+  isDir: boolean;
+}
+
+/** File metadata returned by {@link EngramSession.stat} (host.fs R2 store). */
+export interface VfsStat {
+  /** File size in bytes. */
+  size: number;
+  /** `true` if this is a regular file. */
+  isFile: boolean;
+  /** `true` if this is a directory. */
+  isDir: boolean;
+  /** Last-modified time in epoch milliseconds (host.fs `created_ms`). */
+  mtime: number;
+}
+
+/** Result of {@link EngramSession.registerWorker} — the content hash of a registered worker source. */
+export interface WorkerRegistration {
+  /** Lowercase hex sha256 of the registered source (immutable; same source = same hash). */
+  hash: string;
+  /** Size of the registered source in bytes. */
+  bytes: number;
+  /** `true` if this session had already registered this hash (idempotent no-op). */
+  cached: boolean;
+}
+
+/** A row in the per-session worker registry index, returned by {@link EngramSession.listWorkers}. */
+export interface WorkerRecord {
+  /** Lowercase hex sha256 of the source. */
+  hash: string;
+  /** Size of the source in bytes. */
+  bytes: number;
+  /** Registration time in epoch milliseconds. */
+  createdMs: number;
+}
+
+/** Per-invoke options for {@link EngramSession.invokeWorker}. */
+export interface InvokeWorkerOptions {
+  /** Wall-clock timeout in ms (default 30000, cap 120000). */
+  timeoutMs?: number;
+  /** Per-invoke CPU budget in ms (default 5000). */
+  cpuMs?: number;
+}
+
 /** The structured error a failed cell carries (before it is thrown / surfaced). */
 export interface EvalErrorInfo {
   name: string;
@@ -189,6 +239,14 @@ export interface EngramConfig {
   modules?: boolean | string[];
   /** Capture `console.*` output per cell (default true). */
   capture?: boolean;
+  /**
+   * Enable the Tier-2 sandbox bridge: opt this session into the engram-sandbox container worker
+   * over the SHARED R2 VFS (the container mounts this session's `fs/<doId>/` prefix as `/workspace`).
+   * When `true`, the `s.sandbox.*` SDK surface (and the in-cell `host.sandbox.*` effect) become
+   * available; without it every sandbox call returns `SandboxUnavailable`. The Bearer key is added
+   * DO-side from the kernel env — it never crosses into the VM or any client frame.
+   */
+  sandbox?: boolean;
   /** Any other kernel-recognised config keys. */
   [k: string]: unknown;
 }
@@ -356,12 +414,17 @@ export class FetchBlockedError extends EngramError {
 export class SizeAdmissionError extends EngramError {
   override name = "SizeAdmissionError";
 }
+/** `s.sandbox.*` was called on a session without `config.sandbox: true`. */
+export class SandboxDisabledError extends EngramError {
+  override name = "SandboxDisabledError";
+}
 
 const ERROR_CLASSES: Record<string, typeof EngramError> = {
   TimeoutError,
   MemoryLimitError,
   FetchBlockedError,
   SizeAdmissionError,
+  SandboxDisabledError,
 };
 
 /** Build the right typed error from a kernel error payload. */
@@ -370,6 +433,53 @@ function toTypedError(info: EvalErrorInfo, result?: EvalResult): EngramError {
   const err = new Cls(info.message || info.name || "eval failed", { stack: info.stack, result });
   if (Cls === EngramError && info.name) err.name = info.name;
   return err;
+}
+
+// ---------------------------------------------------------------------------
+// base64 (runtime-agnostic: Node Buffer or browser btoa/atob)
+// ---------------------------------------------------------------------------
+
+type Bufferish = { from(s: string, enc: string): { toString(enc: string): string } };
+const _Buffer: Bufferish | undefined = (globalThis as { Buffer?: Bufferish }).Buffer;
+
+/** Encode raw bytes to a standard base64 string. */
+function bytesToB64(bytes: Uint8Array): string {
+  if (_Buffer) {
+    // Node fast path.
+    return (_Buffer.from as unknown as (b: Uint8Array) => { toString(enc: string): string })(bytes).toString("base64");
+  }
+  let bin = "";
+  const CHUNK = 0x8000; // avoid call-stack blowups on large inputs
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK) as unknown as number[]);
+  }
+  return btoa(bin);
+}
+
+/** Decode a standard base64 string to raw bytes. */
+function b64ToBytes(b64: string): Uint8Array {
+  if (_Buffer) {
+    const s = _Buffer.from(b64, "base64").toString("binary");
+    const out = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 0xff;
+    return out;
+  }
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i) & 0xff;
+  return out;
+}
+
+const _utf8Enc = new TextEncoder();
+
+/** Coerce a writeFile input value to raw bytes (string -> utf8). */
+function toBytes(data: Uint8Array | ArrayBuffer | string): Uint8Array {
+  if (typeof data === "string") return _utf8Enc.encode(data);
+  if (data instanceof Uint8Array) return data;
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  // ArrayBufferView (e.g. Buffer / typed array) — view its underlying bytes.
+  const v = data as ArrayBufferView;
+  return new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
 }
 
 // ---------------------------------------------------------------------------
@@ -914,6 +1024,9 @@ export class EngramSession {
   /** Eval interceptor chain (outermost first). Empty = no wrapping. */
   private interceptors: EvalInterceptor[];
 
+  /** Monotonic correlation id for vfs-* frames (cosmetic — WS matches positionally, the DO echoes it back). */
+  private _vfsId = 0;
+
   /**
    * Per-eval capture of the LAST `host.__engram_final(value)` hostcall. `WsTransport`
    * serialises one rpc at a time, so attribution to the in-flight eval is unambiguous.
@@ -927,6 +1040,38 @@ export class EngramSession {
     set: (key: string, value: unknown) => Promise<void>;
     /** Read a value previously stored in the durable ctx map. */
     get: <T = unknown>(key: string) => Promise<T | undefined>;
+  };
+
+  /**
+   * Tier-2 sandbox bridge (`session.sandbox.*`). Drives the engram-sandbox Linux container worker
+   * over the SHARED R2 VFS: the container mounts THIS session's `fs/<doId>/` prefix as `/workspace`,
+   * so files written by a cell (`host.fs.writeFile('/x')`) are visible at `/workspace/x` inside the
+   * container, and container outputs under `/workspace` land back in R2 readable by a later cell.
+   *
+   * Serviced entirely DO-side (NO eval mutex, never touches the VM heap) by a kernel->sandbox fetch
+   * that adds the Bearer key from the kernel env — the key never crosses the wire to the client.
+   * Requires `config.sandbox: true` (else every call throws `SandboxUnavailable`) and the WebSocket
+   * kernel transport (these frames are unavailable over the HTTP/cloud transport).
+   */
+  readonly sandbox: {
+    /** Run a shell command in the container (cwd defaults to `/workspace`, the R2-backed root). */
+    exec: (
+      cmd: string,
+      opts?: { cwd?: string; timeoutMs?: number },
+    ) => Promise<{ stdout: string; stderr: string; exitCode: number; success: boolean }>;
+    /** Git op in the container (default `checkout`); clones into the R2-backed workspace. */
+    git: (
+      args: { op?: string; repo?: string; branch?: string; dir?: string },
+      opts?: { timeoutMs?: number },
+    ) => Promise<{ ok: boolean }>;
+    /** Write a file into the container workspace (lands in R2 at `fs/<doId>/<path>`). */
+    writeFile: (path: string, content: string, opts?: { timeoutMs?: number }) => Promise<{ ok: boolean }>;
+    /** Read a file from the container workspace. */
+    readFile: (path: string, opts?: { timeoutMs?: number }) => Promise<{ content: string }>;
+    /** List a directory in the container workspace. */
+    list: (path: string, opts?: { timeoutMs?: number }) => Promise<unknown>;
+    /** Expose a container port and get a public preview URL. */
+    expose: (port: number, opts?: { timeoutMs?: number }) => Promise<{ url?: string } & Record<string, unknown>>;
   };
 
   /** @internal */
@@ -976,6 +1121,91 @@ export class EngramSession {
         );
         const r = this.normalize<T>(reply);
         return (r.value as T) ?? undefined;
+      },
+    };
+    // Tier-2 sandbox bridge. Each call is a WS-only, DO-side `{t:"sandbox"}` frame (id-correlated,
+    // bearer-auth inherited); the kernel adds the sandbox key from env. exec/git use a longer wire
+    // timeout (container cold-start can take ~30-60s); throws toTypedError on reply.ok===false.
+    const sandboxRequest = async (frame: Frame, timeoutMs: number): Promise<any> => {
+      this._requireVfsTransport("sandbox." + String(frame.op ?? "call"));
+      const reply = await this.transport.request(frame, timeoutMs);
+      if (reply?.ok === false) {
+        // The kernel reports sandbox errors as a STRING (e.g. "SandboxUnavailable: config.sandbox
+        // not enabled"). Normalize to the typed-error shape; the capability-off case maps to the
+        // typed SandboxDisabledError so callers can `instanceof`-check a disabled sandbox.
+        const raw = reply.error;
+        let info: EvalErrorInfo;
+        if (typeof raw === "string") {
+          const disabled = /SandboxUnavailable|config\.sandbox\s+not\s+enabled/i.test(raw);
+          info = { name: disabled ? "SandboxDisabledError" : "SandboxError", message: raw };
+        } else {
+          info = raw || { name: "SandboxError", message: "sandbox call failed" };
+        }
+        throw toTypedError(info);
+      }
+      return reply;
+    };
+    // Container cold-start clamp (mirrors invokeWorker's wireTimeout): a generous default for the
+    // heavy ops, plus slack, capped so a wedged container can't hang the rpc forever.
+    const sandboxWire = (timeoutMs: number | undefined, dflt: number) =>
+      Math.min(timeoutMs ?? dflt, 120000) + 5000;
+    this.sandbox = {
+      exec: async (cmd, opts = {}) => {
+        const id = this._nextVfsId();
+        const reply = await sandboxRequest(
+          { t: "sandbox", id, op: "exec", cmd, cwd: opts.cwd },
+          sandboxWire(opts.timeoutMs, 60000),
+        );
+        const v = (reply?.value ?? {}) as Record<string, unknown>;
+        return {
+          stdout: String(v.stdout ?? ""),
+          stderr: String(v.stderr ?? ""),
+          exitCode: typeof v.exitCode === "number" ? v.exitCode : Number(v.exitCode ?? 0),
+          success: v.success === true || v.exitCode === 0,
+        };
+      },
+      git: async (args, opts = {}) => {
+        const id = this._nextVfsId();
+        const reply = await sandboxRequest(
+          { t: "sandbox", id, op: "git", gitOp: args.op ?? "checkout", repo: args.repo, branch: args.branch, dir: args.dir },
+          sandboxWire(opts.timeoutMs, 60000),
+        );
+        const v = (reply?.value ?? {}) as Record<string, unknown>;
+        return { ok: v.ok === true };
+      },
+      writeFile: async (path, content, opts = {}) => {
+        const id = this._nextVfsId();
+        const reply = await sandboxRequest(
+          { t: "sandbox", id, op: "write", path, content },
+          opts.timeoutMs ?? this.timeoutMs,
+        );
+        const v = (reply?.value ?? {}) as Record<string, unknown>;
+        return { ok: v.ok === true };
+      },
+      readFile: async (path, opts = {}) => {
+        const id = this._nextVfsId();
+        const reply = await sandboxRequest(
+          { t: "sandbox", id, op: "read", path },
+          opts.timeoutMs ?? this.timeoutMs,
+        );
+        const v = (reply?.value ?? {}) as Record<string, unknown>;
+        return { content: String(v.content ?? "") };
+      },
+      list: async (path, opts = {}) => {
+        const id = this._nextVfsId();
+        const reply = await sandboxRequest(
+          { t: "sandbox", id, op: "list", path },
+          opts.timeoutMs ?? this.timeoutMs,
+        );
+        return reply?.value;
+      },
+      expose: async (port, opts = {}) => {
+        const id = this._nextVfsId();
+        const reply = await sandboxRequest(
+          { t: "sandbox", id, op: "expose", port },
+          opts.timeoutMs ?? this.timeoutMs,
+        );
+        return (reply?.value ?? {}) as { url?: string } & Record<string, unknown>;
       },
     };
   }
@@ -1139,6 +1369,297 @@ export class EngramSession {
       offset += reply.data.length;
       if (reply.done || reply.data.length === 0) break;
     }
+  }
+
+  // ---- vfs (host.fs R2 store, serviced DO-side, off-VM) ----
+  //
+  // These talk to the host.fs **R2** file store (config.fs.provider:'r2') — bodies live
+  // off-heap in R2, keyed under the same session-scoped `fs/<doId>/` prefix host.fs uses.
+  // A file written here is visible to a later cell via `host.fs.*` always, and via the bare
+  // `fs.*` builtin when the session was created with `config.fs.provider:'r2'`. It does NOT
+  // touch the default in-heap VFS (the mem-capped `fs` builtin living in WASM linear memory).
+  //
+  // Serviced entirely DO-side against R2 — never through the VM eval — so it bypasses the
+  // per-cell instruction budget AND the WASM heap/mem cap. Bytes cross the wire as base64;
+  // reads stream in chunks, writes support an absolute `offset` for chunked/append upload.
+  //
+  // WS-only: these frames need the bidirectional kernel socket. Over the HTTP (cloud)
+  // transport they throw a clear error (mirrors {@link supportsHostCalls}).
+
+  /** Throw a clear error if the active transport can't service vfs frames (HTTP/cloud). */
+  private _requireVfsTransport(op: string): void {
+    if (this.transport.supportsHostCalls !== true) {
+      throw new EngramError(
+        `${op}() requires the WebSocket kernel transport; it is not available over the HTTP (cloud) transport`,
+      );
+    }
+  }
+
+  private _nextVfsId(): number {
+    this._vfsId = (this._vfsId + 1) & 0x7fffffff;
+    return this._vfsId;
+  }
+
+  /**
+   * Stream a file from the host.fs R2 store in raw byte chunks. Resumes from the tracked
+   * offset across reconnects (each chunk is an independent ranged frame).
+   *
+   * @param path session-scoped vfs path (normalised + isolated DO-side).
+   */
+  async *streamReadFile(
+    path: string,
+    opts: { timeoutMs?: number; chunkBytes?: number; offset?: number; cwd?: string } = {},
+  ): AsyncIterable<Uint8Array> {
+    this._requireVfsTransport("readFile");
+    let offset = Math.max(0, opts.offset || 0);
+    // base64 inflates ~33%; keep raw chunk conservative (default 256KB, hard-cap 1MB).
+    const len = Math.max(1, Math.min(opts.chunkBytes || 256 * 1024, 1024 * 1024));
+    const timeout = opts.timeoutMs ?? this.timeoutMs;
+    // Relative paths resolve DO-side against this cwd (default /workspace, the ONE fs root).
+    const cwd = opts.cwd ?? "/workspace";
+    for (;;) {
+      const id = this._nextVfsId();
+      const reply = await this.transport.request({ t: "vfs-read", id, path, cwd, offset, len }, timeout);
+      if (reply?.ok === false) {
+        throw toTypedError(reply.error || { name: "VfsError", message: `vfs read failed: ${path}` });
+      }
+      const b64 = typeof reply?.dataB64 === "string" ? reply.dataB64 : "";
+      const bytes = b64 ? b64ToBytes(b64) : new Uint8Array(0);
+      if (bytes.length) {
+        yield bytes;
+        offset += bytes.length;
+      }
+      if (reply?.eof || bytes.length === 0) break;
+    }
+  }
+
+  /** Read an entire file from the host.fs R2 store into a single byte buffer. */
+  async readFile(path: string, opts: { timeoutMs?: number; chunkBytes?: number; cwd?: string } = {}): Promise<Uint8Array> {
+    const parts: Uint8Array[] = [];
+    let total = 0;
+    for await (const chunk of this.streamReadFile(path, opts)) {
+      parts.push(chunk);
+      total += chunk.length;
+    }
+    const out = new Uint8Array(total);
+    let at = 0;
+    for (const p of parts) {
+      out.set(p, at);
+      at += p.length;
+    }
+    return out;
+  }
+
+  /**
+   * Sugar over {@link readFile} for small files. The SDK is always async over the wire — the
+   * `Sync` name is the Node-fs naming convention, not a synchronous call.
+   */
+  readFileSync(path: string, opts: { timeoutMs?: number; chunkBytes?: number } = {}): Promise<Uint8Array> {
+    return this.readFile(path, opts);
+  }
+
+  /**
+   * Write a file (or stream) to the host.fs R2 store. Bytes are chunked; each chunk carries an
+   * absolute `offset` so a retried/reconnected chunk overwrites its range idempotently rather
+   * than double-appending. The first frame carries `truncate` (default `true` → replace the
+   * file); subsequent frames append at the advancing offset.
+   *
+   * Accepts a `Uint8Array` / `ArrayBuffer` / string (utf8) or an `AsyncIterable` of byte chunks
+   * for streaming uploads. Returns the total bytes written.
+   *
+   * Note: random-offset writes into an existing file rewrite the whole object DO-side (R2 has
+   * no partial update); chunked append (monotonic offset) is the efficient path.
+   */
+  async writeFile(
+    path: string,
+    data: Uint8Array | ArrayBuffer | string | AsyncIterable<Uint8Array | ArrayBuffer | string> | Iterable<Uint8Array | ArrayBuffer | string>,
+    opts: { timeoutMs?: number; chunkBytes?: number; offset?: number; truncate?: boolean; cwd?: string } = {},
+  ): Promise<number> {
+    this._requireVfsTransport("writeFile");
+    const chunkBytes = Math.max(1, Math.min(opts.chunkBytes || 256 * 1024, 1024 * 1024));
+    const timeout = opts.timeoutMs ?? this.timeoutMs;
+    // Relative paths resolve DO-side against this cwd (default /workspace, the ONE fs root).
+    const cwd = opts.cwd ?? "/workspace";
+    let offset = Math.max(0, opts.offset || 0);
+    let written = 0;
+    let first = true;
+
+    const sendChunk = async (bytes: Uint8Array): Promise<void> => {
+      // Slice large inputs into <=chunkBytes frames so a single WS frame stays bounded.
+      for (let i = 0; i < bytes.length || (first && bytes.length === 0); i += chunkBytes) {
+        const slice = bytes.subarray(i, i + chunkBytes);
+        const id = this._nextVfsId();
+        const reply = await this.transport.request(
+          {
+            t: "vfs-write",
+            id,
+            path,
+            cwd,
+            dataB64: bytesToB64(slice),
+            offset,
+            // First frame honours `truncate` (default replace); later frames append.
+            truncate: first ? opts.truncate !== false : false,
+          },
+          timeout,
+        );
+        if (reply?.ok === false) {
+          throw toTypedError(reply.error || { name: "VfsError", message: `vfs write failed: ${path}` });
+        }
+        offset += slice.length;
+        written += slice.length;
+        first = false;
+        if (bytes.length === 0) break; // empty-file truncate frame
+      }
+    };
+
+    // AsyncIterable / Iterable (streaming upload) vs a single value.
+    const obj = data as unknown as Record<symbol, unknown>;
+    const asyncIt = typeof obj[Symbol.asyncIterator] === "function";
+    const syncIt = typeof obj[Symbol.iterator] === "function";
+    if (typeof data !== "string" && !(data instanceof Uint8Array) && !(data instanceof ArrayBuffer) && (asyncIt || syncIt)) {
+      if (asyncIt) {
+        for await (const part of data as AsyncIterable<Uint8Array | ArrayBuffer | string>) {
+          await sendChunk(toBytes(part));
+        }
+      } else {
+        for (const part of data as Iterable<Uint8Array | ArrayBuffer | string>) {
+          await sendChunk(toBytes(part));
+        }
+      }
+      // A stream that yielded nothing still needs to truncate the target to empty.
+      if (first) await sendChunk(new Uint8Array(0));
+    } else {
+      await sendChunk(toBytes(data as Uint8Array | ArrayBuffer | string));
+    }
+    return written;
+  }
+
+  /** Sugar over {@link writeFile} (Node-fs naming; still async over the wire). */
+  writeFileSync(
+    path: string,
+    data: Uint8Array | ArrayBuffer | string,
+    opts: { timeoutMs?: number; chunkBytes?: number; offset?: number; truncate?: boolean; cwd?: string } = {},
+  ): Promise<number> {
+    return this.writeFile(path, data, opts);
+  }
+
+  /** List the immediate children of a directory in the host.fs R2 store. */
+  async ls(path: string, opts: { timeoutMs?: number; cwd?: string } = {}): Promise<VfsEntry[]> {
+    this._requireVfsTransport("ls");
+    const id = this._nextVfsId();
+    const cwd = opts.cwd ?? "/workspace";
+    const reply = await this.transport.request({ t: "vfs-ls", id, path, cwd }, opts.timeoutMs ?? this.timeoutMs);
+    if (reply?.ok === false) {
+      throw toTypedError(reply.error || { name: "VfsError", message: `vfs ls failed: ${path}` });
+    }
+    return Array.isArray(reply?.entries) ? (reply.entries as VfsEntry[]) : [];
+  }
+
+  /**
+   * Reconcile the host.fs file namespace from the live R2 prefix `fs/<doId>/`.
+   *
+   * The Tier-2 sandbox container writes file bodies DIRECTLY to R2 (via its s3fs mount), so a file
+   * it creates has no kernel `fs_files` row and is INVISIBLE to `host.fs` / `s.readFile` / `ls`
+   * until this runs. Call `syncFs()` after a container write to make those files readable from the
+   * cell / SDK (the container->cell half of the shared-VFS round-trip). Returns the reconciled file
+   * list. Cell-written files (host.fs / `s.writeFile`) are already durable + visible without this.
+   */
+  async syncFs(opts: { timeoutMs?: number } = {}): Promise<{ path: string; size: number }[]> {
+    this._requireVfsTransport("syncFs");
+    const id = this._nextVfsId();
+    const reply = await this.transport.request({ t: "vfs-sync", id }, opts.timeoutMs ?? this.timeoutMs);
+    if (reply?.ok === false) {
+      throw toTypedError(reply.error || { name: "VfsError", message: "vfs sync failed" });
+    }
+    return Array.isArray(reply?.files) ? (reply.files as { path: string; size: number }[]) : [];
+  }
+
+  /** Stat a file/directory in the host.fs R2 store. Throws if absent (ENOENT). */
+  async stat(path: string, opts: { timeoutMs?: number; cwd?: string } = {}): Promise<VfsStat> {
+    this._requireVfsTransport("stat");
+    const id = this._nextVfsId();
+    const cwd = opts.cwd ?? "/workspace";
+    const reply = await this.transport.request({ t: "vfs-stat", id, path, cwd }, opts.timeoutMs ?? this.timeoutMs);
+    if (reply?.ok === false) {
+      throw toTypedError(reply.error || { name: "VfsError", message: `vfs stat failed: ${path}` });
+    }
+    return reply.stat as VfsStat;
+  }
+
+  // ---- worker registry (content-addressed Dynamic-Worker-Loader isolates) ----
+  //
+  // A registered worker is a STATIC, hash-identified JS source block, stored durably in R2,
+  // invokable many times in a FRESH Worker-Loader isolate that shares the SAME session-scoped
+  // R2 VFS (`fs/<doId>/`) the kernel + vfs-* frames see. This is the "muscle" tier: stateless
+  // heavy/parallel compute decoupled from the single-threaded durable kernel DO; durable results
+  // land in shared R2 (via the worker's `env.VFS`), and the kernel orchestrates.
+  //
+  // Frames are serviced entirely DO-side — they never touch the VM heap (no eval mutex) — and
+  // inherit the session's bearer auth. Correlation mirrors the vfs-* frames: a client `id` is
+  // echoed back by the DO.
+  //
+  // WS-only: these frames need the bidirectional kernel socket. Over the HTTP (cloud) transport
+  // they throw a clear error (mirrors the vfs-* methods).
+
+  /**
+   * Register a worker source. Content-addressed + idempotent: the returned `hash` is the lowercase
+   * hex sha256 of `source`, so the same source always yields the same hash. The source is stored
+   * durably in R2 under a global registry prefix; a per-session registry row gates invocation.
+   *
+   * @param source UTF-8 JS (ESM) source. Must `export async function run(input, env)` (or
+   *   `export default { run }`), or `export default { async fetch(req, env) }` as an escape hatch.
+   *   Capped at 512KB.
+   * @returns the content hash plus whether this session had already registered it.
+   */
+  async registerWorker(source: string, opts: { timeoutMs?: number } = {}): Promise<WorkerRegistration> {
+    this._requireVfsTransport("registerWorker");
+    const id = this._nextVfsId();
+    const reply = await this.transport.request({ t: "worker-register", id, source }, opts.timeoutMs ?? this.timeoutMs);
+    if (reply?.ok === false) {
+      throw toTypedError(reply.error || { name: "RegistryError", message: "worker register failed" });
+    }
+    return {
+      hash: String(reply?.hash ?? ""),
+      bytes: typeof reply?.bytes === "number" ? reply.bytes : 0,
+      cached: reply?.cached === true,
+    };
+  }
+
+  /**
+   * Invoke a previously-registered worker in a fresh (warm-cached-by-hash) isolate. The `input` is
+   * passed as a JSON value to the worker's `run(input, env)`; its JSON-serialisable return value is
+   * resolved here. The worker runs with NO egress and only the shared session VFS as its I/O channel.
+   *
+   * @param hash the content hash returned by {@link registerWorker} (`^[0-9a-f]{64}$`).
+   * @param input any JSON-serialisable value (capped ~1MB; larger data flows through the shared VFS).
+   * @param opts per-invoke wall timeout / CPU budget.
+   * @throws a typed error on `NotRegisteredError` / `ContractError` / `WorkerCpuError` /
+   *   `WorkerTimeoutError` / `WorkerRuntimeError` / `OutputTooLargeError`.
+   */
+  async invokeWorker<T = unknown>(hash: string, input?: unknown, opts: InvokeWorkerOptions = {}): Promise<T> {
+    this._requireVfsTransport("invokeWorker");
+    const id = this._nextVfsId();
+    const frame: Frame = { t: "worker-invoke", id, hash, input };
+    if (typeof opts.timeoutMs === "number") frame.timeoutMs = opts.timeoutMs;
+    if (typeof opts.cpuMs === "number") frame.cpuMs = opts.cpuMs;
+    // Bound the await on the timeout the DO honours (default 30s, cap 120s) plus slack.
+    const wireTimeout = Math.min(opts.timeoutMs ?? 30000, 120000) + 5000;
+    const reply = await this.transport.request(frame, wireTimeout);
+    if (reply?.ok === false) {
+      throw toTypedError(reply.error || { name: "WorkerRuntimeError", message: `worker invoke failed: ${hash}` });
+    }
+    return reply?.output as T;
+  }
+
+  /** List this session's registered workers (the per-session registry index). */
+  async listWorkers(opts: { timeoutMs?: number } = {}): Promise<WorkerRecord[]> {
+    this._requireVfsTransport("listWorkers");
+    const id = this._nextVfsId();
+    const reply = await this.transport.request({ t: "worker-list", id }, opts.timeoutMs ?? this.timeoutMs);
+    if (reply?.ok === false) {
+      throw toTypedError(reply.error || { name: "RegistryError", message: "worker list failed" });
+    }
+    return Array.isArray(reply?.workers) ? (reply.workers as WorkerRecord[]) : [];
   }
 
   // ---- durable key/value sugar (over the persisted namespace) ----

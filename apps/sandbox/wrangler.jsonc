@@ -1,0 +1,67 @@
+{
+  // engram-sandbox — STANDALONE Tier-2 container muscle (NOT engram-kernel).
+  //
+  // A real Linux container fronted by a Durable Object (the @cloudflare/sandbox `Sandbox`
+  // DO class). The worker mounts the SAME session R2 prefix the kernel's host.fs / vfs-*
+  // frames use (fs/<doId>/) as the container's workspace, so the kernel's files and the
+  // container shell are the same bytes. See src/index.ts for the route map.
+  //
+  // PARALLEL-SAFETY: this worker is deployed independently of engram-kernel/engram-cloud and
+  // only ever reads/writes R2 keys under the session prefix (fs/<doId>/ or sandbox-test/).
+  "name": "engram-sandbox",
+  "main": "src/index.ts",
+
+  // The Sandbox runtime image (docker.io/cloudflare/sandbox) is built on a recent compat date.
+  "compatibility_date": "2026-03-19",
+
+  // nodejs_compat: required by the Sandbox SDK worker glue.
+  // NOTE: enable_ctx_exports (ContainerProxy egress-interception for credential-less R2 mounts)
+  //   became the DEFAULT as of compat date 2025-11-17. Our compatibility_date is past that, so CF
+  //   rejects listing it explicitly (error 10021) — it is implied and must be omitted here.
+  "compatibility_flags": ["nodejs_compat"],
+
+  "observability": { "enabled": true },
+
+  // ---- Container -----------------------------------------------------------
+  // image is a Dockerfile that MUST `FROM docker.io/cloudflare/sandbox:<pkgVersion>`
+  // (the SDK checks version compatibility at runtime; mismatch => warnings / 501s).
+  // standard-1 is the recommended production starting instance type.
+  // max_instances bounds concurrency / cost; raise for real load.
+  "containers": [
+    {
+      "class_name": "Sandbox",
+      "image": "./Dockerfile",
+      "instance_type": "standard-1",
+      "max_instances": 5
+    }
+  ],
+
+  // ---- Durable Object ------------------------------------------------------
+  // The Sandbox class is implemented by @cloudflare/sandbox and re-exported from src/index.ts.
+  // It MUST use the SQLite storage backend (new_sqlite_classes), not new_classes.
+  "durable_objects": {
+    "bindings": [{ "name": "Sandbox", "class_name": "Sandbox" }]
+  },
+
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Sandbox"] }],
+
+  // ---- R2 (shared with the kernel) -----------------------------------------
+  // SAME bucket as engram-kernel. mountBucket("SANDBOX_R2", path, { prefix:"/fs/<doId>/" })
+  // uses this binding NAME (not the dashboard name) for credential-less mounts. The worker
+  // ONLY ever mounts under a per-session fs/<doId>/ prefix (or sandbox-test/ for smokes) —
+  // it never touches snapshot/other keys. NOTE: the R2 prefix is a path VIEW, not a
+  // credential scope — see the security note in src/index.ts.
+  // MUST be the SAME bucket the kernel binds as SNAPSHOTS (host.fs bodies live under fs/<doId>/).
+  // The engram-kernel worker (deployed via alchemy) binds the alchemy-named bucket
+  // `engram-kernel-engram-snapshots-umang`, NOT the bare `engram-snapshots` — so the container must
+  // mount THAT bucket for the shared-VFS seam to line up. (Verified via the deployed kernel's
+  // bindings API: SNAPSHOTS -> engram-kernel-engram-snapshots-umang.)
+  "r2_buckets": [
+    { "binding": "SANDBOX_R2", "bucket_name": "engram-kernel-engram-snapshots-umang" }
+  ],
+
+  // Per-op Analytics Engine parity with the kernel (optional but cheap).
+  "analytics_engine_datasets": [
+    { "binding": "AE", "dataset": "engram_sandbox" }
+  ]
+}

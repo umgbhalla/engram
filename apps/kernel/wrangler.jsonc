@@ -4,12 +4,25 @@
   // worker-build output (Rust DO shim + kernel-glue.mjs WASI shim).
   "main": "entry.mjs",
   "compatibility_date": "2025-05-01",
-  "compatibility_flags": ["nodejs_compat"],
+  // enable_ctx_exports exposes ctx.exports (DurableObjectState.exports) so the KernelDO can
+  // instantiate its own VfsGateway WorkerEntrypoint (ctx.exports.VfsGateway({props:{doId}}))
+  // and hand it to each dynamically-loaded registry worker as its session-scoped, prefix-
+  // enforcing VFS — the ONLY I/O channel a hash-worker gets (globalOutbound:null otherwise).
+  // WITHOUT it ctx.exports is undefined -> the registry glue FAILS CLOSED (never falls back to
+  // passing the raw SNAPSHOTS bucket). Mirrors apps/cloud's HttpGateway pattern.
+  "compatibility_flags": ["nodejs_compat", "enable_ctx_exports"],
   "observability": { "enabled": true },
 
   // FAIL-CLOSED auth: persist enforcement so a deploy that forgets to export
   // ENGRAM_AUTH_ENFORCE still boots CLOSED whenever a key is configured.
-  "vars": { "ENGRAM_AUTH_ENFORCE": "1" },
+  // ENGRAM_SANDBOX_URL: fixed trusted engram-sandbox endpoint (plain var). The shared bearer
+  // ENGRAM_SANDBOX_KEY is a SECRET (set via `wrangler secret put ENGRAM_SANDBOX_KEY` / alchemy) —
+  // NOT declared here. Both are read in Rust per-eval (env.var / env.secret); the key is added
+  // DO-side to the kernel->sandbox fetch and never enters the VM heap. Capability-gated by config.sandbox.
+  "vars": {
+    "ENGRAM_AUTH_ENFORCE": "1",
+    "ENGRAM_SANDBOX_URL": "https://engram-sandbox.umg-bhalla88.workers.dev"
+  },
 
   // Build pipeline:
   //   1. tsc --noEmit — typecheck the authored TS (kernel-glue / repl-transform / entry / stdlib-meta).
@@ -35,6 +48,14 @@
   },
 
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["KernelDO"] }],
+
+  // Worker Loader: content-addressed registry. The KernelDO routes worker-register/invoke/list
+  // frames to JS glue, which calls env.LOADER.get(codeId, cb) — warm-cached by codeId, so the
+  // sha256 source hash drives automatic dedup + warm-isolate reuse. Same stanza as
+  // apps/cloud/wrangler.jsonc. Requires Workers Paid + wrangler >= 4.86.
+  "worker_loaders": [
+    { "binding": "LOADER" }
+  ],
 
   // R2 OVERFLOW only (gz image > ~2MB). benchrustf/ key prefix per the guardrails.
   "r2_buckets": [

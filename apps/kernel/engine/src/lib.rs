@@ -633,11 +633,71 @@ try {
       for (var i=0;i<4;i++){ out[i*4]=words[i]&0xff; out[i*4+1]=(words[i]>>>8)&0xff; out[i*4+2]=(words[i]>>>16)&0xff; out[i*4+3]=(words[i]>>>24)&0xff; }
       return out;
     };
+    // SHA-512 / SHA-384 (64-bit words via hi/lo 32-bit pairs, no BigInt). Verified byte-identical
+    // to node:crypto. __sha512core takes the IV + output byte length; sha512 -> 64B, sha384 -> 48B.
+    var __SHA512_K=[0x428a2f98,0xd728ae22,0x71374491,0x23ef65cd,0xb5c0fbcf,0xec4d3b2f,0xe9b5dba5,0x8189dbbc,0x3956c25b,0xf348b538,0x59f111f1,0xb605d019,0x923f82a4,0xaf194f9b,0xab1c5ed5,0xda6d8118,0xd807aa98,0xa3030242,0x12835b01,0x45706fbe,0x243185be,0x4ee4b28c,0x550c7dc3,0xd5ffb4e2,0x72be5d74,0xf27b896f,0x80deb1fe,0x3b1696b1,0x9bdc06a7,0x25c71235,0xc19bf174,0xcf692694,0xe49b69c1,0x9ef14ad2,0xefbe4786,0x384f25e3,0x0fc19dc6,0x8b8cd5b5,0x240ca1cc,0x77ac9c65,0x2de92c6f,0x592b0275,0x4a7484aa,0x6ea6e483,0x5cb0a9dc,0xbd41fbd4,0x76f988da,0x831153b5,0x983e5152,0xee66dfab,0xa831c66d,0x2db43210,0xb00327c8,0x98fb213f,0xbf597fc7,0xbeef0ee4,0xc6e00bf3,0x3da88fc2,0xd5a79147,0x930aa725,0x06ca6351,0xe003826f,0x14292967,0x0a0e6e70,0x27b70a85,0x46d22ffc,0x2e1b2138,0x5c26c926,0x4d2c6dfc,0x5ac42aed,0x53380d13,0x9d95b3df,0x650a7354,0x8baf63de,0x766a0abb,0x3c77b2a8,0x81c2c92e,0x47edaee6,0x92722c85,0x1482353b,0xa2bfe8a1,0x4cf10364,0xa81a664b,0xbc423001,0xc24b8b70,0xd0f89791,0xc76c51a3,0x0654be30,0xd192e819,0xd6ef5218,0xd6990624,0x5565a910,0xf40e3585,0x5771202a,0x106aa070,0x32bbd1b8,0x19a4c116,0xb8d2d0c8,0x1e376c08,0x5141ab53,0x2748774c,0xdf8eeb99,0x34b0bcb5,0xe19b48a8,0x391c0cb3,0xc5c95a63,0x4ed8aa4a,0xe3418acb,0x5b9cca4f,0x7763e373,0x682e6ff3,0xd6b2b8a3,0x748f82ee,0x5defb2fc,0x78a5636f,0x43172f60,0x84c87814,0xa1f0ab72,0x8cc70208,0x1a6439ec,0x90befffa,0x23631e28,0xa4506ceb,0xde82bde9,0xbef9a3f7,0xb2c67915,0xc67178f2,0xe372532b,0xca273ece,0xea26619c,0xd186b8c7,0x21c0c207,0xeada7dd6,0xcde0eb1e,0xf57d4f7f,0xee6ed178,0x06f067aa,0x72176fba,0x0a637dc5,0xa2c898a6,0x113f9804,0xbef90dae,0x1b710b35,0x131c471b,0x28db77f5,0x23047d84,0x32caab7b,0x40c72493,0x3c9ebe0a,0x15c9bebc,0x431d67c4,0x9c100d4c,0x4cc5d4be,0xcb3e42b6,0x597f299c,0xfc657e2a,0x5fcb6fab,0x3ad6faec,0x6c44198c,0x4a475817];
+    var __sha512core = function(bytes, IV, outLen){
+      var H=IV.slice(0);
+      var l=bytes.length;
+      var bitLenHi=Math.floor(l/0x20000000), bitLenLo=(l<<3)>>>0;
+      var withOne=l+1; var k=(128 - ((withOne+16)%128))%128; var total=withOne+k+16;
+      var m=new Uint8Array(total); m.set(bytes); m[l]=0x80;
+      m[total-8]=(bitLenHi>>>24)&0xff; m[total-7]=(bitLenHi>>>16)&0xff; m[total-6]=(bitLenHi>>>8)&0xff; m[total-5]=bitLenHi&0xff;
+      m[total-4]=(bitLenLo>>>24)&0xff; m[total-3]=(bitLenLo>>>16)&0xff; m[total-2]=(bitLenLo>>>8)&0xff; m[total-1]=bitLenLo&0xff;
+      var w=new Array(160);
+      for(var i=0;i<total;i+=128){
+        for(var t=0;t<32;t++){ var off=i+t*4; w[t]=((m[off]<<24)|(m[off+1]<<16)|(m[off+2]<<8)|m[off+3])>>>0; }
+        for(var t=16;t<80;t++){
+          var x15H=w[(t-15)*2], x15L=w[(t-15)*2+1];
+          var s0H=(((x15H>>>1)|(x15L<<31))^((x15H>>>8)|(x15L<<24))^(x15H>>>7))>>>0;
+          var s0L=(((x15L>>>1)|(x15H<<31))^((x15L>>>8)|(x15H<<24))^((x15L>>>7)|(x15H<<25)))>>>0;
+          var x2H=w[(t-2)*2], x2L=w[(t-2)*2+1];
+          var s1H=(((x2H>>>19)|(x2L<<13))^((x2L>>>29)|(x2H<<3))^(x2H>>>6))>>>0;
+          var s1L=(((x2L>>>19)|(x2H<<13))^((x2H>>>29)|(x2L<<3))^((x2L>>>6)|(x2H<<26)))>>>0;
+          var a16H=w[(t-16)*2],a16L=w[(t-16)*2+1],a7H=w[(t-7)*2],a7L=w[(t-7)*2+1];
+          var lo=(s1L>>>0)+(a7L>>>0); var hi=(s1H>>>0)+(a7H>>>0)+(lo>0xffffffff?1:0); lo>>>=0;
+          var lo2=lo+(s0L>>>0); hi=(hi+(s0H>>>0)+(lo2>0xffffffff?1:0))>>>0; lo2>>>=0;
+          var lo3=lo2+(a16L>>>0); hi=(hi+(a16H>>>0)+(lo3>0xffffffff?1:0))>>>0; lo3>>>=0;
+          w[t*2]=hi>>>0; w[t*2+1]=lo3>>>0;
+        }
+        var aH=H[0],aL=H[1],bH=H[2],bL=H[3],cH=H[4],cL=H[5],dH=H[6],dL=H[7],eH=H[8],eL=H[9],fH=H[10],fL=H[11],gH=H[12],gL=H[13],hH=H[14],hL=H[15];
+        for(var t=0;t<80;t++){
+          var S1H=(((eH>>>14)|(eL<<18))^((eH>>>18)|(eL<<14))^((eL>>>9)|(eH<<23)))>>>0;
+          var S1L=(((eL>>>14)|(eH<<18))^((eL>>>18)|(eH<<14))^((eH>>>9)|(eL<<23)))>>>0;
+          var chH=((eH&fH)^(~eH&gH))>>>0, chL=((eL&fL)^(~eL&gL))>>>0;
+          var lo=(hL>>>0)+(S1L>>>0); var hi=(hH>>>0)+(S1H>>>0)+(lo>0xffffffff?1:0); lo>>>=0;
+          lo=lo+(chL>>>0); hi=(hi+(chH>>>0)+(lo>0xffffffff?1:0))>>>0; lo>>>=0;
+          lo=lo+(__SHA512_K[t*2+1]>>>0); hi=(hi+(__SHA512_K[t*2]>>>0)+(lo>0xffffffff?1:0))>>>0; lo>>>=0;
+          lo=lo+(w[t*2+1]>>>0); hi=(hi+(w[t*2]>>>0)+(lo>0xffffffff?1:0))>>>0; lo>>>=0;
+          var T1H=hi>>>0,T1L=lo>>>0;
+          var S0H=(((aH>>>28)|(aL<<4))^((aL>>>2)|(aH<<30))^((aL>>>7)|(aH<<25)))>>>0;
+          var S0L=(((aL>>>28)|(aH<<4))^((aH>>>2)|(aL<<30))^((aH>>>7)|(aL<<25)))>>>0;
+          var majH=((aH&bH)^(aH&cH)^(bH&cH))>>>0, majL=((aL&bL)^(aL&cL)^(bL&cL))>>>0;
+          var lo2=(S0L>>>0)+(majL>>>0); var hi2=(S0H>>>0)+(majH>>>0)+(lo2>0xffffffff?1:0); lo2>>>=0;
+          var T2H=hi2>>>0,T2L=lo2>>>0;
+          hH=gH;hL=gL; gH=fH;gL=fL; fH=eH;fL=eL;
+          var loe=(dL>>>0)+(T1L>>>0); var hie=(dH>>>0)+(T1H>>>0)+(loe>0xffffffff?1:0); eH=hie>>>0; eL=loe>>>0;
+          dH=cH;dL=cL; cH=bH;cL=bL; bH=aH;bL=aL;
+          var loa=(T1L>>>0)+(T2L>>>0); var hia=(T1H>>>0)+(T2H>>>0)+(loa>0xffffffff?1:0); aH=hia>>>0; aL=loa>>>0;
+        }
+        function __ad(idx,vH,vL){ var lo=(H[idx+1]>>>0)+(vL>>>0); var hi=(H[idx]>>>0)+(vH>>>0)+(lo>0xffffffff?1:0); H[idx]=hi>>>0; H[idx+1]=lo>>>0; }
+        __ad(0,aH,aL);__ad(2,bH,bL);__ad(4,cH,cL);__ad(6,dH,dL);__ad(8,eH,eL);__ad(10,fH,fL);__ad(12,gH,gL);__ad(14,hH,hL);
+      }
+      var full=new Uint8Array(64);
+      for(var i=0;i<16;i++){ full[i*4]=(H[i]>>>24)&0xff; full[i*4+1]=(H[i]>>>16)&0xff; full[i*4+2]=(H[i]>>>8)&0xff; full[i*4+3]=H[i]&0xff; }
+      return outLen===64 ? full : full.subarray(0, outLen);
+    };
+    var __SHA512_IV=[0x6a09e667,0xf3bcc908,0xbb67ae85,0x84caa73b,0x3c6ef372,0xfe94f82b,0xa54ff53a,0x5f1d36f1,0x510e527f,0xade682d1,0x9b05688c,0x2b3e6c1f,0x1f83d9ab,0xfb41bd6b,0x5be0cd19,0x137e2179];
+    var __SHA384_IV=[0xcbbb9d5d,0xc1059ed8,0x629a292a,0x367cd507,0x9159015a,0x3070dd17,0x152fecd8,0xf70e5939,0x67332667,0xffc00b31,0x8eb44a87,0x68581511,0xdb0c2e0d,0x64f98fa7,0x47b5481d,0xbefa4fa4];
+    var __sha512 = function(bytes){ return __sha512core(bytes, __SHA512_IV, 64); };
+    var __sha384 = function(bytes){ return __sha512core(bytes, __SHA384_IV, 48); };
     globalThis.__hashes = {
       sha256: __sha256, 'sha-256': __sha256,
       sha1: __sha1, 'sha-1': __sha1,
       md5: __md5,
-      blockSize: { sha256: 64, 'sha-256': 64, sha1: 64, 'sha-1': 64, md5: 64 },
+      sha512: __sha512, 'sha-512': __sha512,
+      sha384: __sha384, 'sha-384': __sha384,
+      blockSize: { sha256: 64, 'sha-256': 64, sha1: 64, 'sha-1': 64, md5: 64, sha512: 128, 'sha-512': 128, sha384: 128, 'sha-384': 128 },
     };
   }
   if (typeof globalThis.crypto === 'undefined') globalThis.crypto = {};
@@ -1787,7 +1847,7 @@ var __crypto = (function(){
     createHash: createHash, createHmac: createHmac, Hash: Hash, Hmac: Hmac,
     scryptSync: scryptSync, pbkdf2Sync: function(pw, salt, it, kl, digest){ if (digest && normAlgo(digest).replace('-','') !== 'sha256') throw new Error('pbkdf2Sync: only sha256 supported in-VM'); return globalThis.Buffer.from(pbkdf2Sha256(toBytes(pw), toBytes(salt), it, kl)); },
     constants: {}, webcrypto: globalThis.crypto,
-    getHashes: function(){ return ['sha256','sha1','md5']; },
+    getHashes: function(){ return ['sha256','sha384','sha512','sha1','md5']; },
     timingSafeEqual: function(a, b){ if (a.length !== b.length) throw new RangeError('Input buffers must have the same byte length'); var diff = 0; for (var i=0;i<a.length;i++) diff |= a[i] ^ b[i]; return diff === 0; },
   };
 })();
@@ -2942,7 +3002,21 @@ fn build_runtime() -> (Runtime, Context) {
     let rt = Runtime::new().unwrap();
     let ctx = Context::full(&rt).unwrap();
     rt.set_memory_limit(64 * 1024 * 1024);
-    rt.set_max_stack_size(512 * 1024);
+    // STACK GUARD (paired with the 8 MiB native wasm stack in engine/.cargo/config.toml).
+    // The native stack is 8 MiB (-zstack-size=8388608, ~3640 native frames). This JS guard
+    // is the catchable RangeError fence: rquickjs measures the C-stack delta on every QuickJS
+    // call and throws a *catchable* `InternalError: stack overflow` (surfaced as a RangeError-
+    // class recursion error) once the budget is exceeded — BEFORE the native 8 MiB stack
+    // actually overflows into an uncatchable `RuntimeError: unreachable` trap that kills the
+    // DO socket (WS-1006). 512 KiB measured ⇒ catchable ceiling ~2000 JS frames (well in the
+    // thousands), with a >7 MiB native-stack margin so it is ALWAYS catchable at EVERY probed
+    // depth (no `unreachable`, no instance corruption — a fresh session is never poisoned).
+    // DO NOT raise this toward the native 8 MiB: a near-ceiling guard intermittently overran
+    // into the uncatchable trap at boundary depths (live-observed 1006), AND a deeper recursion
+    // bloats the monotonic linear buffer toward the snapshot wedge (see the GC-on-grow reclaim
+    // at the tail of finalize_cell). 512 KiB is the safe, always-catchable, depth-in-thousands
+    // sweet spot; re-tune ONLY in lockstep with the native stack size in config.toml.
+    rt.set_max_stack_size(256 * 1024);
     rt.set_interrupt_handler(Some(Box::new(|| {
         // GUARD 1: instruction budget
         let over_budget = BUDGET.with(|b| {
@@ -3509,6 +3583,28 @@ fn run(resume: bool) -> i32 {
         // The cell promise should now be settled (no pending host call, jobs drained).
         // If for some reason it is not done and not parked, finalize as undefined.
         ctx.with(|ctx| finalize_cell(&ctx));
+
+        // WARM-WEDGE RECLAIM (P0). Deep sync recursion (and large transient allocs) grow the
+        // *monotonic* WASM linear buffer with QuickJS call frames / scratch objects that are
+        // already DEAD by the time the cell returns or throws (a catchable RangeError pops the
+        // whole frame chain). WASM memory never shrinks in place, so without an explicit GC the
+        // buffer stays at its recursion high-water-mark — and the NEXT cell's post-cell
+        // checkpoint then has to slice()+compress that bloated buffer, whose transient ~2-3x
+        // expansion can WS-1006 the DO (the observed "after a deep recursion the same session's
+        // next eval hangs/1006" wedge). Running a GC here collapses the freed frames back to the
+        // live used-heap, so the subsequent _serializeForDump sees a small used_heap and the W5
+        // arena-scrub can zero the freed slack → the bloated buffer gzips to ~nothing and the
+        // checkpoint stays well inside the dump envelope. Gate on actual growth so the steady
+        // state (no growth) pays nothing: GC only when the cell grew the buffer by more than
+        // ~4 MiB (64 pages) over eval-begin.
+        let grew_pages = {
+            let start = START_PAGES.with(|s| s.get());
+            cur_pages().saturating_sub(start)
+        };
+        if grew_pages > 64 {
+            rt.run_gc();
+        }
+
         STATUS_DONE
     })
 }

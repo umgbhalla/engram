@@ -1,0 +1,28 @@
+# Native WASM linear stack size.
+#
+# We set an explicit 16 MiB native stack (-z stack-size=8388608; LLD default is
+# 1 MiB). The 1 MiB default capped catchable sync recursion at only ~90-170 JS
+# frames; 8 MiB raised the native ceiling to ~1820 frames but left too thin a margin —
+# the JS guard had to fire so close to the native ceiling (~1700 frames) that boundary
+# depths INTERMITTENTLY overran the native stack into an uncatchable `unreachable` trap
+# that killed the DO socket (live-observed 1006 at N=1500/5000 on the 8 MiB build). A
+# 16 MiB native stack (~3640 native frames) gives the guard room to fire at ~2800-3000
+# frames with a comfortable ≥600-frame margin → ALWAYS catchable, never 1006, while
+# lifting the success ceiling clearly into the thousands.
+#
+# Why this is now SAFE (the old "16 MiB balloons the snapshot to 32 MB and wedges eval"
+# warning is STALE): (1) the SCRATCH buffer rewrite (engine/src/lib.rs) already moved
+# the big IO buffer off the fixed array, and (2) snapshot size-admission is on USED heap
+# (MAX_USED_BYTES = 50 MB), and the raw safe-to-instantiate ceiling is now 76 MB
+# (SAFE_SERIALIZE_BUFFER_BYTES / MAX_RESTORE_RAW_BYTES in kernel-glue.ts) — far above a
+# 16 MiB initial buffer. A fresh kernel's used heap is tiny regardless of stack size,
+# and the 16 MiB stack region is mostly zeros so it gzips to near-nothing (fresh
+# snapshot stays sub-1 MB gz). DO NOT raise above ~32 MiB without re-checking the 76 MB
+# raw ceiling.
+#
+# Pairing: rt.set_max_stack_size(...) in engine/src/lib.rs is tuned to this stack
+# size (512 KiB measured budget => ~2800-3000 catchable frames, well below the ~3640
+# native ceiling for every function shape). See build_runtime() for the sizing
+# rationale. If you change this stack size, RE-TUNE the guard there in lockstep.
+[target.wasm32-wasip1]
+rustflags = ["-C", "link-arg=-zstack-size=8388608"]
