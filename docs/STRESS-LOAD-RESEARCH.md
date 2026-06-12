@@ -28,10 +28,17 @@ warmBuffered session, runs 5 continuous evals, verifies status reports dirty liv
 flush, explicitly flushes the dirty heap, evicts, then verifies the flushed value restores from the
 durable checkpoint.
 
+scripts/chaos-hot-repl.mjs is the fuzzy/chaos harness for hot REPL mode. It mixes random
+warmBuffered evals, reads, delays, explicit flushes, reconnect-after-flush, post-flush evicts,
+timeout cells, and small queue bursts against one disposable session. It is designed to find
+dirty-window loss, heartbeat failures, replay duplication, timeout poisoning, and flush/restore
+boundary bugs.
+
 Default run:
 
     bun run hammer:single -- --out scratch/stress/hammer-single.json --markdown scratch/stress/hammer-single.md
     bun run probe:warm-buffered -- --out scratch/stress/warm-buffered.json
+    bun run chaos:hot-repl -- --iterations 80 --out scratch/stress/chaos-hot-repl.json
 
 Default gates:
 

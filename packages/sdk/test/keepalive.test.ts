@@ -80,7 +80,7 @@ class FakeWebSocket {
   protected reply(frame: any): any {
     if (frame.t === "auth") return { ok: true, t: "auth" };
     if (frame.t === "create") return { ok: true, t: "create" };
-    if (frame.t === "ping") return { ok: true, t: "ping", generation: 1, inMemory: true };
+    if (frame.t === "ping") return { ok: true, t: "ping", generation: 1, inMemory: true, keepAlive: frame.keepAlive === true };
     if (frame.t === "eval") {
       return {
         ok: true,
@@ -127,6 +127,16 @@ class FlakyEvalWebSocket extends FakeWebSocket {
 
 class FlakyOpenWebSocket extends FakeWebSocket {
   static override failOpenCount = 0;
+}
+
+class SlowEvalWebSocket extends FakeWebSocket {
+  override send(data: string): void {
+    if (data === "ping") return super.send(data);
+    const frame = JSON.parse(data);
+    this.sent.push(frame);
+    const delay = frame.t === "eval" ? 260 : 0;
+    setTimeout(() => this.emit("message", JSON.stringify(this.reply(frame))), delay);
+  }
 }
 
 afterEach(() => {
@@ -184,6 +194,26 @@ describe("bare-kernel keepalive", () => {
     expect(FakeWebSocket.instances.length).toBe(1);
     expect(closes).toBe(0);
     expect(reconnects).toBe(0);
+
+    session.close();
+  });
+
+  test("heartbeat replies do not resolve an in-flight eval", async () => {
+    const session = await Engram.connect({
+      url: "wss://kernel.example",
+      session: "keepalive-heartbeat-pending",
+      kernelKey: "test-key",
+      WebSocket: SlowEvalWebSocket,
+      keepAliveAfterActivityMs: 500,
+    });
+
+    await session.eval("prime()");
+    const result = await session.eval("slow()");
+    expect(result.value).toBe(42);
+
+    const sent = FakeWebSocket.instances.flatMap((ws) => ws.sent);
+    expect(sent.some((frame) => frame && frame.t === "ping" && frame.keepAlive === true)).toBe(true);
+    expect(sent.filter((frame) => frame && frame.t === "eval").length).toBeGreaterThanOrEqual(2);
 
     session.close();
   });

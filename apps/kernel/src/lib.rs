@@ -749,7 +749,21 @@ impl KernelDO {
 
     fn pending_eval_reply(cell: i64, src: &str) -> String {
         let timeout_like = src.contains("while (true)") || src.contains("__timeoutSpin");
-        json!({"__engramPending": true, "cell": cell, "timeoutLike": timeout_like}).to_string()
+        let side_effect_like =
+            src.contains("=")
+                || src.contains("++")
+                || src.contains("--")
+                || src.contains(".push(")
+                || src.contains(".splice(")
+                || src.contains(".set(")
+                || src.contains("delete ");
+        json!({
+            "__engramPending": true,
+            "cell": cell,
+            "timeoutLike": timeout_like,
+            "sideEffectLike": side_effect_like,
+        })
+        .to_string()
     }
 
     fn pending_eval_replay(reply: &serde_json::Value, generation: i64) -> Option<serde_json::Value> {
@@ -787,6 +801,13 @@ impl KernelDO {
                         "replay": true
                     }
                 }));
+            }
+            if !reply
+                .get("sideEffectLike")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true)
+            {
+                return None;
             }
             return Some(json!({
                 "ok": true,
@@ -937,7 +958,7 @@ impl KernelDO {
 
         let epoch = read_int(&store, "epoch", 0);
         let src = read_str(&store, "lastDirtySrc").unwrap_or_else(|| "/* engram warmBuffered flush */".into());
-        let ckpt = self.checkpoint(live, epoch, &src).await?;
+        let ckpt = self.checkpoint_force_full(live, epoch, &src).await?;
         let ok = ckpt.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
         if ok {
             self.mark_clean(live);
@@ -2168,6 +2189,7 @@ impl KernelDO {
                 "ok": true, "t": "ping",
                 "inMemory": self.glue.borrow().is_some(),
                 "generation": self.generation,
+                "keepAlive": msg.get("keepAlive").and_then(|v| v.as_bool()).unwrap_or(false),
             })),
             // VFS-* out-of-band file I/O. Serviced DIRECTLY against the host.fs R2 store (same
             // key scheme `fs/<doId>/<normpath>`, same SNAPSHOTS bucket, same `fs_files` meta table,
@@ -2865,9 +2887,28 @@ impl KernelDO {
     /// via DO synchronous write-coalescing; R2 swap-then-delete for the base overflow.
     /// `src` is the cell source (for the E6 oplog tail).
     async fn checkpoint(&self, cell: i64, epoch: i64, src: &str) -> Result<serde_json::Value> {
+        self.checkpoint_impl(cell, epoch, src, false).await
+    }
+
+    async fn checkpoint_force_full(
+        &self,
+        cell: i64,
+        epoch: i64,
+        src: &str,
+    ) -> Result<serde_json::Value> {
+        self.checkpoint_impl(cell, epoch, src, true).await
+    }
+
+    async fn checkpoint_impl(
+        &self,
+        cell: i64,
+        epoch: i64,
+        src: &str,
+        force_full_override: bool,
+    ) -> Result<serde_json::Value> {
         const BASE_EVERY: i64 = 20;
         let prev = self.read_manifest();
-        let force_full = match &prev {
+        let force_full = force_full_override || match &prev {
             None => true,
             Some(m) => m.delta_seq + 1 >= BASE_EVERY,
         };

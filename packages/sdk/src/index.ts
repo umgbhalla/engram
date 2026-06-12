@@ -557,6 +557,7 @@ function resolveWebSocket(explicit: unknown): any {
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+const KEEPALIVE_HEARTBEAT_MS = 2_000;
 
 /**
  * WebSocket transport (bare kernel, or cloud `/connect`). Serialises requests on a
@@ -653,6 +654,9 @@ class WsTransport implements Transport {
           (value) => this.sendRaw({ t: "hostcall-result", id: msg.id, ok: true, value }),
           (err) => this.sendRaw({ t: "hostcall-result", id: msg.id, ok: false, error: String((err && err.message) || err) }),
         );
+      return;
+    }
+    if (msg && msg.t === "ping" && msg.keepAlive === true) {
       return;
     }
     // Any other frame is the reply to the in-flight rpc.
@@ -763,11 +767,18 @@ class WsTransport implements Transport {
         return;
       }
 
-      const delay = Math.min(1000, Math.max(100, this.keepAliveUntil - Date.now()));
+      try {
+        if (this.ws && this.ws.readyState === 1) {
+          this.ws.send(JSON.stringify({ t: "ping", keepAlive: true }));
+        }
+      } catch {
+        /* best-effort heartbeat */
+      }
+      const delay = Math.min(KEEPALIVE_HEARTBEAT_MS, Math.max(100, this.keepAliveUntil - Date.now()));
       this.keepAliveTimer = setTimeout(tick, delay);
     };
 
-    const initialDelay = Math.min(100, Math.max(25, Math.floor(windowMs / 4)));
+    const initialDelay = Math.min(KEEPALIVE_HEARTBEAT_MS, Math.max(100, Math.floor(windowMs / 4)));
     this.keepAliveTimer = setTimeout(tick, initialDelay);
   }
 

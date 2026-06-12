@@ -18,6 +18,7 @@
     "stress:single": "node scripts/stress-single-instance.mjs",
     "hammer:single": "node scripts/hammer-single-connection.mjs",
     "probe:warm-buffered": "node scripts/probe-warm-buffered.mjs",
+    "chaos:hot-repl": "node scripts/chaos-hot-repl.mjs",
     "build:sdk": "bun run --filter @engram/sdk build",
     "build:cli": "bun run --filter @engram/cli build",
     "build:ui": "bun run --filter @engram/ui-app build"
