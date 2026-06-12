@@ -12,6 +12,11 @@
 //         pure WS client cannot force R2 unavailability, so case2 verifies restore FIDELITY
 //         (acc survives) and reports the precondition reached. A red verdict still means a
 //         real fidelity break; a green verdict does NOT clear the documented fault path.
+//   telemetry: the DEPLOYED kernel does NOT echo sizeRaw/usedHeap to the client (they read
+//         0.0MB live). NO precondition in this harness trusts them — spikes/pins are
+//         confirmed by in-VM readback (`__b.length`, fill-byte samples, a fresh-alloc
+//         pressure probe). If a precondition can't be confirmed, the case THROWS a harness
+//         error instead of emitting a false 🟢 held.
 
 import { Engram } from "../../packages/sdk/dist/index.mjs";
 const { default: WebSocket } = await import("ws");
@@ -25,8 +30,10 @@ const tag = () => `chaos-${Math.floor(performance.now())}-${Math.floor(performan
 const verdicts = [];
 function reproduced(name, detail) { console.log(`\n  🔴 REPRODUCED — ${name}\n     ${detail}`); verdicts.push({ name, reproduced: true, detail }); }
 function held(name, detail) { console.log(`\n  🟢 not reproduced (guard held) — ${name}\n     ${detail}`); verdicts.push({ name, reproduced: false, detail }); }
-async function connect(t, config = {}) {
-  return Engram.connect({ url, apiKey, session: `${t}-${tag()}`, WebSocket, config });
+async function connect(t, config = {}, timeoutMs) {
+  // ConnectOptions.timeoutMs (packages/sdk/src/index.ts, default 60000) is the per-frame wire
+  // timeout — it also bounds hibernateThenResume()'s cold-restore touch eval.
+  return Engram.connect({ url, apiKey, session: `${t}-${tag()}`, WebSocket, config, ...(timeoutMs ? { timeoutMs } : {}) });
 }
 const val = (r) => r?.value;
 
@@ -38,22 +45,46 @@ const val = (r) => r?.value;
 // ───────────────────────────────────────────────────────────────────────────
 async function case1() {
   console.log("\n══ CASE 1 — admission-math un-restorable commit [CRITICAL] ══");
-  const s = await connect("c1");
+  // 120s wire timeout: the 46MB-spike checkpoint + the cold restore of a big base are slow.
+  const s = await connect("c1", {}, 120_000);
   try {
     // durable canary established BEFORE the spike — must survive
     await s.eval(`globalThis.canary = { id: 'c1-canary', n: 12345, arr: [1,2,3] }`);
 
-    // Cell 1: prime high-water-mark ~46MB single native alloc (< 64MB grow cap, no trip)
-    const c1 = await s.eval(`globalThis.__b = new Uint8Array(46*1024*1024); __b.fill(7); __b.length`);
-    console.log(`     spike alloc -> sizeRaw≈${((c1.sizeRaw ?? 0)/MB).toFixed(1)}MB used≈${((c1.usedHeap ?? 0)/MB).toFixed(1)}MB`);
+    // Cell 1: prime high-water-mark ~46MB single native alloc (< 64MB grow cap, no trip).
+    // CALIBRATION FIX: the deployed kernel does NOT echo sizeRaw/usedHeap (read 0.0MB live),
+    // so we confirm the spike landed by IN-VM READBACK — length + fill-byte samples — not telemetry.
+    const SPIKE = 46 * MB;
+    const c1 = await s.eval(
+      `globalThis.__b = new Uint8Array(${SPIKE}); __b.fill(7);
+       [__b.length, __b[0], __b[${SPIKE >> 1}], __b[${SPIKE - 1}]]`,
+      { timeoutMs: 120_000 },
+    );
+    const [len, b0, bMid, bEnd] = Array.isArray(val(c1)) ? val(c1) : [];
+    if (len !== SPIKE || b0 !== 7 || bMid !== 7 || bEnd !== 7) {
+      throw new Error(`case1 PRECONDITION FAILED — 46MB spike did not land (readback ${JSON.stringify(val(c1))}); case not exercised`);
+    }
+    console.log(`     spike alloc CONFIRMED by readback -> __b.length=${(len/MB).toFixed(1)}MB, fill bytes 7/7/7`);
+
+    // Memory-pressure probe: a SECOND real allocation on top of the live 46MB spike. Its
+    // success is a genuine signal the linear buffer grew past the spike high-water-mark
+    // (an alloc-success readback, not a trusted size counter).
+    const probe = await s.eval(
+      `{ const p = new Uint8Array(4*1024*1024); p.fill(3); p[p.length - 1] }`,
+      { timeoutMs: 120_000 },
+    );
+    if (val(probe) !== 3) {
+      throw new Error(`case1 PRECONDITION FAILED — pressure probe alloc did not land (got ${JSON.stringify(val(probe))})`);
+    }
+    console.log(`     pressure probe -> +4MB alloc succeeded on top of live spike (high-water ≥ ~50MB)`);
 
     // Cell 2: free
     await s.eval(`globalThis.__b = null; 1`);
 
     // Cell 3: force GC + settle to tiny used_heap → this checkpoint is the one that ADMITS
+    // the ~46MB-high-water W4 base. (sizeRaw/usedHeap intentionally NOT read — see header note.)
     const c3 = await s.eval(`(globalThis.gc?.(), globalThis.canary.n)`);
-    const raw = c3.sizeRaw ?? 0, used = c3.usedHeap ?? 0;
-    console.log(`     settle commit -> sizeRaw≈${(raw/MB).toFixed(1)}MB used≈${(used/MB).toFixed(1)}MB committed=${c3.ok !== false}`);
+    console.log(`     settle commit -> committed=${c3.ok !== false} (admits the ~${(SPIKE/MB).toFixed(0)}MB high-water base)`);
 
     // Now the bomb: genuine cold restore from that committed high-water base
     const { restoreSource, generation } = await s.hibernateThenResume();
@@ -62,11 +93,11 @@ async function case1() {
     // Did the acked-durable canary survive the restore?
     const after = await s.eval(`globalThis.canary?.n ?? null`).catch((e) => ({ __err: e.message }));
     if (after?.__err) {
-      reproduced("case1", `cold restore THREW / lost session after committing ~${(raw/MB).toFixed(1)}MB base: ${after.__err}`);
+      reproduced("case1", `cold restore THREW / lost session after committing a readback-confirmed ~46MB-high-water base: ${after.__err}`);
     } else if (val(after) !== 12345) {
-      reproduced("case1", `canary LOST across restore (got ${JSON.stringify(val(after))}, expected 12345) from a ${(raw/MB).toFixed(1)}MB admitted base`);
+      reproduced("case1", `canary LOST across restore (got ${JSON.stringify(val(after))}, expected 12345) from a readback-confirmed ~46MB-high-water admitted base`);
     } else {
-      held("case1", `canary survived (n=12345) restore=${restoreSource}; admitted base ${(raw/MB).toFixed(1)}MB instantiated OK this run`);
+      held("case1", `canary survived (n=12345) restore=${restoreSource}; readback-confirmed ~46MB-high-water base instantiated OK this run`);
     }
   } finally { s.close(); }
 }
@@ -79,18 +110,29 @@ async function case1() {
 // ───────────────────────────────────────────────────────────────────────────
 async function case2() {
   console.log("\n══ CASE 2 — W4 rollover 1-cell-namespace fidelity [HIGH] ══");
-  const s = await connect("c2");
+  // CALIBRATION FIX: 21 sequential evals each checkpointing over a 9MB pinned heap blew the
+  // default 60s wire timeout → 180s via ConnectOptions.timeoutMs (also bounds the
+  // hibernateThenResume restore touch); the pin cell additionally gets EvalOptions.timeoutMs.
+  const s = await connect("c2", {}, 180_000);
   try {
-    // pin usedHeap > 8MB SQLITE_HOT_MAX so the rollover base spills to R2
-    await s.eval(`globalThis.big = new Uint8Array(9*1024*1024).fill(1); globalThis.acc = []; 1`);
+    // pin usedHeap > 8MB SQLITE_HOT_MAX so the rollover base spills to R2.
+    // Pin confirmed by IN-VM READBACK (big.length) — sizeRaw/usedHeap are NOT echoed by the
+    // deployed kernel (read 0.0MB live), so the R2-spill itself is NOT client-observable;
+    // we can only confirm the >8MB precondition that forces it.
+    const PIN = 9 * MB;
+    const pinned = val(await s.eval(
+      `globalThis.big = new Uint8Array(${PIN}).fill(1); globalThis.acc = []; big.length`,
+      { timeoutMs: 180_000 },
+    ));
+    if (pinned !== PIN) {
+      throw new Error(`case2 PRECONDITION FAILED — 9MB pin did not land (big.length=${JSON.stringify(pinned)}); case not exercised`);
+    }
     const BASE_EVERY = 20;
-    let lastSpill = null;
     for (let i = 0; i <= BASE_EVERY; i++) {
-      const r = await s.eval(`acc.push({ i: ${i}, blob: big.slice(0, 1024) }); globalThis.last = acc.length; last`);
-      if ((r.sizeRaw ?? 0) > 8 * MB) lastSpill = r.sizeRaw;
+      await s.eval(`acc.push({ i: ${i}, blob: big.slice(0, 1024) }); globalThis.last = acc.length; last`);
     }
     const pre = val(await s.eval(`acc.length`));
-    console.log(`     drove ${BASE_EVERY + 1} non-idempotent cells over rollover; acc.length=${pre}; R2-spill seen=${lastSpill != null}`);
+    console.log(`     drove ${BASE_EVERY + 1} non-idempotent cells over rollover; acc.length=${pre}; pin confirmed=${(pinned/MB).toFixed(0)}MB (R2 spill forced, not client-observable)`);
 
     const { restoreSource, generation } = await s.hibernateThenResume();
     const post = val(await s.eval(`globalThis.acc?.length ?? null`));
@@ -137,20 +179,44 @@ async function case3() {
     await new Promise((r) => setTimeout(r, 1500));
 
     // Frame 2: a mutex-FREE commit to the SAME path while eval is parked.
-    // vfs-write / sandbox / worker-invoke bypass the eval mutex (lib.rs:2201-2229).
-    // Drive it via a fresh transport on the SAME session so it races the parked frame.
+    // CALIBRATION FIX (the real harness bug): the old racer used `racer.eval(...)`, which
+    // TAKES the kernel eval mutex (lib.rs "eval" arm acquires self.mutex) — it queued BEHIND
+    // the parked frame and timed out instead of racing it. Mutex-free dispatch paths per
+    // apps/kernel/src/lib.rs:2196-2229:
+    //   - vfs-write/vfs-read/vfs-ls/vfs-stat: serviced directly against R2 + fs_files,
+    //     "These arms do NOT acquire self.mutex" — fully mutex-free AND land in the SAME
+    //     fs/<doId>/ + fs_files namespace the eval's staged flush targets. ← USED HERE
+    //     (SDK: s.writeFile -> {t:"vfs-write"}).
+    //   - sandbox (s.sandbox.exec): the exec itself is mutex-free, BUT a container write goes
+    //     direct-to-R2 via s3fs with NO fs_files row — invisible to the eval's namespace until
+    //     vfs-sync, and vfs-sync ACQUIRES the mutex (would deadlock behind the parked frame).
+    //     Not usable as an observable racer while the eval is parked.
+    //   - worker-invoke (s.registerWorker/s.invokeWorker via env.VFS): the dispatch arm is
+    //     mutex-free, but worker_invoke acquires the mutex for its post-invoke fs_files
+    //     reconcile (lib.rs:2213-2215) — it would block behind the parked frame too.
+    // So vfs-write is the ONLY fully mutex-free commit path observable in the eval's fs view.
+    // Drive it via a fresh transport on the SAME session (the SDK WS transport allows one
+    // in-flight frame per socket, and s's socket is occupied by the parked eval).
     const racer = await Engram.connect({ url, apiKey, session: s.session ?? undefined, WebSocket });
-    let racerNote = "racer issued";
+    let racerNote = "racer vfs-write committed (mutex-free)";
+    let racerOk = true;
     try {
-      // worker-invoke path writes through env.VFS to the same fs/<doId>/ prefix, mutex-free
-      await racer.eval(`fs.writeFileSync('${PATH}', 'RACED_MUTEX_FREE')`);
-    } catch (e) { racerNote = `racer eval err: ${e.message}`; }
+      // s.writeFile -> {t:"vfs-write"} frames: direct R2 + fs_files commit, no eval mutex.
+      await racer.writeFile(PATH, "RACED_MUTEX_FREE", { timeoutMs: 15_000 });
+    } catch (e) { racerOk = false; racerNote = `racer vfs-write err: ${e.message}`; }
     racer.close();
 
     // release the parked eval → it now flushes staged_fs at checkpoint over the raced write
     release();
     const parkedRes = await parked;
     const evalSaw = parkedRes?.__err ? `THREW ${parkedRes.__err}` : JSON.stringify(val(parkedRes));
+
+    // If the mutex-free racer write never landed, the race was NOT exercised — throw a
+    // harness error rather than emit a false 🟢 held. (A timeout here would mean the path
+    // was NOT mutex-free after all — that itself is worth surfacing, not hiding.)
+    if (!racerOk) {
+      throw new Error(`case3 NOT EXERCISED — ${racerNote}; the parked frame was released but no mutex-free write raced it`);
+    }
 
     // ground truth: what is durably committed now?
     const final = val(await s.eval(`fs.readFileSync('${PATH}', 'utf8')`));
