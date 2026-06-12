@@ -35,3 +35,7 @@ v1-spike-wasm/
 
 # local comparison harness output
 tests/compare-cf/run*-stderr.log
+
+# session scratch
+/test-*.mjs
+/tmp/
