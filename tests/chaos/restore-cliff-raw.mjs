@@ -11,8 +11,18 @@
 //   defaults: 16 76 8  (+78 cap probe)
 
 import WebSocket from "ws";
-const KK = process.env.ENGRAM_KERNEL_KEY;
-if (!KK) { console.error("ENGRAM_KERNEL_KEY required"); process.exit(2); }
+// ENGRAM_KERNEL_KEY is often EMPTY in a fresh shell (lives in repo .env). Fall back to .env.
+const _fs = await import("node:fs"), _path = await import("node:path"), _url = await import("node:url");
+function envKey() {
+  if (process.env.ENGRAM_KERNEL_KEY) return process.env.ENGRAM_KERNEL_KEY;
+  try {
+    const root = _path.resolve(_path.dirname(_url.fileURLToPath(import.meta.url)), "../..");
+    const line = _fs.readFileSync(_path.join(root, ".env"), "utf8").split("\n").find((l) => l.startsWith("ENGRAM_KERNEL_KEY="));
+    return line ? line.slice("ENGRAM_KERNEL_KEY=".length).trim().replace(/^["']|["']$/g, "") : "";
+  } catch { return ""; }
+}
+const KK = envKey();
+if (!KK) { console.error("ENGRAM_KERNEL_KEY required (shell env or repo .env)"); process.exit(2); }
 const HOST = (process.env.ENGRAM_URL ?? "wss://engram.umgbhalla.xyz").replace(/^http/i, "ws");
 const MB = 1024 * 1024;
 const lo = Number(process.argv[2] ?? 16), hi = Number(process.argv[3] ?? 76), step = Number(process.argv[4] ?? 8);
@@ -40,7 +50,10 @@ function rpc(ws, frame, timeoutMs = 90000) {
   });
 }
 const errStr = (e) => (e?.message ?? String(e));
-const isReject = (s) => /SizeAdmission|MemoryLimit/i.test(s);
+// "rejected" = the session survived (socket alive): a typed admission/limit error OR a CAUGHT
+// QuickJS OOM (InternalError "out of memory") returned as a reply. Only socket DEATH (1006 /
+// close / timeout) is a CLIFF (uncatchable, silent-loss risk). A caught OOM is NOT a cliff.
+const isReject = (s) => /SizeAdmission|MemoryLimit|out of memory|InternalError/i.test(s);
 
 async function trial(nMB) {
   const session = `cliffraw-${seed}-${nMB}`;

@@ -22,8 +22,19 @@ import { Engram } from "../../packages/sdk/dist/index.mjs";
 const { default: WebSocket } = await import("ws");
 
 const url = process.env.ENGRAM_URL ?? "wss://engram.umgbhalla.xyz";
-const apiKey = process.env.ENGRAM_KERNEL_KEY;
-if (!apiKey) { console.error("ENGRAM_KERNEL_KEY required"); process.exit(2); }
+// ENGRAM_KERNEL_KEY is often EMPTY in a fresh shell (it lives in repo .env, not the shell env).
+// Fall back to .env so runs don't silently send an empty token (-> 401 "kernel down" red herring).
+const _fs = await import("node:fs"), _path = await import("node:path"), _url = await import("node:url");
+function envKey() {
+  if (process.env.ENGRAM_KERNEL_KEY) return process.env.ENGRAM_KERNEL_KEY;
+  try {
+    const root = _path.resolve(_path.dirname(_url.fileURLToPath(import.meta.url)), "../..");
+    const line = _fs.readFileSync(_path.join(root, ".env"), "utf8").split("\n").find((l) => l.startsWith("ENGRAM_KERNEL_KEY="));
+    return line ? line.slice("ENGRAM_KERNEL_KEY=".length).trim().replace(/^["']|["']$/g, "") : "";
+  } catch { return ""; }
+}
+const apiKey = envKey();
+if (!apiKey) { console.error("ENGRAM_KERNEL_KEY required (shell env or repo .env)"); process.exit(2); }
 
 const MB = 1024 * 1024;
 const tag = () => `chaos-${Math.floor(performance.now())}-${Math.floor(performance.timeOrigin)}`;

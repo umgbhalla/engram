@@ -117,6 +117,18 @@ size × the retain-path copy multiplier**, which bites well below 63MB. Two surg
 "Nothing lost" guarantee: F1+F2 make the checkpoint SUCCEED (peak under ceiling) rather than
 WS-1006. F3 makes the spike fail-closed *before* commit. Either way no silent durable loss.
 
+## Measurement caveat: the cliff is NOT a clean per-session number (shared-isolate contamination)
+A clean `restore-cliff-raw.mjs` run (key auto-loaded from .env) showed the failures are
+**load/timing-dependent, not size-monotonic**: a 16MB spike hard-crashed (WS-1006) while a 78MB
+single alloc failed *cleanly* (catchable QuickJS `InternalError: out of memory`, socket alive) —
+the reverse of a true size cliff. Cause: the bare kernel's worker isolate is SHARED across sessions;
+repeated heavy probing leaves resident high-water sessions, so a new session's checkpoint OOMs on
+the *aggregate* isolate memory, not its own. ⇒ **a reliable threshold can't be measured from a WS
+client against the shared deployment.** The fix must therefore be **STRUCTURAL (F1+F2: cut the
+checkpoint copy-multiplier)**, NOT a magic threshold tuned to a contaminated measurement. (A clean
+number would need a fresh/quiet worker or per-session isolates.) The 5-copy amplification is real
+regardless; reducing it lowers peak under any load.
+
 ## Status
 - Root cause CONFIRMED (dump-side, 5-copy retain peak), fix designed with file:line.
 - **No kernel code changed yet** — F1/F2 touch correctness-sensitive W4/commit-ordering; shipping
