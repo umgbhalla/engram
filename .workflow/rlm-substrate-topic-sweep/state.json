@@ -1,0 +1,41 @@
+{
+  "title": "RLM substrate topic sweep",
+  "slug": "rlm-substrate-topic-sweep",
+  "created_at": "2026-06-13T08:34:40+00:00",
+  "status": "complete",
+  "approval": {
+    "required": null,
+    "granted": null,
+    "notes": ""
+  },
+  "packets": [
+    {
+      "id": "A",
+      "status": "complete",
+      "objective": "Enumerate topic repos and clone/fetch them"
+    },
+    {
+      "id": "B",
+      "status": "complete",
+      "objective": "Inspect canonical and high-signal substrate code"
+    },
+    {
+      "id": "C",
+      "status": "complete",
+      "objective": "Classify topic-tail repos"
+    },
+    {
+      "id": "D",
+      "status": "complete",
+      "objective": "Integrate substrate matrix and Engram implications"
+    }
+  ],
+  "verification": {
+    "status": "complete",
+    "checks": [
+      "GitHub topic API returned 20 repositories",
+      "All 20 topic repositories exist under /tmp/rlm-substrate-research",
+      "Runtime-source grep completed for substrate markers"
+    ]
+  }
+}
