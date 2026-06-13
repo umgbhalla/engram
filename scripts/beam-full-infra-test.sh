@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 RUN_ID="beam-infra-$(date -u +%Y%m%dT%H%M%SZ)"
-OUT_DIR="scratch/beam/$RUN_ID"
+OUT_DIR="$ROOT/scratch/beam/$RUN_ID"
 mkdir -p "$OUT_DIR"
 
 if [[ -f .env ]]; then
