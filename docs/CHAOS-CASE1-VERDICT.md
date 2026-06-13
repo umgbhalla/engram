@@ -73,7 +73,53 @@ and binary-searches the cold-restore failure point. Run it against a healthy `en
      A bad base falls back to the prior verified base + oplog replay (the fallback already exists:
      `restoreW4` CRC-mismatch → replay). Touches `lib.rs` checkpoint commit ordering.
 
+## CONFIRMED (live probe + opus code analysis): the real bug is DUMP-side, not restore-side
+The cascade pointed at restore; the truth is the **CHECKPOINT (dump)**. A raw-WS probe
+(`tests/chaos/restore-cliff-raw.mjs`) reproducibly failed **at the post-free checkpoint** (NOT
+restore) at 16 / 24 / 32 MB raw — `rpc-timeout` and `WS-1006` (uncatchable OOM), monotonic with
+spike size. opus code-analysis (high confidence) pinned the mechanism:
+
+1. **Tripwire bypass.** Default `cellGrowCapPages = 1024` (64MB, raised for 32MB fetch bodies —
+   `kernel-glue.ts:~1635`). A single `new Uint8Array(16-32MB)` grows ~256-512 pages, FAR under the
+   cap, and a single native alloc emits no bytecode interrupts → the v0.8 mid-cell tripwire never
+   fires. The spike lands silently.
+2. **Admission passes by design.** After free, the buffer is monotonic (~16-32MB), `usedHeap≈0`.
+   The 24MB incompressible gate (`max(usedHeap, buf-31MB)`) reads ~0 → ADMITS the freed spike (its
+   intended behavior).
+3. **5-copy retain peak.** raw < `LARGE_BUFFER_NO_RETAIN_BYTES (63MB)` → takes the RETAIN path, not
+   the 2-copy no-retain fence. The `canDelta` branch holds simultaneously: `raw` (L2628) +
+   `payload` (L2671) + **`payGz` AND `fullGz` — TWO full compresses** (L2681-2685) + `_pendingImage
+   = raw.slice()` (L2690) + the Rust-side `gz` copy (`lib.rs:~2939`). For a 32MB *incompressible*
+   image that's ~5× ≈ 130-160MB live in one synchronous checkpoint → crosses the ~128MB workerd
+   isolate soft ceiling → WS-1006. At 16MB it's ~80-90MB — still enough to wedge under any load.
+
+Worst single avoidable alloc: **`kernel-glue.ts:2690` (and 2695/2701) `_pendingImage = raw.slice()`**
++ the **double-compress** at L2681/L2685.
+
+## Precise fix (cuts peak; does NOT regress the fetch-body path or W4 correctness)
+The 63MB no-retain fence keys off `raw.byteLength`; the real OOM driver is **incompressible raw
+size × the retain-path copy multiplier**, which bites well below 63MB. Two surgical changes:
+
+- **(F1) Lower / re-key the no-retain trigger.** Trip the 2-copy no-retain path when the buffer is
+  bloated-and-mostly-freed (e.g. `bufBytes0 > ~24MB` with low `usedHeap`), not only at 63MB raw.
+  That routes a freed 16-32MB spike to peak `~raw + gz` instead of 5×. Normal small sessions
+  (buffer < trigger) keep the W4 delta chain untouched. Tradeoff: a freed-spike session loses its
+  delta chain (forced full base) — acceptable, it's the rare case, and correctness is preserved
+  (full base resets the oplog tail consistently, as the existing >63MB path already does).
+- **(F2) Skip the `fullGz` fallback compress when `raw` is large.** In the `canDelta` branch, don't
+  compute both `payGz` and `fullGz` above a size threshold — pick full directly. Removes one full
+  incompressible copy from the peak.
+- **(F3, defense-in-depth, has a tradeoff — USER DECISION):** drop default `cellGrowCapPages`
+  toward 256 for non-fetch sessions so a 16MB single-alloc trips `MemoryLimitError` MID-CELL
+  (socket alive) instead of silently wedging the next checkpoint. Cost: breaks >16MB single-alloc
+  cells for sessions that legitimately need them (large fetch bodies) unless scoped to non-fetch.
+
+"Nothing lost" guarantee: F1+F2 make the checkpoint SUCCEED (peak under ceiling) rather than
+WS-1006. F3 makes the spike fail-closed *before* commit. Either way no silent durable loss.
+
 ## Status
-- Mechanism corrected. Discount justified. **No code changed** (would regress v0.2 / is unverified).
-- Blocked on: (a) `engram-kernel` was unresponsive after the cascade run — confirm recovered;
-  (b) run `tests/chaos/restore-cliff.mjs` to get the real cliff number.
+- Root cause CONFIRMED (dump-side, 5-copy retain peak), fix designed with file:line.
+- **No kernel code changed yet** — F1/F2 touch correctness-sensitive W4/commit-ordering; shipping
+  needs: implement → `build:worker` (cargo+tsc+worker-build, slow/in-thread) → `alchemy deploy` →
+  re-run `restore-cliff-raw.mjs` to confirm the WS-1006 is gone AND W4 delta still reconstructs.
+- Live key currently **throttled (401)** from repeated probing — let it cool before re-testing.
