@@ -48,7 +48,10 @@
     "bindings": [{ "name": "KERNEL_DO", "class_name": "KernelDO" }]
   },
 
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["KernelDO"] }],
+  // Matches the already-applied Alchemy migration tag on the live engram-kernel worker. Keeping
+  // this in sync lets Wrangler Versions upload code-only releases without treating the existing
+  // KernelDO SQLite class as a new migration.
+  "migrations": [{ "tag": "alchemy:v92", "new_sqlite_classes": ["KernelDO"] }],
 
   // Worker Loader: content-addressed registry. The KernelDO routes worker-register/invoke/list
   // frames to JS glue, which calls env.LOADER.get(codeId, cb) — warm-cached by codeId, so the
