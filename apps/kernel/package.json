@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "build:engine": "node scripts/build-engine.ts && node scripts/engine-hash.ts",
-    "build:worker": "bun x tsc -p tsconfig.json && node scripts/build-ts.ts && node scripts/build-engine.ts && node scripts/build-codec.ts && node scripts/engine-hash.ts && worker-build --release",
+    "build:worker": "node scripts/build-ts.ts && node scripts/build-engine.ts && node scripts/build-codec.ts && node scripts/engine-hash.ts && bun x tsc -p tsconfig.json && worker-build --release",
     "deploy": "wrangler deploy",
     "deploy:alchemy": "npm run build:worker && alchemy deploy",
     "dev:alchemy": "npm run build:worker && alchemy dev",
