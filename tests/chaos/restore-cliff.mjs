@@ -37,7 +37,8 @@ const tag = () => `cliff-${Math.floor(performance.now())}-${Math.floor(performan
 //   "CLIFF"     — restore crashed / socket died / timed out (silent-loss risk — the real bug)
 //   "no-spike"  — precondition failed (alloc didn't land); inconclusive
 async function trial(nMB) {
-  const s = await Engram.connect({ url, apiKey, session: `${tag()}-${nMB}`, WebSocket, timeoutMs: 120_000 });
+  // bare engram-kernel wants kernelKey (/ws?id=); apiKey routes to the cloud /connect path and hangs.
+  const s = await Engram.connect({ url, kernelKey: apiKey, session: `${tag()}-${nMB}`, WebSocket, timeoutMs: 120_000 });
   try {
     await s.eval(`globalThis.canary = 'cliff-${nMB}'`);
 

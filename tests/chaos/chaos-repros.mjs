@@ -33,7 +33,9 @@ function held(name, detail) { console.log(`\n  🟢 not reproduced (guard held) 
 async function connect(t, config = {}, timeoutMs) {
   // ConnectOptions.timeoutMs (packages/sdk/src/index.ts, default 60000) is the per-frame wire
   // timeout — it also bounds hibernateThenResume()'s cold-restore touch eval.
-  return Engram.connect({ url, apiKey, session: `${t}-${tag()}`, WebSocket, config, ...(timeoutMs ? { timeoutMs } : {}) });
+  // bare engram-kernel wants kernelKey (/ws?id=&apiKey=<kernelKey>); `apiKey` routes to the cloud
+  // /connect supervisor path and the handshake hangs. See MEMORY: "SDK kernelKey not apiKey over wss".
+  return Engram.connect({ url, kernelKey: apiKey, session: `${t}-${tag()}`, WebSocket, config, ...(timeoutMs ? { timeoutMs } : {}) });
 }
 const val = (r) => r?.value;
 
@@ -197,7 +199,7 @@ async function case3() {
     // So vfs-write is the ONLY fully mutex-free commit path observable in the eval's fs view.
     // Drive it via a fresh transport on the SAME session (the SDK WS transport allows one
     // in-flight frame per socket, and s's socket is occupied by the parked eval).
-    const racer = await Engram.connect({ url, apiKey, session: s.session ?? undefined, WebSocket });
+    const racer = await Engram.connect({ url, kernelKey: apiKey, session: s.session ?? undefined, WebSocket });
     let racerNote = "racer vfs-write committed (mutex-free)";
     let racerOk = true;
     try {
