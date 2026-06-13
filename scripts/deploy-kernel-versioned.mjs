@@ -40,6 +40,8 @@ const current = currentDeployment(deployments);
 const oldVersion = currentVersion(current);
 if (!oldVersion) fail("could not determine current 100% Worker version from deployments list");
 console.log("[deploy-versioned] current=" + oldVersion);
+const versionsBeforeUpload = versionsList();
+const versionIdsBeforeUpload = new Set(versionsBeforeUpload.map(versionIdOf).filter(Boolean));
 
 if (dryRun) {
   runWrangler(["versions", "upload", "-c", configPath, "--tag", tag, "--message", message, "--dry-run"], { stdio: "inherit" });
@@ -48,7 +50,10 @@ if (dryRun) {
 }
 
 const upload = runWrangler(["versions", "upload", "-c", configPath, "--tag", tag, "--message", message], { capture: true });
-const newVersion = parseVersionId(upload.stdout) || latestVersionByTag(tag);
+const newVersion =
+  parseUploadedVersionId(upload.stdout) ||
+  newestVersionNotIn(versionIdsBeforeUpload) ||
+  latestVersionByTag(tag);
 if (!newVersion) {
   if (/migration/i.test(upload.stdout + upload.stderr)) {
     fail("version upload failed because this change includes a Durable Object migration; run an explicit migration deploy instead");
@@ -134,8 +139,8 @@ function deploymentsList() {
 }
 
 function currentDeployment(value) {
-  if (Array.isArray(value)) return value[0];
-  if (Array.isArray(value?.deployments)) return value.deployments[0];
+  if (Array.isArray(value)) return newestByCreated(value);
+  if (Array.isArray(value?.deployments)) return newestByCreated(value.deployments);
   if (value?.deployment) return value.deployment;
   return value;
 }
@@ -162,22 +167,38 @@ function versionIdOf(v) {
   return v?.version_id || v?.versionId || v?.id || v?.tag || "";
 }
 
-function latestVersionByTag(wantedTag) {
+function versionsList() {
   const out = runWrangler(["versions", "list", "-c", configPath, "--json"], { capture: true });
-  let versions;
   try {
-    versions = JSON.parse(out.stdout);
+    const versions = JSON.parse(out.stdout);
+    return Array.isArray(versions) ? versions : versions?.versions || [];
   } catch {
-    return "";
+    return [];
   }
-  const list = Array.isArray(versions) ? versions : versions?.versions || [];
-  const found = list.find((v) => v?.tag === wantedTag || v?.version_tag === wantedTag) || list[0];
+}
+
+function latestVersionByTag(wantedTag) {
+  const list = versionsList();
+  const found = newestByCreated(list.filter((v) => v?.tag === wantedTag || v?.version_tag === wantedTag)) || newestByCreated(list);
   return versionIdOf(found);
 }
 
-function parseVersionId(text) {
-  const match = String(text || "").match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
-  return match ? match[0] : "";
+function newestVersionNotIn(beforeIds) {
+  const list = versionsList().filter((v) => !beforeIds.has(versionIdOf(v)));
+  return versionIdOf(newestByCreated(list));
+}
+
+function parseUploadedVersionId(text) {
+  const match = String(text || "").match(/(?:uploaded|created|version(?: id)?)[^0-9a-f]*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+  return match ? match[1] : "";
+}
+
+function newestByCreated(items) {
+  return [...(items || [])].sort((a, b) => {
+    const byNumber = Number(b?.number ?? 0) - Number(a?.number ?? 0);
+    if (byNumber !== 0) return byNumber;
+    return Date.parse(b?.created_on || b?.metadata?.created_on || 0) - Date.parse(a?.created_on || a?.metadata?.created_on || 0);
+  })[0];
 }
 
 function gitSha() {
