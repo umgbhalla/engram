@@ -61,6 +61,12 @@ if (!newVersion) {
   fail("could not determine uploaded Worker version id");
 }
 console.log("[deploy-versioned] uploaded=" + newVersion);
+if (newVersion === oldVersion) {
+  console.log("[deploy-versioned] upload resolved to current live version; no rollout needed");
+  smokeVersion(newVersion);
+  console.log("[deploy-versioned] complete newVersion=" + newVersion + " previous=" + oldVersion + " noop=true");
+  process.exit(0);
+}
 
 deploySplit([
   { id: newVersion, pct: 0 },
