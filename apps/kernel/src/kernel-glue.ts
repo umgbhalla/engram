@@ -900,6 +900,12 @@ const MAX_RESTORE_RAW_BYTES = 45 * 1024 * 1024 + SCRATCH_DELTA_BYTES;       // 7
 // REPLAY of that specific cell would no-op — an accepted edge: the byte-blit image stays the primary
 // restore path, and 32MB-class payload cells are the rare exception, not the steady state.
 const LARGE_BUFFER_NO_RETAIN_BYTES = 63 * 1024 * 1024;
+// CHECKPOINT-PEAK fix (docs/CHAOS-CASE1-VERDICT.md): on a FULL base whose raw image is at least
+// this big, do NOT retain a host-side _lastImage copy (the next dump is forced full — chain-safe,
+// since a full base resets the delta chain anyway). Caps a large full-base checkpoint peak at
+// ~raw+gz instead of ~raw+gz+retain. Applies ONLY to full bases (delta MUST retain to keep the
+// retained image == committed chain tail, else the W4 module-drop desync at commitDump()).
+const FULL_BASE_NO_RETAIN_BYTES = 16 * 1024 * 1024;
 const SCRUB_SLACK_BYTES = 4 * 1024 * 1024;          // scrub when freed slack exceeds this
 const SCRUB_MAX_BUFFER_BYTES = 44 * 1024 * 1024 + SCRATCH_DELTA_BYTES;      // only scrub below this (stay under the absolute cap)
 const COMPACT_TRIGGER_BYTES = 12 * 1024 * 1024;     // cell-boundary scrub trigger (bloated buffer)
@@ -2651,6 +2657,23 @@ class GlueKernel {
     // changed so its exact bytes are carried.
     const canDelta = !forceFull && prev && raw.byteLength >= prev.byteLength;
 
+    // Emit a FULL (W5-compacted) base, resetting the delta chain. CHECKPOINT-PEAK fix: a large
+    // full base does NOT retain a host-side image (peak ~raw+gz, not ~raw+gz+retain). A full base
+    // resets the chain, so prev=null on the next dump is consistent (same pattern as the >63MB
+    // no-retain fence). A small full base retains (commit-ordered via _pendingImage/commitDump).
+    const emitFull = (): DumpResult => {
+      const gz = zstdCompress(raw);
+      const imageCrc = crc32(raw);
+      if (raw.byteLength > FULL_BASE_NO_RETAIN_BYTES) {
+        this._lastImage = null;
+        this._pendingImage = null;
+      } else {
+        this._pendingImage = raw.slice();
+      }
+      return { mode: "full", gz, snapCodec: SNAP_CODEC, indicesGz: null, nChanged: 0, grain: DELTA_GRAIN_BYTES,
+        imageLen: raw.byteLength, sizeGz: gz.byteLength, imageCrc, ...common };
+    };
+
     if (canDelta && prev) {
       const grain = DELTA_GRAIN_BYTES;
       const nGrains = Math.ceil(raw.byteLength / grain);
@@ -2668,40 +2691,43 @@ class GlueKernel {
         if (!diff && end > prevLen) diff = true;
         if (diff) changed.push(i);
       }
-      const payload = new Uint8Array(changed.length * grain);
-      for (let k = 0; k < changed.length; k++) {
-        const i = changed[k];
-        const start = i * grain;
-        const end = Math.min(start + grain, raw.byteLength);
-        payload.set(raw.subarray(start, end), k * grain);
+      // CHECKPOINT-PEAK fix: decide delta-vs-full from the CHEAP changed-grain estimate BEFORE any
+      // big allocation. A dense mutation (e.g. a freed spike, where ~every grain changed) skips the
+      // payload buffer + payGz + idxGz + a full `zstdCompress(raw)` fallback that previously all
+      // lived simultaneously (the ~5x peak that WS-1006'd the DO) and goes straight to a no-retain
+      // full base. Equivalent OUTPUT to the old deltaStored-vs-fullGz test (both delta and full
+      // reconstruct identically); only the decision is cheaper and the dense path avoids the peak.
+      const changedBytes = changed.length * grain;
+      const dense = changedBytes >= raw.byteLength * DELTA_FALLBACK_PCT;
+      if (!dense) {
+        const payload = new Uint8Array(changedBytes);
+        for (let k = 0; k < changed.length; k++) {
+          const i = changed[k];
+          const start = i * grain;
+          const end = Math.min(start + grain, raw.byteLength);
+          payload.set(raw.subarray(start, end), k * grain);
+        }
+        const idx = new Uint32Array(changed.length);
+        for (let k = 0; k < changed.length; k++) idx[k] = changed[k];
+        const idxBytes = new Uint8Array(idx.buffer, idx.byteOffset, idx.byteLength);
+        const payGz = zstdCompress(payload);
+        const idxGz = zstdCompress(idxBytes);
+        const deltaBlobsFit = payGz.byteLength <= DELTA_MAX_BLOB_BYTES && idxGz.byteLength <= DELTA_MAX_BLOB_BYTES;
+        if (deltaBlobsFit) {
+          // STAGE the candidate base; commitDump() promotes it ONLY after the DO appends this delta
+          // row + bumps delta_seq. A delta MUST retain (retained image == committed chain tail).
+          this._pendingImage = raw.slice();
+          return { mode: "delta", gz: payGz, indicesGz: idxGz, snapCodec: SNAP_CODEC, nChanged: changed.length, grain,
+            imageLen: raw.byteLength, sizeGz: payGz.byteLength + idxGz.byteLength, imageCrc: crc32(raw), ...common };
+        }
+        // sparse but the delta blobs overflow the SQLite value cap => fall through to a full base.
       }
-      const idx = new Uint32Array(changed.length);
-      for (let k = 0; k < changed.length; k++) idx[k] = changed[k];
-      const idxBytes = new Uint8Array(idx.buffer, idx.byteOffset, idx.byteLength);
-      const payGz = zstdCompress(payload);
-      const idxGz = zstdCompress(idxBytes);
-      const deltaStored = payGz.byteLength + idxGz.byteLength;
-      // AUTO-FALLBACK: dense mutation (delta >= FALLBACK_PCT of a full image) => store full.
-      const fullGz = zstdCompress(raw);
-      const deltaBlobsFit = payGz.byteLength <= DELTA_MAX_BLOB_BYTES && idxGz.byteLength <= DELTA_MAX_BLOB_BYTES;
-      if (deltaBlobsFit && deltaStored < fullGz.byteLength * DELTA_FALLBACK_PCT) {
-        // STAGE the candidate base; commitDump() promotes it ONLY after the DO appends this delta
-        // row + bumps delta_seq. imageCrc = crc of the FULL image this delta reconstructs to.
-        this._pendingImage = raw.slice();
-        return { mode: "delta", gz: payGz, indicesGz: idxGz, snapCodec: SNAP_CODEC, nChanged: changed.length, grain,
-          imageLen: raw.byteLength, sizeGz: deltaStored, imageCrc: crc32(raw), ...common };
-      }
-      // dense — fall through to full base, reuse fullGz.
-      this._pendingImage = raw.slice();
-      return { mode: "full", gz: fullGz, snapCodec: SNAP_CODEC, indicesGz: null, nChanged: 0, grain: DELTA_GRAIN_BYTES,
-        imageLen: raw.byteLength, sizeGz: fullGz.byteLength, imageCrc: crc32(raw), ...common };
+      // dense, or sparse-but-blobs-too-big => full base.
+      return emitFull();
     }
 
-    // FULL (W5-compacted) base. Resets the delta chain.
-    this._pendingImage = raw.slice();
-    const gz = zstdCompress(raw);
-    return { mode: "full", gz, snapCodec: SNAP_CODEC, indicesGz: null, nChanged: 0, grain: DELTA_GRAIN_BYTES,
-      imageLen: raw.byteLength, sizeGz: gz.byteLength, imageCrc: crc32(raw), ...common };
+    // No prev / forceFull => full base.
+    return emitFull();
   }
 
   // W4 commit-ordering hook: the DO calls this AFTER its checkpoint SQL txn commits successfully,
