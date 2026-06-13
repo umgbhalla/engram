@@ -274,12 +274,18 @@ pub struct KernelDO {
     // checkpoint, dropped on crash. In-memory only — NEVER snapshotted (the durable authority is
     // R2 + the `fs_files` SQLite table).
     staged_fs: StagedFs,
+    // Per-session backpressure for VM/mutex work. This is intentionally DO-local: the
+    // serialization point is one live interpreter heap, so queue depth is per KernelDO.
+    eval_queue_depth: RefCell<u32>,
+    active_eval: RefCell<bool>,
 }
 
 /// Semantic snapshot layout epoch (bump on quickjs-ng/rustc/feature/static-layout change). Recorded
 /// in meta as groundwork; compatibility is proven by the build artifacts + the post-restore sanity
 /// probe, never declared — a bump may only force replay, never a hot restore.
 const SNAPSHOT_FORMAT_VERSION: &str = "1";
+const DEFAULT_MAX_EVAL_QUEUE_DEPTH: u32 = 16;
+const QUEUE_RETRY_AFTER_MS: u32 = 250;
 
 impl DurableObject for KernelDO {
     fn new(state: State, env: Env) -> Self {
@@ -432,6 +438,8 @@ impl DurableObject for KernelDO {
             auth_keys,
             auth_enforce,
             staged_fs: Rc::new(RefCell::new(Vec::new())),
+            eval_queue_depth: RefCell::new(0),
+            active_eval: RefCell::new(false),
         }
     }
 
@@ -628,7 +636,7 @@ fn urlencode(s: &str) -> String {
 }
 
 /// V0.5 OBSERVABILITY parity: one Analytics Engine datapoint per op. Mirrors the JS
-/// kernel (apps/kernel/src/lib.rs): blobs op/restoreSource/store/errorName/valueType/label,
+/// kernel (apps/kernel/src/lib.rs): blobs op/restoreSource/store/errorName/valueType/label/version,
 /// doubles totalServerMs/readMs/sizeRaw/sizeGz/usedHeap/cell/generation/ok. Fire-and-forget.
 #[derive(Default)]
 
@@ -647,6 +655,53 @@ struct Datapoint {
     cell: i64,
     ok: bool,
 }
+
+#[derive(Default)]
+struct VersionMeta {
+    id: String,
+    tag: String,
+    timestamp: String,
+}
+
+struct VmQueuePermit<'a> {
+    depth: &'a RefCell<u32>,
+    active: &'a RefCell<bool>,
+    activated: bool,
+    done: bool,
+}
+
+impl<'a> VmQueuePermit<'a> {
+    fn mark_active(&mut self) {
+        *self.active.borrow_mut() = true;
+        self.activated = true;
+    }
+
+    fn finish(mut self) {
+        self.close();
+    }
+
+    fn close(&mut self) {
+        if self.done {
+            return;
+        }
+        if self.activated {
+            *self.active.borrow_mut() = false;
+            self.activated = false;
+        }
+        let mut depth = self.depth.borrow_mut();
+        if *depth > 0 {
+            *depth -= 1;
+        }
+        self.done = true;
+    }
+}
+
+impl Drop for VmQueuePermit<'_> {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 impl Datapoint {
     fn new(op: &str) -> Self {
         Datapoint {
@@ -661,6 +716,7 @@ impl Datapoint {
 impl KernelDO {
     /// Emit a structured Workers-Logs line + a best-effort AE datapoint. Never perturbs the op.
     fn emit(&self, dp: &Datapoint) {
+        let version = self.version_meta();
         let log = json!({
             "ev": "op", "op": dp.op, "doId": self.do_id,
             "restoreSource": dp.restore_source, "store": dp.store,
@@ -668,6 +724,7 @@ impl KernelDO {
             "totalServerMs": dp.total_server_ms, "readMs": dp.read_ms,
             "sizeRaw": dp.size_raw, "sizeGz": dp.size_gz, "usedHeap": dp.used_heap,
             "cell": dp.cell, "generation": self.generation, "ok": dp.ok,
+            "versionId": version.id, "versionTag": version.tag, "versionTimestamp": version.timestamp,
         });
         console_log(&log.to_string());
         let _ = self.write_ae(dp);
@@ -685,6 +742,60 @@ impl KernelDO {
             "log-only".into()
         };
         self.emit(&dp);
+    }
+
+    fn version_meta(&self) -> VersionMeta {
+        version_meta_from_env(&self.env)
+    }
+
+    fn max_eval_queue_depth(&self) -> u32 {
+        DEFAULT_MAX_EVAL_QUEUE_DEPTH
+    }
+
+    fn eval_queue_depth(&self) -> u32 {
+        *self.eval_queue_depth.borrow()
+    }
+
+    fn active_eval(&self) -> bool {
+        *self.active_eval.borrow()
+    }
+
+    fn try_enter_vm_queue(&self, frame_t: &str) -> std::result::Result<VmQueuePermit<'_>, serde_json::Value> {
+        let max = self.max_eval_queue_depth();
+        let mut depth = self.eval_queue_depth.borrow_mut();
+        if *depth >= max {
+            let mut dp = Datapoint::new("queue-reject");
+            dp.ok = false;
+            dp.error_name = "QueueFullError".into();
+            dp.label = frame_t.to_string();
+            dp.cell = -1;
+            self.emit(&dp);
+            return Err(json!({
+                "ok": false,
+                "t": frame_t,
+                "valueType": "error",
+                "error": {
+                    "name": "QueueFullError",
+                    "message": format!("kernel eval queue is full ({}/{})", *depth, max),
+                    "queueDepth": *depth,
+                    "maxQueueDepth": max,
+                    "retryAfterMs": QUEUE_RETRY_AFTER_MS,
+                    "session": self.do_id,
+                },
+                "queueDepth": *depth,
+                "maxQueueDepth": max,
+                "retryAfterMs": QUEUE_RETRY_AFTER_MS,
+                "generation": self.generation,
+            }));
+        }
+        *depth += 1;
+        drop(depth);
+        Ok(VmQueuePermit {
+            depth: &self.eval_queue_depth,
+            active: &self.active_eval,
+            activated: false,
+            done: false,
+        })
     }
 
     fn write_ae(&self, dp: &Datapoint) -> std::result::Result<(), JsValue> {
@@ -706,6 +817,10 @@ impl KernelDO {
         blobs.push(&JsValue::from_str(&dp.error_name));
         blobs.push(&JsValue::from_str(&dp.value_type));
         blobs.push(&JsValue::from_str(&dp.label));
+        let version = self.version_meta();
+        blobs.push(&JsValue::from_str(&version.id));
+        blobs.push(&JsValue::from_str(&version.tag));
+        blobs.push(&JsValue::from_str(&version.timestamp));
 
         let doubles = js_sys::Array::new();
         doubles.push(&JsValue::from_f64(dp.total_server_ms));
@@ -2172,6 +2287,7 @@ impl KernelDO {
                 let store = self.store();
                 let committed = read_int(&store, "committedCell", -1);
                 let live = read_int(&store, "liveCell", committed);
+                let version = self.version_meta();
                 Ok(json!({
                     "ok": true, "t": "gen",
                     "generation": self.generation,
@@ -2183,14 +2299,29 @@ impl KernelDO {
                     "durability": self.config_durability(),
                     "engineHash": get_engine_hash(),
                     "version": "rust-v0.9.3",
+                    "versionId": version.id,
+                    "versionTag": version.tag,
+                    "versionTimestamp": version.timestamp,
+                    "activeEval": self.active_eval(),
+                    "queueDepth": self.eval_queue_depth(),
+                    "maxQueueDepth": self.max_eval_queue_depth(),
                 }))
             }
-            "ping" => Ok(json!({
-                "ok": true, "t": "ping",
-                "inMemory": self.glue.borrow().is_some(),
-                "generation": self.generation,
-                "keepAlive": msg.get("keepAlive").and_then(|v| v.as_bool()).unwrap_or(false),
-            })),
+            "ping" => {
+                let version = self.version_meta();
+                Ok(json!({
+                    "ok": true, "t": "ping",
+                    "inMemory": self.glue.borrow().is_some(),
+                    "generation": self.generation,
+                    "keepAlive": msg.get("keepAlive").and_then(|v| v.as_bool()).unwrap_or(false),
+                    "versionId": version.id,
+                    "versionTag": version.tag,
+                    "versionTimestamp": version.timestamp,
+                    "activeEval": self.active_eval(),
+                    "queueDepth": self.eval_queue_depth(),
+                    "maxQueueDepth": self.max_eval_queue_depth(),
+                }))
+            }
             // VFS-* out-of-band file I/O. Serviced DIRECTLY against the host.fs R2 store (same
             // key scheme `fs/<doId>/<normpath>`, same SNAPSHOTS bucket, same `fs_files` meta table,
             // same `norm_fs_path` isolation) — NEVER through the VM eval. These arms do NOT acquire
@@ -2228,32 +2359,62 @@ impl KernelDO {
             // config.sandbox. The key NEVER enters the VM heap nor any client frame.
             "sandbox" => self.sandbox_frame(&msg).await,
             "create" => {
+                let mut permit = match self.try_enter_vm_queue("create") {
+                    Ok(p) => p,
+                    Err(reply) => return Ok(reply),
+                };
                 let release = JsFuture::from(self.mutex.acquire()).await.map_err(to_err)?;
+                permit.mark_active();
                 let res = self.create_critical(&msg).await;
+                permit.finish();
                 let _ = js_sys::Function::from(release).call0(&JsValue::NULL);
                 res
             }
             "eval" => {
+                let mut permit = match self.try_enter_vm_queue("eval") {
+                    Ok(p) => p,
+                    Err(reply) => return Ok(reply),
+                };
                 let release = JsFuture::from(self.mutex.acquire()).await.map_err(to_err)?;
+                permit.mark_active();
                 let res = self.eval_critical(&msg, ws).await;
+                permit.finish();
                 let _ = js_sys::Function::from(release).call0(&JsValue::NULL);
                 res
             }
             "flush" => {
+                let mut permit = match self.try_enter_vm_queue("flush") {
+                    Ok(p) => p,
+                    Err(reply) => return Ok(reply),
+                };
                 let release = JsFuture::from(self.mutex.acquire()).await.map_err(to_err)?;
+                permit.mark_active();
                 let res = self.flush_critical("explicit").await;
+                permit.finish();
                 let _ = js_sys::Function::from(release).call0(&JsValue::NULL);
                 res
             }
             "artifact" => {
+                let mut permit = match self.try_enter_vm_queue("artifact") {
+                    Ok(p) => p,
+                    Err(reply) => return Ok(reply),
+                };
                 let release = JsFuture::from(self.mutex.acquire()).await.map_err(to_err)?;
+                permit.mark_active();
                 let res = self.artifact_critical(&msg).await;
+                permit.finish();
                 let _ = js_sys::Function::from(release).call0(&JsValue::NULL);
                 res
             }
             "reset" => {
+                let mut permit = match self.try_enter_vm_queue("reset") {
+                    Ok(p) => p,
+                    Err(reply) => return Ok(reply),
+                };
                 let release = JsFuture::from(self.mutex.acquire()).await.map_err(to_err)?;
+                permit.mark_active();
                 let res = self.reset_critical().await;
+                permit.finish();
                 let _ = js_sys::Function::from(release).call0(&JsValue::NULL);
                 res
             }
@@ -2621,6 +2782,7 @@ impl KernelDO {
         dp.size_gz = ckpt.get("sizeGz").and_then(|v| v.as_i64()).unwrap_or(0);
         dp.used_heap = ckpt.get("usedHeap").and_then(|v| v.as_i64()).unwrap_or(0);
         self.emit(&dp);
+        let version = self.version_meta();
 
         let reply = json!({
             "ok": ok, "t": "eval",
@@ -2639,6 +2801,9 @@ impl KernelDO {
             "durability": if buffered { "warmBuffered" } else { "eagerDurable" },
             "dirty": buffered,
             "checkpoint": ckpt,
+            "versionId": version.id,
+            "versionTag": version.tag,
+            "versionTimestamp": version.timestamp,
         });
 
         if let Some(id) = req_id {
@@ -3580,6 +3745,10 @@ fn write_ext_ae(env: &Env, do_id: &str, generation: i64, op: &str) {
     blobs.push(&JsValue::from_str("")); // error_name
     blobs.push(&JsValue::from_str("ext")); // value_type
     blobs.push(&JsValue::from_str("")); // label
+    let version = version_meta_from_env(env);
+    blobs.push(&JsValue::from_str(&version.id));
+    blobs.push(&JsValue::from_str(&version.tag));
+    blobs.push(&JsValue::from_str(&version.timestamp));
     let doubles = js_sys::Array::new();
     for _ in 0..6 {
         doubles.push(&JsValue::from_f64(0.0));
@@ -3592,8 +3761,40 @@ fn write_ext_ae(env: &Env, do_id: &str, generation: i64, op: &str) {
     let _ = Reflect::set(&point, &JsValue::from_str("doubles"), &doubles);
     let _ = write_fn.call1(&ae, &point);
     let log = json!({ "ev": "op", "op": op, "doId": do_id, "valueType": "ext",
-        "generation": generation, "ok": true });
+        "generation": generation, "ok": true,
+        "versionId": version.id, "versionTag": version.tag, "versionTimestamp": version.timestamp });
     console_log(&log.to_string());
+}
+
+fn version_meta_from_env(env: &Env) -> VersionMeta {
+    let envj: &JsValue = env.as_ref();
+    let meta = match Reflect::get(envj, &JsValue::from_str("CF_VERSION_METADATA")) {
+        Ok(v) if !v.is_undefined() && !v.is_null() => v,
+        _ => return VersionMeta::default(),
+    };
+    VersionMeta {
+        id: js_prop_string(&meta, "id"),
+        tag: js_prop_string(&meta, "tag"),
+        timestamp: js_prop_string(&meta, "timestamp"),
+    }
+}
+
+fn js_prop_string(obj: &JsValue, key: &str) -> String {
+    Reflect::get(obj, &JsValue::from_str(key))
+        .ok()
+        .and_then(|v| {
+            if v.is_undefined() || v.is_null() {
+                None
+            } else if let Some(s) = v.as_string() {
+                Some(s)
+            } else {
+                js_sys::JSON::stringify(&v)
+                    .ok()
+                    .and_then(|s| s.as_string())
+                    .map(|s| s.trim_matches('"').to_string())
+            }
+        })
+        .unwrap_or_default()
 }
 
 fn read_int<S: KernelStore>(store: &S, k: &str, dflt: i64) -> i64 {

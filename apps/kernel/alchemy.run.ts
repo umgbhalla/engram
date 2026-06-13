@@ -24,7 +24,7 @@
  * `alchemy deploy` against a non-prod account/name before retiring `wrangler deploy`.
  */
 import alchemy from "alchemy";
-import { AnalyticsEngineDataset, DurableObjectNamespace, R2Bucket, Worker, WorkerLoader } from "alchemy/cloudflare";
+import { AnalyticsEngineDataset, DurableObjectNamespace, R2Bucket, VersionMetadata, Worker, WorkerLoader } from "alchemy/cloudflare";
 import { R2RestStateStore } from "alchemy/state";
 
 const app = await alchemy("engram-kernel", {
@@ -86,6 +86,7 @@ export const worker = await Worker("engram-kernel", {
     KERNEL_DO: kernelDo,
     SNAPSHOTS: snapshots,
     AE: ae,
+    CF_VERSION_METADATA: VersionMetadata(),
     // Worker Loader: content-addressed registry. The registry glue calls env.LOADER.get(codeId, cb)
     // (warm-cached by codeId so the sha256 source hash drives dedup + warm reuse). Emits the
     // worker_loaders binding { binding: "LOADER" } — mirrors wrangler.jsonc. Workers Paid required.

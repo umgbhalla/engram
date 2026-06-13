@@ -8,6 +8,7 @@
   "scripts": {
     "check": "node scripts/check-deployed-endpoints.mjs && bun run --filter @engram/sdk typecheck && bun run --filter @engram/cli typecheck && bun run --filter @engram/ui-app typecheck && bun run --filter @engram/cloud-app typecheck && cd apps/kernel && bun x tsc -p tsconfig.json",
     "deploy:kernel": "wrangler deploy -c apps/kernel/wrangler.jsonc",
+    "deploy:kernel:versioned": "node scripts/deploy-kernel-versioned.mjs",
     "deploy:cloud": "wrangler deploy -c apps/cloud/wrangler.jsonc",
     "deploy:ui": "bun run --filter @engram/ui-app build && wrangler deploy -c apps/ui/wrangler.jsonc",
     "deploy:all": "bun scripts/deploy.ts",
@@ -17,6 +18,7 @@
     "telemetry:probe": "node scripts/telemetry-probe.mjs",
     "stress:single": "node scripts/stress-single-instance.mjs",
     "hammer:single": "node scripts/hammer-single-connection.mjs",
+    "probe:queue-backpressure": "node scripts/probe-queue-backpressure.mjs",
     "probe:warm-buffered": "node scripts/probe-warm-buffered.mjs",
     "chaos:hot-repl": "node scripts/chaos-hot-repl.mjs",
     "build:sdk": "bun run --filter @engram/sdk build",
@@ -24,6 +26,7 @@
     "build:ui": "bun run --filter @engram/ui-app build"
   },
   "devDependencies": {
-    "isomorphic-git": "1.27.1"
+    "isomorphic-git": "1.27.1",
+    "wrangler": "^4.99.0"
   }
 }

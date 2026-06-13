@@ -107,6 +107,7 @@ export interface EvalErrorInfo {
   name: string;
   message: string;
   stack?: string;
+  [k: string]: unknown;
 }
 
 /**
@@ -317,8 +318,8 @@ export interface ConnectOptions {
   apiKey?: string;
   /**
    * Bare-kernel shared bearer key (engram-kernel auth, additive — does NOT change `apiKey`
-   * cloud semantics). When set, the bare-kernel WS URL gains `&apiKey=<kernelKey>` AND a
-   * `{t:"auth",token}` frame is sent first on every (re)connect so reconnect re-auths transparently.
+   * cloud semantics). When set, a `{t:"auth",token}` frame is sent first on every
+   * (re)connect so reconnect re-auths transparently without putting the key in the URL.
    */
   kernelKey?: string;
   /** In-VM kernel config, applied once at connect. */
@@ -437,6 +438,10 @@ export class SizeAdmissionError extends EngramError {
 export class SandboxDisabledError extends EngramError {
   override name = "SandboxDisabledError";
 }
+/** The per-session kernel queue is full; retry after the reported backoff. */
+export class QueueFullError extends EngramError {
+  override name = "QueueFullError";
+}
 
 const ERROR_CLASSES: Record<string, typeof EngramError> = {
   TimeoutError,
@@ -444,6 +449,7 @@ const ERROR_CLASSES: Record<string, typeof EngramError> = {
   FetchBlockedError,
   SizeAdmissionError,
   SandboxDisabledError,
+  QueueFullError,
 };
 
 /** Build the right typed error from a kernel error payload. */
@@ -1959,9 +1965,7 @@ export const Engram = {
       ? ""
       : opts.apiKey
         ? `${wsBase}/connect?session=${encodeURIComponent(session)}&apiKey=${encodeURIComponent(opts.apiKey)}`
-        : opts.kernelKey
-          ? `${wsBase}/ws?id=${encodeURIComponent(session)}&apiKey=${encodeURIComponent(opts.kernelKey)}`
-          : `${wsBase}/ws?id=${encodeURIComponent(session)}`;
+        : `${wsBase}/ws?id=${encodeURIComponent(session)}`;
 
     let s!: EngramSession;
     const transport = new WsTransport(WS, wsUrl, {

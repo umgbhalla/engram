@@ -67,5 +67,10 @@
   // AE binding). Queryable via the AE SQL API. dataset engram_kernel.
   "analytics_engine_datasets": [
     { "binding": "AE", "dataset": "engram_kernel" }
-  ]
+  ],
+
+  // Worker version id/tag/timestamp for safe rollout smoke checks and AE/log correlation.
+  "version_metadata": {
+    "binding": "CF_VERSION_METADATA"
+  }
 }
