@@ -1381,7 +1381,11 @@ class GlueKernel {
     this._ex().set_counters(BigInt(clockCalls | 0), BigInt(rngCalls | 0));
     if (kvJson && kvJson !== "{}") this._importKv(kvJson);
     // W4: retain the reconstructed image so the next warm checkpoint diffs against it.
-    this._lastImage = raw.slice();
+    // BUG-1 FIX (restore triple-buffer): `raw` is a standalone decompressed array we own and which
+    // nothing mutates after the blit above, so retain it DIRECTLY instead of `raw.slice()`. The old
+    // slice was a 3rd full-size transient copy (instance + raw + raw.slice) that crossed the OOM
+    // cliff on large images; dropping it halves the extra transient peak.
+    this._lastImage = raw;
     this._applyFsProvider();
     this._seedStdlibMeta();
     this._seedExtMeta();
@@ -1482,7 +1486,10 @@ class GlueKernel {
     if (!ok) throw new Error("RestoreError: reattach failed after W4 blit");
     this._ex().set_counters(BigInt(clockCalls | 0), BigInt(rngCalls | 0));
     if (kvJson && kvJson !== "{}") this._importKv(kvJson);
-    this._lastImage = image.slice();
+    // BUG-1 FIX (restore triple-buffer): `image` is a standalone reconstructed array we own and
+    // which nothing mutates after the blit; retain it DIRECTLY instead of `image.slice()` to drop
+    // the redundant 3rd full-size transient copy.
+    this._lastImage = image;
     this._applyFsProvider();
     this._seedStdlibMeta();
     this._seedExtMeta();
@@ -2577,6 +2584,12 @@ class GlueKernel {
     // the gap between MAX_USED_BYTES(50MB) and SAFE_SERIALIZE_BUFFER_BYTES(76MB) for the specific
     // incompressible-heap case that WS-1006s the DO during the dump's transient gz/copy expansion.
     // usedHeap here is the GC-refined value (scrub_arena ran above when the buffer was bloated).
+    // NOTE: the SCRATCH_DELTA_BYTES discount intentionally accounts for ALL compressible high-water
+    // (the freed dlmalloc arena + zero-filled WASM growth + the SCRATCH Vec), not just the resident
+    // SCRATCH — that whole region gzips away (sizeGz << sizeRaw). An earlier attempt to discount only
+    // resident scratch (scratch_cap()) over-rejected legitimate ~24-29MB-raw-but-compressible
+    // snapshots and was reverted. The genuine BUG-1 (un-restorable freed-spike commit) is mitigated
+    // on the RESTORE side (the triple-buffer reduction below), not here.
     const incompressibleBytes = Math.max(usedHeap, bufBytes0 - SCRATCH_DELTA_BYTES);
     if (incompressibleBytes >= INCOMPRESSIBLE_BUFFER_CEILING_BYTES) {
       throw new Error(

@@ -278,6 +278,10 @@ pub struct KernelDO {
     // serialization point is one live interpreter heap, so queue depth is per KernelDO.
     eval_queue_depth: RefCell<u32>,
     active_eval: RefCell<bool>,
+    // BUG-3: durable fsVersion captured at the start of each eval, so flush_staged_fs can tell when a
+    // mutex-free vfs-write/sandbox/worker commit landed (ACKed durable) during an eval park and must
+    // not be silently clobbered by the post-eval staged flush. In-memory only.
+    eval_start_fs_version: std::cell::Cell<i64>,
 }
 
 /// Semantic snapshot layout epoch (bump on quickjs-ng/rustc/feature/static-layout change). Recorded
@@ -440,6 +444,7 @@ impl DurableObject for KernelDO {
             staged_fs: Rc::new(RefCell::new(Vec::new())),
             eval_queue_depth: RefCell::new(0),
             active_eval: RefCell::new(false),
+            eval_start_fs_version: std::cell::Cell::new(0),
         }
     }
 
@@ -1202,8 +1207,33 @@ impl KernelDO {
             last.insert(o.path, o.op);
         }
         let now = now_ms();
+        // BUG-3 FIX (parked-continuation vs mutex-free vfs-write clobber): vfs-write/sandbox/worker
+        // arms commit to the SAME fs/<doId>/ + fs_files namespace WITHOUT the eval mutex. If this
+        // eval parked on a host call, such a frame write could have committed (and been ACKed
+        // durable) to a staged path during the park. Last-writer-wins below would silently destroy
+        // it. If fsVersion advanced since eval start, a mutex-free write landed: do NOT clobber a
+        // path now owned by an `origin='frame'` row. (No-race path: byte-identical to before.)
+        #[derive(serde::Deserialize)]
+        struct OriginRow {
+            origin: String,
+        }
+        let fs_raced = read_fs_version(store) > self.eval_start_fs_version.get();
         for (path, op) in last {
             let key = format!("{}{}", prefix, path.trim_start_matches('/'));
+            if fs_raced {
+                let cur: Vec<OriginRow> = self
+                    .store()
+                    .query_typed(
+                        "SELECT origin FROM fs_files WHERE path=?;",
+                        Some(vec![path.clone().into()]),
+                    )
+                    .unwrap_or_default();
+                if cur.first().map(|r| r.origin == "frame").unwrap_or(false) {
+                    // A mutex-free frame write won this path during the eval park; preserve the
+                    // ACKed durable write rather than silently overwriting/deleting it.
+                    continue;
+                }
+            }
             match op {
                 FsStageOp::Write(bytes) => {
                     let size = bytes.len() as i64;
@@ -2490,6 +2520,10 @@ impl KernelDO {
         msg: &serde_json::Value,
         ws: Option<&WebSocket>,
     ) -> Result<serde_json::Value> {
+        // BUG-3 FIX: snapshot the durable fsVersion at eval start. A mutex-free frame write that
+        // commits during this eval's park bumps fsVersion; flush_staged_fs compares against this to
+        // avoid clobbering an ACKed out-of-band write with the staged last-writer-wins flush.
+        self.eval_start_fs_version.set(read_fs_version(&self.store()));
         let src = msg.get("src").and_then(|v| v.as_str()).unwrap_or("");
         let req_id = msg
             .get("reqId")
@@ -3227,14 +3261,33 @@ impl KernelDO {
                 None
             }
         });
-        let to_r2 = bytes.len() > SQLITE_HOT_MAX;
-        let (store, new_r2_key) = if to_r2 {
+        let want_r2 = bytes.len() > SQLITE_HOT_MAX;
+        let (store, new_r2_key, to_r2) = if want_r2 {
             let new_key = self.r2_key_for(cell, epoch);
             let bucket = self.env.bucket("SNAPSHOTS")?;
             bucket.put(&new_key, bytes.clone()).execute().await?;
-            ("r2".to_string(), new_key)
+            // BUG-2 FIX (verify-before-truncate): R2 is read-after-write eventually consistent for a
+            // freshly-PUT key. The destructive txn below DELETEs the prior base+chain+oplog and
+            // re-seeds the oplog with ONLY this cell. If the new base were momentarily unreadable on
+            // a later cold wake, restore() would route to a 1-row oplog replay and SILENTLY resurrect
+            // a truncated namespace (committed cells lost, reported ok). Confirm the new base is
+            // GET-readable NOW — before we truncate — via the SAME resilient path restore uses. If it
+            // is NOT durably readable, do not trust R2 for this rollover: persist the base into the
+            // DO's own SQLite chunks (no read-after-write gap), so truncation only ever discards the
+            // old chain once the new authority is verified durable. Fail-safe: a false negative just
+            // keeps the base in SQLite this round.
+            match self.r2_get_resilient(&new_key).await {
+                R2Read::Got(_) => ("r2".to_string(), new_key, true),
+                _ => {
+                    console_log(
+                        "[checkpoint] new R2 base unverified after PUT (read-after-write gap) — \
+                         persisting base to SQLite chunks for this rollover (no data loss)",
+                    );
+                    ("sqlite".to_string(), String::new(), false)
+                }
+            }
         } else {
-            ("sqlite".to_string(), String::new())
+            ("sqlite".to_string(), String::new(), false)
         };
 
         let kstore = self.store();
