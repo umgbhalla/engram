@@ -51,7 +51,11 @@
   // Matches the already-applied Alchemy migration tag on the live engram-kernel worker. Keeping
   // this in sync lets Wrangler Versions upload code-only releases without treating the existing
   // KernelDO SQLite class as a new migration.
-  "migrations": [{ "tag": "alchemy:v92", "new_sqlite_classes": ["KernelDO"] }],
+  // ADOPT the live worker's already-applied migration tag (was drifted at alchemy:v92 while the
+  // deployed worker is alchemy:v94). Matching it means wrangler applies NO migration on deploy
+  // (the KernelDO sqlite class already exists) -> no 10074 conflict, and `wrangler versions upload`
+  // carries no DO migration -> gradual/versioned deploys are unblocked. wrangler is now the SoT.
+  "migrations": [{ "tag": "alchemy:v94", "new_sqlite_classes": ["KernelDO"] }],
 
   // Worker Loader: content-addressed registry. The KernelDO routes worker-register/invoke/list
   // frames to JS glue, which calls env.LOADER.get(codeId, cb) — warm-cached by codeId, so the
@@ -62,8 +66,12 @@
   ],
 
   // R2 OVERFLOW only (gz image > ~2MB). benchrustf/ key prefix per the guardrails.
+  // Match the bucket the LIVE (alchemy-deployed) worker actually binds — the alchemy-named
+  // `engram-kernel-engram-snapshots-umang`, NOT the bare `engram-snapshots`. The Tier-2 sandbox
+  // worker mounts this same bucket (apps/sandbox/wrangler.jsonc SANDBOX_R2), so the kernel must use
+  // it too or kernel<->container /workspace fs coherence breaks.
   "r2_buckets": [
-    { "binding": "SNAPSHOTS", "bucket_name": "engram-snapshots" }
+    { "binding": "SNAPSHOTS", "bucket_name": "engram-kernel-engram-snapshots-umang" }
   ],
 
   // V0.5 OBSERVABILITY parity: per-op Analytics Engine datapoint
